@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TMF S/R 監控</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="bar-main">
+      <span id="code" class="code">—</span>
+      <span id="price" class="price">—</span>
+      <span id="session" class="pill">—</span>
+      <span id="freshness" class="pill">—</span>
+    </div>
+    <div class="bar-meta">
+      <span>小時 ATR <b id="atr">—</b></span>
+      <span>小時棒 <b id="bars">—</b></span>
+      <span>委託簿 <b id="book">—</b></span>
+      <span>更新於 <b id="updated">—</b></span>
+    </div>
+  </header>
+
+  <section class="sides">
+    <article class="side" id="side-support">
+      <h2>🟩 支撐箱</h2>
+      <div class="side-body">尚無資料</div>
+    </article>
+    <article class="side" id="side-resistance">
+      <h2>🟥 阻力箱</h2>
+      <div class="side-body">尚無資料</div>
+    </article>
+  </section>
+
+  <section class="chart-wrap">
+    <div class="chart-head">
+      <div id="legend-series" class="legend"></div>
+      <div class="chart-tools">
+        <button type="button" id="recent">近 6 日</button>
+        <button type="button" id="fit">全部</button>
+      </div>
+    </div>
+    <div id="legend-ohlc" class="legend-ohlc"></div>
+    <div id="chart"></div>
+  </section>
+
+  <section class="tables">
+    <article>
+      <h2>進行中 / 最近的箱體停留</h2>
+      <div id="visits" class="table-slot">—</div>
+    </article>
+    <article>
+      <h2>反轉型態</h2>
+      <div id="reversals" class="table-slot">—</div>
+    </article>
+    <article>
+      <h2>Telegram 通知</h2>
+      <div id="alerts" class="table-slot">—</div>
+    </article>
+  </section>
+
+  <footer>
+    每 60 秒自動更新 · 僅為監控與提示，不下單 · <a href="/plotly">Plotly 版本</a>
+  </footer>
+
+  <script src="/static/status.js"></script>
+  <script src="/static/boxes_primitive.js"></script>
+  <script src="/static/lwc_app.js"></script>
+</body>
+</html>

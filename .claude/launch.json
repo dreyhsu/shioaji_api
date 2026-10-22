@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "/opt/homebrew/Caskroom/miniconda/base/bin/conda",
+      "runtimeArgs": ["run", "-n", "tss", "--no-capture-output", "python", "src/dashboard.py", "--code", "TMFR1", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}

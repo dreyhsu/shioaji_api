@@ -1,0 +1,12 @@
+.env
+data/
+.ipynb_checkpoints/
+__pycache__/
+*.pfx
+*.log
+.DS_Store
+.pytest_cache/
+out/
+*.db
+*.db-wal
+*.db-shm
