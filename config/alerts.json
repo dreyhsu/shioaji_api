@@ -1,0 +1,41 @@
+{
+  "_comment": "Monitor settings: the market time zone and the Telegram alert rules, checked on every 1-minute close. Edits are picked up on the next cycle, no restart needed. cooldown_minutes is global; any rule may set its own. The two trendline_break rules send only once per line.",
+  "cooldown_minutes": 10,
+
+  "_utc_offset_comment": "the market clock (TAIFEX = Taiwan, UTC+8). Every 'now' in the monitor and dashboard is UTC + this, whatever the computer's own timezone, so travelling (e.g. Japan, UTC+9) needs no change. Read at startup: restart monitor.py and dashboard.py after changing it.",
+  "utc_offset_hours": 8,
+
+  "support_bottom_third": {
+    "_comment": "close inside the support box, in its bottom part (0 = box bottom, 1 = box top)",
+    "enabled": true,
+    "zone_max": 0.3333
+  },
+  "resistance_top_third": {
+    "_comment": "close inside the resistance box, in its top part",
+    "enabled": true,
+    "zone_min": 0.6667
+  },
+  "box_in_out": {
+    "_comment": "previous 1-min close inside the box, latest close outside it, either side (support: up = held, down = broke; resistance: up = broke, down = held). Close only, no exit buffer",
+    "enabled": true
+  },
+  "trendline_near": {
+    "_comment": "close within distance_points of a drawn line; set distance_atr (e.g. 0.2) to use hourly ATR instead",
+    "enabled": true,
+    "kinds": ["curve", "line"],
+    "distance_points": 30,
+    "distance_atr": null
+  },
+  "trendline_break_below_up": {
+    "_comment": "close below a rising line by more than buffer_points; sent once per line",
+    "enabled": true,
+    "kinds": ["curve", "line"],
+    "buffer_points": 0
+  },
+  "trendline_break_above_down": {
+    "_comment": "close above a falling line by more than buffer_points; sent once per line",
+    "enabled": true,
+    "kinds": ["curve", "line"],
+    "buffer_points": 0
+  }
+}

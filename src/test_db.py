@@ -136,6 +136,32 @@ def test_replace_boxes_swaps_the_whole_table(conn):
     assert len(db.load_boxes(conn, "TMFR1")) == 1
 
 
+def test_box_override_patches_and_resets_the_stored_box(conn):
+    created = pd.Timestamp("2026-10-08 10:00")
+    frame = pd.DataFrame(
+        {
+            "box_id": [1], "box_type": ["support"], "state": ["fresh"],
+            "top": [10.0], "bottom": [5.0], "pivot_price": [10.0], "atr_width": [5.0],
+            "delta_volume": [1.0], "left_time": [created], "right_time": [created],
+            "created_time": [created], "state_time": [pd.NaT], "holds": [0], "breakouts": [0],
+        }
+    )
+    db.replace_boxes(conn, "TMFR1", frame)
+
+    assert not db.set_box_override(conn, "TMFR1", "resistance", created, 12.0, 6.0)
+    assert db.set_box_override(conn, "TMFR1", "support", created, 12.0, 6.0)
+    assert db.set_box_override(conn, "TMFR1", "support", created, 13.0, 7.0)
+    assert db.load_box_overrides(conn, "TMFR1") == {("support", created): (13.0, 7.0)}
+    row = db.load_boxes(conn, "TMFR1").iloc[0]
+    assert (row["top"], row["bottom"]) == (13.0, 7.0)
+
+    assert db.delete_box_override(conn, "TMFR1", "support", created)
+    assert not db.delete_box_override(conn, "TMFR1", "support", created)
+    assert db.load_box_overrides(conn, "TMFR1") == {}
+    row = db.load_boxes(conn, "TMFR1").iloc[0]
+    assert (row["top"], row["bottom"]) == (10.0, 5.0)  # the first edit's original
+
+
 def test_nat_state_time_survives_the_round_trip(conn):
     frame = pd.DataFrame(
         {

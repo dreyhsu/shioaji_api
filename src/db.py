@@ -8,10 +8,11 @@ Two UNIQUE constraints carry real logic rather than just hygiene:
 * ``orderbook_snapshots(code, event_ts, source)`` -- the monitor re-flushes its
   in-memory book buffer every minute and the windows overlap, so ``INSERT OR
   IGNORE`` makes repeated flushes idempotent instead of needing a watermark.
-* ``telegram_alerts(code, hour_start, box_type, kind)`` -- this *is* the
-  "at most one message per hour per side per kind" rule.  :func:`record_alert`
-  returns whether the row was new, and only a new row gets sent, so restarting
-  the monitor mid-hour cannot double-notify.
+* ``telegram_alerts(code, hour_start, box_type, kind)`` -- rule alerts store the
+  triggering *minute* in ``hour_start`` and their key (``support:7``,
+  ``line:3``) in ``box_type``, so a re-polled minute cannot double-send.  The
+  cooldown and once-per-line rules read the same rows back
+  (:func:`last_alert_at`), so a restart forgets neither.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 import pandas as pd
+
+import market_clock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "tmf.db"
@@ -56,6 +59,16 @@ CREATE TABLE IF NOT EXISTS snr_boxes (
   holds INTEGER, breakouts INTEGER,
   updated_at TEXT,
   PRIMARY KEY (code, box_id)
+);
+
+CREATE TABLE IF NOT EXISTS box_overrides (
+  code TEXT NOT NULL,
+  box_type TEXT NOT NULL,
+  created_time TEXT NOT NULL,
+  top REAL NOT NULL, bottom REAL NOT NULL,
+  orig_top REAL, orig_bottom REAL,
+  updated_at TEXT,
+  PRIMARY KEY (code, box_type, created_time)
 );
 
 CREATE TABLE IF NOT EXISTS box_visits (
@@ -122,6 +135,17 @@ CREATE TABLE IF NOT EXISTS telegram_alerts (
   UNIQUE (code, hour_start, box_type, kind)
 );
 
+CREATE TABLE IF NOT EXISTS trendlines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,
+  label TEXT, color TEXT,
+  anchors TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'line',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trendlines_code ON trendlines (code, enabled);
+
 CREATE TABLE IF NOT EXISTS backfill_progress (
   code TEXT NOT NULL,
   task TEXT NOT NULL,
@@ -160,6 +184,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # EXISTS", so each one is applied only when missing.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
+    ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
 )
 
 
@@ -224,7 +249,7 @@ def upsert_hourly_bars(
     """Write hourly bars; rows at index > ``closed_through`` are marked unfinished."""
     if bars.empty:
         return 0
-    now = _text(pd.Timestamp.now())
+    now = _text(market_clock.now())
     rows = []
     for index, row in enumerate(bars.itertuples(index=False)):
         rows.append(
@@ -308,7 +333,7 @@ def replace_boxes(conn: sqlite3.Connection, code: str, boxes: pd.DataFrame) -> i
     if boxes.empty:
         conn.commit()
         return 0
-    now = _text(pd.Timestamp.now())
+    now = _text(market_clock.now())
     rows = [
         (
             code,
@@ -352,6 +377,81 @@ def load_boxes(conn: sqlite3.Connection, code: str) -> pd.DataFrame:
         if column in frame.columns:
             frame[column] = pd.to_datetime(frame[column])
     return frame
+
+
+def set_box_override(
+    conn: sqlite3.Connection, code: str, box_type: str, created_time: Any, top: float, bottom: float
+) -> bool:
+    """Pin a box's edges by hand; returns False when no such box is stored.
+
+    Keyed by ``created_time`` because ``box_id`` is renumbered on every pass.  The
+    stored ``snr_boxes`` row is patched too, so the dashboard shows the new edges
+    before the monitor's next cycle recomputes the box from the override.
+    """
+    created = _text(created_time)
+    current = conn.execute(
+        "SELECT top, bottom FROM snr_boxes WHERE code = ? AND box_type = ? AND created_time = ?",
+        (code, box_type, created),
+    ).fetchone()
+    if current is None:
+        return False
+    # orig_* is the computed shape, kept from the first edit so a reset can put the
+    # stored row back without waiting for the monitor to recompute it.
+    conn.execute(
+        """
+        INSERT INTO box_overrides
+            (code, box_type, created_time, top, bottom, orig_top, orig_bottom, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (code, box_type, created_time)
+        DO UPDATE SET top = excluded.top, bottom = excluded.bottom, updated_at = excluded.updated_at
+        """,
+        (
+            code, box_type, created, float(top), float(bottom),
+            float(current["top"]), float(current["bottom"]), _text(market_clock.now()),
+        ),
+    )
+    conn.execute(
+        "UPDATE snr_boxes SET top = ?, bottom = ? WHERE code = ? AND box_type = ? AND created_time = ?",
+        (float(top), float(bottom), code, box_type, created),
+    )
+    conn.commit()
+    return True
+
+
+def delete_box_override(conn: sqlite3.Connection, code: str, box_type: str, created_time: Any) -> bool:
+    """Drop a hand edit and put the stored box back to its computed edges."""
+    key = (code, box_type, _text(created_time))
+    row = conn.execute(
+        "SELECT orig_top, orig_bottom FROM box_overrides "
+        "WHERE code = ? AND box_type = ? AND created_time = ?",
+        key,
+    ).fetchone()
+    if row is None:
+        return False
+    if row["orig_top"] is not None:
+        conn.execute(
+            "UPDATE snr_boxes SET top = ?, bottom = ? "
+            "WHERE code = ? AND box_type = ? AND created_time = ?",
+            (row["orig_top"], row["orig_bottom"], *key),
+        )
+    conn.execute(
+        "DELETE FROM box_overrides WHERE code = ? AND box_type = ? AND created_time = ?", key
+    )
+    conn.commit()
+    return True
+
+
+def load_box_overrides(
+    conn: sqlite3.Connection, code: str
+) -> dict[tuple[str, pd.Timestamp], tuple[float, float]]:
+    """``{(box_type, created_time): (top, bottom)}``, the shape ``collect_snr_boxes`` takes."""
+    rows = conn.execute(
+        "SELECT box_type, created_time, top, bottom FROM box_overrides WHERE code = ?", (code,)
+    ).fetchall()
+    return {
+        (row["box_type"], pd.Timestamp(row["created_time"])): (float(row["top"]), float(row["bottom"]))
+        for row in rows
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -509,7 +609,7 @@ def insert_orderbook_rows(
             row.get("visit_id"),
             row.get("reversal_id"),
             code,
-            _text(row.get("captured_at") or pd.Timestamp.now()),
+            _text(row.get("captured_at") or market_clock.now()),
             _text(row["event_ts"]),
             row.get("source", "bidask_v1"),
             int(row.get("levels", 5)),
@@ -573,7 +673,7 @@ def insert_reversal(conn: sqlite3.Connection, code: str, event: dict) -> int:
         (
             event.get("visit_id"),
             code,
-            _text(event.get("detected_at") or pd.Timestamp.now()),
+            _text(event.get("detected_at") or market_clock.now()),
             _text(event.get("hour_start")),
             1 if event.get("bar_closed") else 0,
             event.get("minutes_into_bar"),
@@ -635,6 +735,66 @@ def reversal_exists(
 
 
 # --------------------------------------------------------------------------------------
+# Trendlines
+# --------------------------------------------------------------------------------------
+def insert_trendline(
+    conn: sqlite3.Connection,
+    code: str,
+    anchors: Sequence[dict],
+    *,
+    label: str | None = None,
+    color: str | None = None,
+    kind: str = "line",
+    created_at: Any = None,
+) -> int:
+    """Store a hand drawing; ``anchors`` is ``[{"time": epoch, "price": p}, ...]``.
+
+    Anchors are kept in time order.  For a ``"curve"`` that puts the Bezier
+    control point in the middle, which is where ``trendline`` expects it.
+    """
+    ordered = sorted(
+        ({"time": int(a["time"]), "price": float(a["price"])} for a in anchors),
+        key=lambda a: a["time"],
+    )
+    cursor = conn.execute(
+        "INSERT INTO trendlines (code, label, color, anchors, kind, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?)",
+        (
+            code,
+            label,
+            color,
+            json.dumps(ordered),
+            kind,
+            _text(market_clock.now() if created_at is None else created_at),
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def load_trendlines(conn: sqlite3.Connection, code: str, enabled_only: bool = True) -> list[dict]:
+    query = "SELECT * FROM trendlines WHERE code = ?"
+    if enabled_only:
+        query += " AND enabled = 1"
+    rows = conn.execute(query + " ORDER BY id", (code,)).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["anchors"] = json.loads(item["anchors"])
+        out.append(item)
+    return out
+
+
+def delete_trendline(conn: sqlite3.Connection, line_id: int) -> bool:
+    """Soft delete: past ``telegram_alerts`` rows keep pointing at a real line."""
+    cursor = conn.execute(
+        "UPDATE trendlines SET enabled = 0 WHERE id = ? AND enabled = 1", (int(line_id),)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+# --------------------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------------------
 def record_alert(
@@ -667,7 +827,7 @@ def record_alert(
             box_id,
             visit_id,
             kind,
-            _text(pd.Timestamp.now()),
+            _text(market_clock.now()),
             message,
         ),
     )
@@ -680,9 +840,29 @@ def record_alert(
 def mark_alert_sent(conn: sqlite3.Connection, alert_id: int, ok: bool) -> None:
     conn.execute(
         "UPDATE telegram_alerts SET ok = ?, sent_at = ? WHERE id = ?",
-        (1 if ok else 0, _text(pd.Timestamp.now()), int(alert_id)),
+        (1 if ok else 0, _text(market_clock.now()), int(alert_id)),
     )
     conn.commit()
+
+
+def last_alert_at(
+    conn: sqlite3.Connection, code: str, box_type: str, kind: str
+) -> pd.Timestamp | None:
+    """Newest ``hour_start`` claimed for this (key, rule), or None.
+
+    Rule alerts store the triggering minute in ``hour_start``, so a cooldown is
+    measured in market time and survives a restart.
+    """
+    row = conn.execute(
+        "SELECT MAX(hour_start) AS last FROM telegram_alerts "
+        "WHERE code = ? AND box_type = ? AND kind = ?",
+        (code, box_type, kind),
+    ).fetchone()
+    return pd.Timestamp(row["last"]) if row and row["last"] else None
+
+
+def alert_exists(conn: sqlite3.Connection, code: str, box_type: str, kind: str) -> bool:
+    return last_alert_at(conn, code, box_type, kind) is not None
 
 
 def load_alerts(conn: sqlite3.Connection, code: str, limit: int = 50) -> pd.DataFrame:
@@ -706,7 +886,7 @@ def mark_backfill_done(
         ON CONFLICT(code, task, key) DO UPDATE SET
             done_at=excluded.done_at, rows=excluded.rows, note=excluded.note
         """,
-        (code, task, key, _text(pd.Timestamp.now()), int(rows), note),
+        (code, task, key, _text(market_clock.now()), int(rows), note),
     )
     conn.commit()
 

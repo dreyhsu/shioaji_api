@@ -80,6 +80,15 @@ body {
   border-radius: 6px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
 }
 .chart-tools button:hover { color: var(--text); border-color: var(--muted); }
+.chart-tools button.active { color: #1a1c23; background: #f5c542; border-color: #f5c542; }
+.draw-hint { padding: 0 2px 4px; font-size: 12px; color: #f5c542; }
+.draw-hint[hidden] { display: none; }
+.trendline-list { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 2px 4px; font-size: 12px; color: var(--muted); }
+.trendline-list:empty { display: none; }
+.trendline-list .tl { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px 1px 7px; }
+.trendline-list .tl i { width: 10px; height: 3px; display: inline-block; }
+.trendline-list button { background: none; border: 0; color: var(--muted); cursor: pointer; font: inherit; padding: 0 3px; }
+.trendline-list button:hover { color: var(--resistance); }
 /* Reserved height so the chart does not jump as the crosshair readout appears. */
 .legend-ohlc { height: 18px; padding: 0 2px 2px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .legend-ohlc b.up { color: var(--support); }

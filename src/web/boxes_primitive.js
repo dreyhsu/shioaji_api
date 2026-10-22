@@ -106,6 +106,35 @@
           ctx.fillStyle = it.border;
           ctx.fillText(it.label, cx1 + padX, cy1 + padY);
         }
+
+        // Grips on the edges of a box that can be dragged, centred on the part of
+        // the box that is on screen.
+        if (it.editable) {
+          ctx.setLineDash([]);
+          ctx.fillStyle = it.border;
+          const gw = Math.round(18 * hr);
+          const gh = Math.max(2, Math.round((it.active ? 4 : 3) * vr));
+          const gx = Math.round((cx1 + cx2) / 2 - gw / 2);
+          if (hasTop) ctx.fillRect(gx, y1 - Math.floor(gh / 2), gw, gh);
+          if (hasBottom) ctx.fillRect(gx, y2 - Math.floor(gh / 2), gw, gh);
+        }
+
+        // While dragging, print both edge prices at the right end of the box.
+        if (it.active) {
+          ctx.setLineDash([]);
+          ctx.font = 'bold ' + fontPx + 'px -apple-system, "Helvetica Neue", sans-serif';
+          ctx.textAlign = 'right';
+          ctx.fillStyle = it.border;
+          const tx = cx2 - padX - Math.round(60 * hr);
+          if (hasTop) {
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(it.topText, tx, y1 - padY);
+          }
+          if (hasBottom) {
+            ctx.textBaseline = 'top';
+            ctx.fillText(it.bottomText, tx, y2 + padY);
+          }
+        }
       }
       ctx.restore();
     });
@@ -174,7 +203,12 @@
         fill: style.fill,
         border: style.border,
         dashed: box.state === 'broken',
-        label: '#' + box.box_id,
+        label: '#' + box.box_id + (box.adjusted ? ' ✎' : ''),
+        editable: src.isEditable(box),
+        active: box === src._active,
+        topText: String(Math.round(box.top)),
+        bottomText: String(Math.round(box.bottom)),
+        box: box,
       });
     }
   };
@@ -189,7 +223,50 @@
     this._paneView = new BoxesPaneView(this);
     this._paneViews = [this._paneView];
     this._signature = null;
+    this._active = null; // the box being dragged
   }
+
+  // Only the live boxes -- the ones whose right edge is still advancing -- can be
+  // reshaped; the rest are history.
+  BoxesPrimitive.prototype.isEditable = function (box) { return !!box.open; };
+
+  // Hit test in pane CSS pixels.  Returns { box, part } with part 'top', 'bottom'
+  // or 'body', or null.  Edges win over the body, and the grab band is a few px
+  // wide so a thin box can still be moved by its body.
+  BoxesPrimitive.prototype.hitTest = function (x, y, width) {
+    const items = this._paneView._items;
+    const tol = 5;
+    let body = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (!it.editable) continue;
+      const x1 = Math.min(it.x1, it.x2);
+      const x2 = it.openRight ? width : Math.max(it.x1, it.x2);
+      if (x < x1 || x > x2) continue;
+      const top = Math.min(it.y1, it.y2);
+      const bottom = Math.max(it.y1, it.y2);
+      if (Math.abs(y - top) <= tol) return { box: it.box, part: 'top' };
+      if (Math.abs(y - bottom) <= tol) return { box: it.box, part: 'bottom' };
+      if (!body && y > top && y < bottom) body = { box: it.box, part: 'body' };
+    }
+    return body;
+  };
+
+  // Live preview while dragging: move the edges in place and repaint.
+  BoxesPrimitive.prototype.previewEdges = function (box, top, bottom) {
+    box.top = top;
+    box.bottom = bottom;
+    this._active = box;
+    if (this._requestUpdate) this._requestUpdate();
+  };
+
+  BoxesPrimitive.prototype.endPreview = function () {
+    this._active = null;
+    // Forces the next setBoxes through even if the server echoes the same payload
+    // the preview started from (a cancelled or failed drag).
+    this._signature = null;
+    if (this._requestUpdate) this._requestUpdate();
+  };
 
   BoxesPrimitive.prototype.attached = function (params) {
     this._chart = params.chart;

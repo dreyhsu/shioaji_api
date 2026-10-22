@@ -123,6 +123,40 @@ def test_box_bottom_is_pivot_minus_atr(one_support_box):
     assert boxes.iloc[0]["bottom"] == pytest.approx(5.0 - atr)
 
 
+def test_override_replaces_the_edges_of_the_matching_box(one_support_box):
+    created = one_support_box["timestamp"].iloc[4]
+    boxes = snr.collect_snr_boxes(
+        one_support_box, lookback=2, volume_length=2, atr_length=2, box_width=1.0,
+        overrides={("support", created): (7.0, 2.0)},
+    )
+    box = boxes.iloc[0]
+    assert (box["top"], box["bottom"]) == (7.0, 2.0)
+    assert box["pivot_price"] == pytest.approx(5.0)  # still the computed pivot
+
+
+def test_override_moves_the_level_the_crosses_test(one_support_box):
+    # Bar 5's low (10) crosses over a top raised to 10.5 only via the override's
+    # level; with the computed top of 5 it never crosses at all.
+    created = one_support_box["timestamp"].iloc[4]
+    plain = snr.collect_snr_boxes(
+        one_support_box, lookback=2, volume_length=2, atr_length=2, box_width=1.0
+    )
+    edited = snr.collect_snr_boxes(
+        one_support_box, lookback=2, volume_length=2, atr_length=2, box_width=1.0,
+        overrides={("support", created): (10.5, 4.0)},
+    )
+    assert plain.iloc[0]["holds"] != edited.iloc[0]["holds"] or plain.iloc[0]["state"] != edited.iloc[0]["state"]
+
+
+def test_override_for_another_box_is_ignored(one_support_box):
+    created = one_support_box["timestamp"].iloc[4]
+    boxes = snr.collect_snr_boxes(
+        one_support_box, lookback=2, volume_length=2, atr_length=2, box_width=1.0,
+        overrides={("resistance", created): (99.0, 98.0)},
+    )
+    assert boxes.iloc[0]["top"] == pytest.approx(5.0)
+
+
 def test_box_width_scales_the_box(one_support_box):
     narrow = snr.collect_snr_boxes(
         one_support_box, lookback=2, volume_length=2, atr_length=2, box_width=0.5

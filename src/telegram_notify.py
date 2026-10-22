@@ -1,4 +1,4 @@
-"""Telegram alerts for box entries, hourly reminders and reversal patterns.
+"""Telegram alerts for the box and trendline rules in ``alert_rules``.
 
 The transport follows ``src/telegram_sample.py``: POST to ``sendMessage`` with
 ``parse_mode=HTML`` and credentials from ``.env``.
@@ -7,9 +7,9 @@ Nothing here can fail loudly.  A notification problem must never take down the
 monitor that is collecting data, so a missing token or a dead network returns
 ``False`` and the caller records ``ok = 0`` against the alert row.
 
-Rate limiting lives in the database, not here -- ``db.record_alert`` relies on a
-UNIQUE constraint over ``(code, hour_start, box_type, kind)`` to decide whether a
-message is owed, so this module only formats and sends what it is handed.
+Rate limiting lives in ``monitor.send_rule`` (cooldown and once-per-line, both
+read back from the alert rows in the database), so this module only formats and
+sends what it is handed.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+
+import market_clock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -36,16 +38,7 @@ REQUEST_TIMEOUT = 10
 SUPPORT_BADGE = "\U0001f7e9"  # green square
 RESISTANCE_BADGE = "\U0001f7e5"  # red square
 
-STATE_LABEL = {"fresh": "未觸發", "holds": "已支撐", "broken": "已突破"}
 SIDE_LABEL = {"support": "支撐箱", "resistance": "阻力箱"}
-PATTERN_LABEL = {
-    "long_lower_tail": "長下影（錘子）",
-    "long_upper_tail": "長上影（射擊之星）",
-    "bullish_engulfing": "多頭吞噬",
-    "bearish_engulfing": "空頭吞噬",
-    "piercing_line": "貫穋線",
-    "dark_cloud_cover": "烏雲罩頂",
-}
 
 
 def credentials_present() -> bool:
@@ -80,119 +73,90 @@ def _badge(box_type: str) -> str:
     return SUPPORT_BADGE if box_type == "support" else RESISTANCE_BADGE
 
 
-def _book_line(book_source: str | None, levels: int | None) -> str:
-    if not book_source:
-        return "委託簿：<b>未取得</b>"
-    if book_source == "bidask_v1":
-        return f"委託簿：<b>五檔</b>（{levels} 檔，即時）"
-    if book_source == "snapshot":
-        return "委託簿：<b>一檔</b>（snapshot 降級模式）"
-    return f"委託簿：{book_source}"
+def _stamp(minute_start) -> str:
+    return f"\U0001f550 {pd.Timestamp(minute_start):%Y-%m-%d %H:%M} 1 分 K 收盤"
 
 
-def _pattern_names(patterns: list[str] | None) -> str:
-    if not patterns:
-        return "尚未出現"
-    return "、".join(PATTERN_LABEL.get(name, name) for name in patterns)
+FOOTER = "<i>僅為提示，未下單</i>"
 
 
-def format_entry_alert(
+def format_zone_alert(
     *,
     code: str,
     box_type: str,
     box_id: int,
     box_top: float,
     box_bottom: float,
-    box_state: str,
     price: float,
     zone_pct: float,
     minute_start,
-    hourly_atr: float | None,
-    book_source: str | None = None,
-    book_levels: int | None = None,
 ) -> str:
-    direction = "回落進入" if box_type == "support" else "上漲進入"
-    atr_text = f"{hourly_atr:,.1f}" if hourly_atr and pd.notna(hourly_atr) else "n/a"
+    """Close in the bottom third of support / top third of resistance."""
+    where = "下緣 1/3" if box_type == "support" else "上緣 1/3"
     return (
-        f"{_badge(box_type)} <b>{code} 價格{direction}{SIDE_LABEL[box_type]}</b>\n"
-        f"\U0001f550 {pd.Timestamp(minute_start):%Y-%m-%d %H:%M} (1分K)\n\n"
-        f"現價：<b>{price:,.0f}</b>\n"
-        f"箱體 #{box_id}：{box_bottom:,.0f} ~ {box_top:,.0f}"
-        f"（高 {box_top - box_bottom:,.0f}）\n"
-        f"箱內位置：<b>{zone_pct * 100:.0f}%</b>"
-        f"（0%=下緣，100%=上緣）\n"
-        f"箱體狀態：{STATE_LABEL.get(box_state, box_state)}\n"
-        f"小時 ATR：{atr_text}\n"
-        f"{_book_line(book_source, book_levels)}\n\n"
-        f"<i>已開始記錄委託簿</i>"
+        f"{_badge(box_type)} <b>{code} 收盤進入{SIDE_LABEL[box_type]}{where}</b>\n"
+        f"{_stamp(minute_start)}\n\n"
+        f"價格：<b>{price:,.0f}</b>（箱內位置 {zone_pct * 100:.0f}%）\n"
+        f"箱體 #{box_id}：{box_bottom:,.0f} – {box_top:,.0f}\n\n"
+        f"{FOOTER}"
     )
 
 
-def format_hourly_alert(
+def format_box_exit_alert(
     *,
     code: str,
     box_type: str,
     box_id: int,
     box_top: float,
     box_bottom: float,
-    box_state: str,
     price: float,
-    zone_pct: float,
-    hour_start,
-    minutes_in_box: int,
-    min_zone_pct: float | None,
-    max_zone_pct: float | None,
-    orderbook_rows: int,
-    patterns: list[str] | None,
-    hourly_atr: float | None,
-) -> str:
-    atr_text = f"{hourly_atr:,.1f}" if hourly_atr and pd.notna(hourly_atr) else "n/a"
-    span = (
-        f"{min_zone_pct * 100:.0f}% ~ {max_zone_pct * 100:.0f}%"
-        if min_zone_pct is not None and max_zone_pct is not None
-        else "n/a"
-    )
-    return (
-        f"{_badge(box_type)} <b>{code} 仍在{SIDE_LABEL[box_type]}內</b>\n"
-        f"\U0001f550 {pd.Timestamp(hour_start):%Y-%m-%d %H:%M} 小時棒\n\n"
-        f"現價：<b>{price:,.0f}</b>（箱內 {zone_pct * 100:.0f}%）\n"
-        f"箱體 #{box_id}：{box_bottom:,.0f} ~ {box_top:,.0f}"
-        f"（{STATE_LABEL.get(box_state, box_state)}）\n"
-        f"已停留：<b>{minutes_in_box}</b> 分鐘\n"
-        f"走過區間：{span}\n"
-        f"小時 ATR：{atr_text}\n"
-        f"反轉型態：{_pattern_names(patterns)}\n"
-        f"委託簿累積：<b>{orderbook_rows:,}</b> 筆"
-    )
-
-
-def format_reversal_alert(
-    *,
-    code: str,
-    box_type: str,
-    box_id: int,
-    box_top: float,
-    box_bottom: float,
-    pattern: str,
     direction: str,
-    detail: dict,
-    price: float,
-    zone_pct: float,
-    hour_start,
-    minutes_into_bar: int,
-    bar_closed: bool,
+    minute_start,
 ) -> str:
-    arrow = "⬆️ 做多" if direction == "long" else "⬇️ 做空"
-    status = "已收棒" if bar_closed else f"未收棒（第 {minutes_into_bar} 分）"
-    detail_lines = "\n".join(f"  {key} = {value}" for key, value in detail.items())
+    """The previous minute closed inside the box and this one closed outside it."""
+    held = (box_type == "support") == (direction == "up")
+    if held:
+        head = "\U0001f6e1\ufe0f 守住" + ("（向上離開）" if direction == "up" else "（向下離開）")
+    else:
+        head = "\u2b06\ufe0f 突破" if direction == "up" else "\u2b07\ufe0f 跌破"
+    edge = box_top if direction == "up" else box_bottom
     return (
-        f"⚡ <b>{code} {SIDE_LABEL[box_type]}出現反轉型態</b>\n"
-        f"\U0001f550 {pd.Timestamp(hour_start):%Y-%m-%d %H:%M} 小時棒（{status}）\n\n"
-        f"型態：<b>{PATTERN_LABEL.get(pattern, pattern)}</b>  {arrow}\n"
-        f"現價：<b>{price:,.0f}</b>（箱內 {zone_pct * 100:.0f}%）\n"
-        f"箱體 #{box_id}：{box_bottom:,.0f} ~ {box_top:,.0f}\n\n"
-        f"<i>量化細節</i>\n<code>{detail_lines}</code>\n\n"
-        f"<i>僅為提示，未下單</i>"
+        f"{head} <b>{code} {SIDE_LABEL[box_type]} #{box_id}</b>\n"
+        f"{_stamp(minute_start)}\n\n"
+        f"價格：<b>{price:,.0f}</b>（{'箱頂' if direction == 'up' else '箱底'} {edge:,.0f}，"
+        f"差 {abs(price - edge):,.0f}）\n"
+        f"箱體：{box_bottom:,.0f} – {box_top:,.0f}\n\n"
+        f"{FOOTER}"
+    )
+
+
+LINE_EVENT = {
+    "near": "\U0001f3af 接近",
+    "break_below_up": "\U0001f4c9 跌破上升",
+    "break_above_down": "\U0001f4c8 突破下降",
+}
+
+
+def format_line_alert(
+    *,
+    code: str,
+    label: str,
+    event: str,
+    price: float,
+    line_value: float,
+    slope: float,
+    minute_start,
+) -> str:
+    """Price near a drawn line, or through a rising / falling one."""
+    diff = price - line_value
+    note = "（此線僅通知一次）" if event != "near" else ""
+    return (
+        f"{LINE_EVENT[event]} <b>{code} {label}</b>{note}\n"
+        f"{_stamp(minute_start)}\n\n"
+        f"價格：<b>{price:,.0f}</b>（線值 {line_value:,.0f}，"
+        f"{'高' if diff >= 0 else '低'} {abs(diff):,.0f}）\n"
+        f"線斜率：{slope:+,.1f} 點 / 小時棒\n\n"
+        f"{FOOTER}"
     )
 
 
@@ -200,66 +164,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Send a Telegram message or a format demo.")
     parser.add_argument("--message", type=str, help="send this literal text")
     parser.add_argument(
-        "--demo", action="store_true", help="print the three templates without sending"
+        "--demo", action="store_true", help="print the message templates without sending"
     )
     args = parser.parse_args()
 
     if args.demo:
-        now = pd.Timestamp.now().floor("min")
-        print(
-            format_entry_alert(
-                code="TMFR1",
-                box_type="support",
-                box_id=7,
-                box_top=49600,
-                box_bottom=49400,
-                box_state="fresh",
-                price=49480,
-                zone_pct=0.4,
-                minute_start=now,
-                hourly_atr=145.3,
-                book_source="bidask_v1",
-                book_levels=5,
-            )
-        )
-        print("\n" + "-" * 60 + "\n")
-        print(
-            format_hourly_alert(
-                code="TMFR1",
-                box_type="support",
-                box_id=7,
-                box_top=49600,
-                box_bottom=49400,
-                box_state="holds",
-                price=49450,
-                zone_pct=0.25,
-                hour_start=now.floor("h"),
-                minutes_in_box=37,
-                min_zone_pct=0.1,
-                max_zone_pct=0.62,
-                orderbook_rows=11234,
-                patterns=["long_lower_tail"],
-                hourly_atr=145.3,
-            )
-        )
-        print("\n" + "-" * 60 + "\n")
-        print(
-            format_reversal_alert(
-                code="TMFR1",
-                box_type="support",
-                box_id=7,
-                box_top=49600,
-                box_bottom=49400,
-                pattern="long_lower_tail",
-                direction="long",
-                detail={"wick_body_ratio": 4.2, "close_pos": 0.81},
-                price=49520,
-                zone_pct=0.6,
-                hour_start=now.floor("h"),
-                minutes_into_bar=24,
-                bar_closed=False,
-            )
-        )
+        now = market_clock.now().floor("min")
+        samples = [
+            format_zone_alert(
+                code="TMFR1", box_type="support", box_id=7, box_top=49600,
+                box_bottom=49400, price=49450, zone_pct=0.25, minute_start=now,
+            ),
+            format_box_exit_alert(
+                code="TMFR1", box_type="resistance", box_id=9, box_top=50200,
+                box_bottom=50050, price=50230, direction="up", minute_start=now,
+            ),
+            format_line_alert(
+                code="TMFR1", label="曲線 #3", event="near", price=49620,
+                line_value=49600, slope=12.5, minute_start=now,
+            ),
+            format_line_alert(
+                code="TMFR1", label="趨勢線 #4", event="break_below_up", price=49540,
+                line_value=49580, slope=8.0, minute_start=now,
+            ),
+        ]
+        print(("\n\n" + "-" * 60 + "\n\n").join(samples))
     elif args.message:
         ok = send_message(args.message)
         print("sent" if ok else "failed")

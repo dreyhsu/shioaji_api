@@ -35,6 +35,8 @@ import pandas as pd
 import shioaji as sj
 from dotenv import load_dotenv
 
+import market_clock
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # kbars requests are chunked so one failure does not cost the whole backfill, and
@@ -244,7 +246,7 @@ def fetch_latest_minute_bars(api: sj.Shioaji, contract, *, verbose: bool = False
     slices by calendar day (quirk 2), so "today" alone would miss the first hours
     of a night session that is still running.
     """
-    today = date.today()
+    today = market_clock.today()
     return fetch_minute_bars(api, contract, today - timedelta(days=1), today, verbose=verbose)
 
 

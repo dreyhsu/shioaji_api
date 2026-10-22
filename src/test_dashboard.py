@@ -89,21 +89,23 @@ def test_every_series_sits_on_the_candles_time_grid(client):
     payload = client.get("/api/chart").json()
     times = [bar["time"] for bar in payload["bars"]]
     names = {spec["name"] for spec in payload["series"]}
-    assert {"delta_volume", "support_filter", "resistance_filter"} <= names
+    # Price + volume only: the delta-volume and ATR sub-charts are gone.
+    assert names == {"volume"}
 
     for spec in payload["series"]:
         # Equal length and identical timestamps: a series on its own grid would
         # shift the logical index of every bar, and the boxes are positioned by
         # logical index.
         assert [point["time"] for point in spec["data"]] == times, spec["name"]
-        assert spec["pane"] in (0, 1, 2)
+        assert spec["pane"] in (0, 1)
         assert spec["type"] in ("line", "histogram", "area", "baseline")
 
-    histogram = next(s for s in payload["series"] if s["name"] == "delta_volume")
-    coloured = [p for p in histogram["data"] if "value" in p]
-    assert coloured
-    for point in coloured:
-        expected = dashboard.UP_COLOR if point["value"] >= 0 else dashboard.DOWN_COLOR
+    volume = next(s for s in payload["series"] if s["name"] == "volume")
+    assert volume["pane"] == 1 and volume["type"] == "histogram"
+    assert volume["autoscale"] is True
+    for bar, point in zip(payload["bars"], volume["data"]):
+        assert point["value"] == bar["volume"]
+        expected = dashboard.UP_COLOR if bar["close"] >= bar["open"] else dashboard.DOWN_COLOR
         assert point["color"] == expected
 
 
@@ -166,3 +168,89 @@ def test_real_db_box_18_extends_past_the_last_bar(monkeypatch):
     open_boxes = [box for box in payload["boxes"] if box["open"]]
     assert open_boxes, "the newest box of a side should still be advancing"
     assert all(len(s["data"]) == len(payload["bars"]) for s in payload["series"])
+
+
+def test_trendline_round_trip_renders_on_the_price_pane(client):
+    bars = client.get("/api/chart").json()["bars"]
+    a, b = bars[-20]["time"], bars[-10]["time"]
+    assert client.post(
+        "/api/trendlines", json={"anchors": [{"time": a, "price": 1}]}
+    ).status_code == 422
+    created = client.post(
+        "/api/trendlines",
+        json={"anchors": [{"time": b, "price": 20100}, {"time": a, "price": 20000}]},
+    )
+    assert created.status_code == 200
+    line_id = created.json()["id"]
+
+    payload = client.get("/api/chart").json()
+    assert [line["id"] for line in payload["trendlines"]] == [line_id]
+    spec = next(s for s in payload["series"] if s["name"] == f"trendline_{line_id}")
+    assert spec["pane"] == 0
+    # Kept out of the price autoscale, so the zoom fits the candles.
+    assert spec["autoscale"] is False
+    assert [p["time"] for p in spec["data"]] == [bar["time"] for bar in payload["bars"]]
+    values = [p.get("value") for p in spec["data"]]
+    assert values[-20] == pytest.approx(20000)
+    assert values[-10] == pytest.approx(20100)
+    assert values[-1] == pytest.approx(20190)  # extended right at +10/bar
+    assert values[-21] is None
+
+    assert client.delete(f"/api/trendlines/{line_id}").status_code == 200
+    assert client.delete(f"/api/trendlines/{line_id}").status_code == 404
+    assert client.get("/api/chart").json()["trendlines"] == []
+
+
+def test_curve_round_trip(client):
+    bars = client.get("/api/chart").json()["bars"]
+    t0, t1, t2 = bars[-30]["time"], bars[-20]["time"], bars[-10]["time"]
+    bad = client.post(
+        "/api/trendlines",
+        json={"kind": "curve", "anchors": [{"time": t0, "price": 1}, {"time": t2, "price": 2}]},
+    )
+    assert bad.status_code == 422
+    created = client.post(
+        "/api/trendlines",
+        json={
+            "kind": "curve",
+            "anchors": [
+                {"time": t2, "price": 20200},
+                {"time": t0, "price": 20000},
+                {"time": t1, "price": 20000},
+            ],
+        },
+    )
+    line_id = created.json()["id"]
+    payload = client.get("/api/chart").json()
+    assert payload["trendlines"][0]["kind"] == "curve"
+    spec = next(s for s in payload["series"] if s["name"] == f"trendline_{line_id}")
+    assert spec["label"] == f"曲線 #{line_id}"
+    values = [p.get("value") for p in spec["data"]]
+    assert values[-30] == pytest.approx(20000)
+    assert values[-20] == pytest.approx(20050)  # bent: chord would be 20100
+    assert values[-10] == pytest.approx(20200)
+    assert values[-9] == pytest.approx(20220)  # end tangent: +200 / 10 bars
+
+
+def test_box_override_round_trip(client):
+    live = next(b for b in client.get("/api/chart").json()["boxes"] if b["open"])
+    body = {
+        "box_type": live["box_type"],
+        "created_time": live["created_time"],
+        "top": live["top"] + 10,
+        "bottom": live["bottom"] - 10,
+    }
+    assert client.put("/api/boxes/override", json={**body, "top": 1, "bottom": 2}).status_code == 422
+    assert client.put("/api/boxes/override", json={**body, "created_time": "2000-01-01 00:00:00"}).status_code == 404
+    assert client.put("/api/boxes/override", json=body).status_code == 200
+
+    edited = next(b for b in client.get("/api/chart").json()["boxes"] if b["box_id"] == live["box_id"])
+    assert edited["adjusted"] is True
+    assert (edited["top"], edited["bottom"]) == (body["top"], body["bottom"])
+
+    params = {"box_type": live["box_type"], "created_time": live["created_time"]}
+    assert client.delete("/api/boxes/override", params=params).status_code == 200
+    assert client.delete("/api/boxes/override", params=params).status_code == 404
+    reset = next(b for b in client.get("/api/chart").json()["boxes"] if b["box_id"] == live["box_id"])
+    assert reset["adjusted"] is False
+    assert (reset["top"], reset["bottom"]) == (live["top"], live["bottom"])

@@ -30,14 +30,19 @@ from pathlib import Path
 import pandas as pd
 import plotly.io as pio
 from fastapi import FastAPI, HTTPException, Query
+from typing import Literal
+
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import db
+import market_clock
 import session_bars as sb
 import snr_core as snr
+import trendline as tl
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 PLOTLY_BUNDLE = WEB_DIR / "plotly.min.js"
@@ -50,6 +55,7 @@ LWC_URL = (
 
 UP_COLOR = "#20ca26"
 DOWN_COLOR = "#e92929"
+TRENDLINE_COLOR = "#f5c542"
 
 # ``_load`` re-reads every minute bar and resamples, so one browser poll hitting
 # four endpoints would do that work four times over.  The monitor only has
@@ -150,6 +156,7 @@ def _boxes_payload(data) -> list[dict]:
     start = visible["timestamp"].iloc[0]
     end = visible["timestamp"].iloc[-1]
     clipped = snr.clip_boxes(boxes, start, end)
+    overrides = data.get("box_overrides") or {}
     rows = []
     for box in clipped.itertuples(index=False):
         rows.append(
@@ -166,65 +173,55 @@ def _boxes_payload(data) -> list[dict]:
                 "breakouts": int(box.breakouts),
                 "delta_volume": float(box.delta_volume),
                 "created_time": _json_safe(box.created_time),
+                "adjusted": (str(box.box_type), pd.Timestamp(box.created_time)) in overrides,
             }
         )
     return rows
 
 
-def _series_payload(
-    data, volume_length: int = snr.DEFAULT_VOLUME_LENGTH
-) -> list[dict]:
+def _series_payload(data) -> list[dict]:
     """Indicator curves as a generic, open-ended list.
 
     The browser builds whatever this returns by ``type`` and ``pane``, so a new
-    indicator is a change here and nowhere else.  Panes: 0 price, 1 volume,
-    2 oscillators.  Everything is computed on the full history and sliced to the
-    window, so rolling windows are not distorted by the window edge.
+    indicator is a change here and nowhere else.  Panes: 0 price, 1 volume.
+    Everything is computed on the full history and sliced to the window, so
+    rolling windows are not distorted by the window edge.
+
+    ``autoscale: False`` keeps a series out of the price scale's fit: the zoom
+    follows the candles, not a trendline extended far off-screen.
     """
     hourly, visible = data["hourly"], data["visible"]
     tail = len(visible)
     times = _epochs(visible["timestamp"])
+    rising = (visible["close"] >= visible["open"]).to_numpy()
 
-    scaled = snr.delta_volume(hourly) / 2.5
     specs = [
         {
-            "name": "delta_volume",
-            "label": "delta volume / 2.5",
+            "name": "volume",
+            "label": "volume",
             "pane": 1,
             "type": "histogram",
             "color": UP_COLOR,
-            "values": scaled,
-            "color_by_sign": True,
+            "values": hourly["volume"].astype(float),
+            "color_by_candle": True,
             "precision": 0,
-        },
-        {
-            "name": "support_filter",
-            "label": "support filter (highest)",
-            "pane": 1,
-            "type": "line",
-            "color": snr.SUPPORT_COLOR,
-            "values": scaled.rolling(volume_length, min_periods=volume_length).max(),
-            "precision": 0,
-        },
-        {
-            "name": "resistance_filter",
-            "label": "resistance filter (lowest)",
-            "pane": 1,
-            "type": "line",
-            "color": snr.RESISTANCE_COLOR,
-            "values": scaled.rolling(volume_length, min_periods=volume_length).min(),
-            "precision": 0,
-        },
-        {
-            "name": f"atr{snr.DEFAULT_ATR_LENGTH}",
-            "label": f"ATR({snr.DEFAULT_ATR_LENGTH})",
-            "pane": 2,
-            "type": "line",
-            "color": "#8ab4f8",
-            "values": snr.pine_atr(hourly, snr.DEFAULT_ATR_LENGTH),
-            "precision": 1,
         },
     ]
+    for line in data.get("trendlines") or []:
+        specs.append(
+            {
+                "name": f"trendline_{line['id']}",
+                "label": line.get("label") or tl.default_label(line),
+                "pane": 0,
+                "type": "line",
+                "color": line.get("color") or TRENDLINE_COLOR,
+                "line_width": 2,
+                "last_value_visible": True,
+                "autoscale": False,
+                "values": tl.line_values(hourly, line["anchors"], line.get("kind") or "line"),
+                "precision": 0,
+            }
+        )
 
     out = []
     for spec in specs:
@@ -238,8 +235,8 @@ def _series_payload(
                 points.append({"time": stamp})
                 continue
             point = {"time": stamp, "value": float(value)}
-            if spec.get("color_by_sign"):
-                point["color"] = UP_COLOR if value >= 0 else DOWN_COLOR
+            if spec.get("color_by_candle"):
+                point["color"] = UP_COLOR if rising[index] else DOWN_COLOR
             points.append(point)
         out.append(
             {
@@ -248,6 +245,9 @@ def _series_payload(
                 "pane": spec["pane"],
                 "type": spec["type"],
                 "color": spec["color"],
+                "line_width": spec.get("line_width", 1),
+                "last_value_visible": spec.get("last_value_visible", True),
+                "autoscale": spec.get("autoscale", True),
                 "price_format": {
                     "type": "price",
                     "precision": spec["precision"],
@@ -293,6 +293,8 @@ def _load(code: str, days: int):
         visits = db.load_visits(conn, code, limit=30)
         alerts = db.load_alerts(conn, code, limit=30)
         book_rows = db.count_orderbook_rows(conn, code)
+        trendlines = db.load_trendlines(conn, code)
+        box_overrides = db.load_box_overrides(conn, code)
 
     if minute_bars.empty:
         return None
@@ -317,6 +319,8 @@ def _load(code: str, days: int):
         "alerts": alerts,
         "book_rows": book_rows,
         "atr": atr,
+        "trendlines": trendlines,
+        "box_overrides": box_overrides,
     }
 
 
@@ -348,10 +352,11 @@ def api_chart(
     return {
         "code": code,
         "timeframe": "1h",
-        "generated_at": pd.Timestamp.now().isoformat(sep=" "),
+        "generated_at": market_clock.now().isoformat(sep=" "),
         "bars": _bars_payload(data),
         "boxes": _boxes_payload(data),
         "series": _series_payload(data),
+        "trendlines": data.get("trendlines") or [],
     }
 
 
@@ -409,6 +414,93 @@ def api_figure(
     return Response(content=pio.to_json(figure), media_type="application/json")
 
 
+# --------------------------------------------------------------------------------------
+# Trendlines and box edits -- the only writes the dashboard makes.  sqlite runs in
+# WAL mode, so they do not block the monitor; the monitor picks them up next cycle.
+# --------------------------------------------------------------------------------------
+class Anchor(BaseModel):
+    time: int
+    price: float
+
+
+class TrendlineIn(BaseModel):
+    code: str | None = None
+    label: str | None = Field(default=None, max_length=40)
+    color: str | None = Field(default=None, max_length=20)
+    anchors: list[Anchor] = Field(min_length=2, max_length=20)
+    kind: Literal["line", "curve"] = "line"
+
+
+def _invalidate_cache() -> None:
+    _LOAD_CACHE.clear()
+
+
+@app.get("/api/trendlines")
+def api_trendlines(code: str | None = None) -> list[dict]:
+    code = code or CONFIG["code"]
+    with db.session(CONFIG["db_path"]) as conn:
+        return db.load_trendlines(conn, code)
+
+
+@app.post("/api/trendlines")
+def api_create_trendline(body: TrendlineIn) -> dict:
+    code = body.code or CONFIG["code"]
+    anchors = [anchor.model_dump() for anchor in body.anchors]
+    if len({anchor["time"] for anchor in anchors}) != len(anchors):
+        raise HTTPException(status_code=422, detail="anchors must be on different bars")
+    if body.kind == "curve" and len(anchors) != 3:
+        raise HTTPException(status_code=422, detail="a curve takes exactly 3 anchors")
+    with db.session(CONFIG["db_path"]) as conn:
+        line_id = db.insert_trendline(
+            conn, code, anchors, label=body.label, color=body.color, kind=body.kind
+        )
+    _invalidate_cache()
+    return {"id": line_id}
+
+
+@app.delete("/api/trendlines/{line_id}")
+def api_delete_trendline(line_id: int) -> dict:
+    with db.session(CONFIG["db_path"]) as conn:
+        if not db.delete_trendline(conn, line_id):
+            raise HTTPException(status_code=404, detail=f"no trendline {line_id}")
+    _invalidate_cache()
+    return {"deleted": line_id}
+
+
+class BoxOverrideIn(BaseModel):
+    code: str | None = None
+    box_type: Literal["support", "resistance"]
+    created_time: str
+    top: float
+    bottom: float
+
+
+@app.put("/api/boxes/override")
+def api_set_box_override(body: BoxOverrideIn) -> dict:
+    code = body.code or CONFIG["code"]
+    if not body.top > body.bottom:
+        raise HTTPException(status_code=422, detail="top must be above bottom")
+    with db.session(CONFIG["db_path"]) as conn:
+        if not db.set_box_override(
+            conn, code, body.box_type, body.created_time, body.top, body.bottom
+        ):
+            raise HTTPException(status_code=404, detail="no such box")
+    _invalidate_cache()
+    return {"box_type": body.box_type, "created_time": body.created_time, "top": body.top, "bottom": body.bottom}
+
+
+@app.delete("/api/boxes/override")
+def api_delete_box_override(
+    box_type: Literal["support", "resistance"], created_time: str, code: str | None = None
+) -> dict:
+    code = code or CONFIG["code"]
+    with db.session(CONFIG["db_path"]) as conn:
+        if not db.delete_box_override(conn, code, box_type, created_time):
+            raise HTTPException(status_code=404, detail="no override for that box")
+    _invalidate_cache()
+    return {"deleted": created_time}
+
+
 @app.get("/api/state")
 def api_state(code: str | None = None) -> dict:
     code = code or CONFIG["code"]
@@ -420,7 +512,7 @@ def api_state(code: str | None = None) -> dict:
     last_minute = minute_bars.iloc[-1]
     last_price = float(last_minute["close"])
     last_stamp = pd.Timestamp(last_minute["minute_start"])
-    stale_minutes = (pd.Timestamp.now() - last_stamp).total_seconds() / 60.0
+    stale_minutes = (market_clock.now() - last_stamp).total_seconds() / 60.0
 
     sides = {}
     for box_type in ("support", "resistance"):
@@ -454,7 +546,7 @@ def api_state(code: str | None = None) -> dict:
     return {
         "code": code,
         "ready": True,
-        "server_time": pd.Timestamp.now().isoformat(sep=" "),
+        "server_time": market_clock.now().isoformat(sep=" "),
         "last_minute_start": last_stamp.isoformat(sep=" "),
         "last_price": last_price,
         "stale_minutes": round(stale_minutes, 1),

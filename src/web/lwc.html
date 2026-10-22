@@ -38,11 +38,16 @@
     <div class="chart-head">
       <div id="legend-series" class="legend"></div>
       <div class="chart-tools">
+        <button type="button" id="draw-line">畫線</button>
+        <button type="button" id="draw-curve">曲線</button>
+        <button type="button" id="draw-done" hidden>完成</button>
         <button type="button" id="recent">近 6 日</button>
         <button type="button" id="fit">全部</button>
       </div>
     </div>
     <div id="legend-ohlc" class="legend-ohlc"></div>
+    <div id="trendlines" class="trendline-list"></div>
+    <div id="draw-hint" class="draw-hint" hidden></div>
     <div id="chart"></div>
   </section>
 

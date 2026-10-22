@@ -45,15 +45,16 @@ conda run -n tss python src/backfill_orderbook.py --code TMFR1 --days 30
 outside ──1分K 進入箱體──▶ inside ──1分K 離開箱體──▶ outside
             │                   │
             │                   ├─ 每分鐘：持續寫委託簿到 DB
-            │                   └─ 每小時：Telegram 提醒（仍在箱內）
-            └─ 進箱瞬間：開 box_visit、立即發 Telegram、
+            │                   └─ 每分鐘：寫委託簿到 DB
+            └─ 進箱瞬間：開 box_visit、
                回寫進箱前 30 筆委託簿作為前文
 ```
 
 - **進箱判定**用 1 分 K 的 `[low, high]` 區間與箱體相交，不是收盤價 —— 只用影線插進
   箱體又彈走也算，那正是最值得留委託簿紀錄的時刻。
 - **箱體選擇**：每側取最新且 `state != 'broken'` 的那一個（Pine 本身每側也只維護一個）。
-- **小時反轉型態是加料不是閘門**：只在 `inside` 期間偵測，命中時標記該筆委託簿並發強提示。
+- **小時反轉型態是加料不是閘門**：只在 `inside` 期間偵測，命中時標記該筆委託簿（只記錄，不發通知）。
+- **Telegram 通知**由 `config/alerts.json` 的規則決定，見下節。
 
 ### 為什麼預設 `--exit-buffer-atr 0.1`
 
@@ -66,6 +67,52 @@ outside ──1分K 進入箱體──▶ inside ──1分K 離開箱體──�
 | 0.20 | 55 | 2,961 | 55 |
 
 0.1 讓 visit 少 42%，涵蓋的分鐘數反而**多 10%** —— 因為破碎的片段被合併成連續窗口。
+
+---
+
+## 手畫趨勢線 / 曲線
+
+圖表右上兩個工具：
+
+* **畫線**：點 K 棒放錨點（2 點直線，3+ 點折線）→「完成」/ Enter 儲存。沿最後一段斜率向右延伸。
+* **曲線**（同 TradingView Curve）：點起點 → 點終點 → 移動滑鼠拉彎（即時預覽）→ 點一下儲存。
+  二次 Bézier，曲線經過起點與終點，第三點是**控制點**（只把曲線拉向它，不經過它），
+  必須落在起點與終點之間。過了終點沿終點切線（控制點→終點）向右延伸，警報才有線可比。
+
+Esc 取消。都在 **bar index 空間**計算（跨盤別空檔不會彎折），與圖上看到的一致。
+
+線的延伸段不參與價格軸自動縮放：圖表永遠以 K 棒（與兩個進行中的箱體）為準，
+不會因為某條線延伸得很遠就把整張圖縮小。圖表只有兩個窗格：價格與成交量。
+
+---
+
+## Telegram 通知規則（`config/alerts.json`）
+
+所有可調參數都在這一個檔案：通知規則與時區（`utc_offset_hours`，見下節）。
+
+`monitor.py` 每分鐘用 **最新 1 分 K 收盤** 檢查下列規則。檔案存檔後下一輪就生效，不必重啟；
+JSON 格式錯誤時沿用上一次的設定並在 log 警告。
+
+| 規則 | 條件 | 參數 |
+|---|---|---|
+| `support_bottom_third` | 收盤在支撐箱內、位於下緣 1/3（0 = 箱底，1 = 箱頂） | `zone_max`（預設 0.3333） |
+| `resistance_top_third` | 收盤在阻力箱內、位於上緣 1/3 | `zone_min`（預設 0.6667） |
+| `box_in_out` | 前一根 1 分 K 收盤在箱內、最新一根收盤在箱外（上下皆算：支撐箱向上＝守住、向下＝跌破；阻力箱向上＝突破、向下＝守住）。只看收盤，不套用 `--exit-buffer-atr` | — |
+| `trendline_near` | 收盤距離畫線 ≤ 門檻 | `distance_points`（預設 30）；設了 `distance_atr` 則改用 `distance_atr × 小時 ATR` |
+| `trendline_break_below_up` | 收盤跌破**上升**的線（**每條線只通知一次**） | `buffer_points` |
+| `trendline_break_above_down` | 收盤突破**下降**的線（**每條線只通知一次**） | `buffer_points` |
+
+* 每條規則都有 `enabled`；趨勢線規則另有 `kinds`（`["curve", "line"]`，只要曲線就填 `["curve"]`）。
+* 冷卻時間 `cooldown_minutes`（預設 10）以「規則 × 箱體／線」計算，以觸發的那根 1 分 K 時間為準，
+  重啟後仍有效；個別規則可再寫自己的 `cooldown_minutes` 覆蓋。
+* 線的值與斜率取在最新一根小時棒（通常是正在形成的那根），與圖上畫出來的一致；過了終點沿切線延伸。
+* `--alerts-config` 可指定別的檔案。
+
+## 時區（同一個 `config/alerts.json` 的 `utc_offset_hours`）
+
+DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC + `utc_offset_hours`**（預設 8），
+不看電腦本身的時區，所以人在日本（UTC+9）也不必改；只有在盤別判斷、落後分鐘或通知時間
+看起來整體偏移時才需要調整。改完需重啟 `monitor.py` 與 `dashboard.py`。
 
 ---
 
@@ -126,6 +173,9 @@ outside ──1分K 進入箱體──▶ inside ──1分K 離開箱體──�
 | `src/box_watch.py` | 進/出箱狀態機 |
 | `src/patterns.py` | 小時 K 棒反轉型態 |
 | `src/orderbook.py` | 五檔訂閱、環形緩衝、降頻、歷史 tick 轉換 |
+| `src/trendline.py` | 手畫趨勢線／Bézier 曲線：bar-index 計算、向右延伸 |
+| `src/alert_rules.py` | Telegram 通知規則判斷與 `config/alerts.json` 載入 |
+| `src/market_clock.py` | 市場時鐘（UTC + `config/alerts.json` 的 `utc_offset_hours`） |
 | `src/telegram_notify.py` | 通知格式與發送 |
 | `src/monitor.py` | 每分鐘主迴圈（寫 DB、發通知） |
 | `src/dashboard.py` + `src/web/` | 唯讀儀表板，每 60 秒更新；圖表用 lightweight-charts |
@@ -144,6 +194,7 @@ outside ──1分K 進入箱體──▶ inside ──1分K 離開箱體──�
 | `/plotly` | 舊的 Plotly 頁，留著對照箱體幾何用 |
 | `/api/chart` | `bars` + `boxes` + `series`，同一次 DB 讀取產生，所以三者必然一致 |
 | `/api/bars`、`/api/boxes`、`/api/series` | `/api/chart` 的單項版本，除錯用 |
+| `/api/trendlines` | `GET` 列表、`POST` 新增（`anchors:[{time,price},…]`）、`DELETE /{id}` 軟刪除 |
 | `/api/state` | 現價、落後分鐘、兩側箱體、近期停留／型態／通知 |
 | `/api/figure` | 舊的 Plotly figure JSON，只有 `/plotly` 在用 |
 
@@ -170,7 +221,8 @@ outside ──1分K 進入箱體──▶ inside ──1分K 離開箱體──�
 | `box_visits` | 一次進出箱一列，`source` 區分 `live` / `backfill` |
 | `orderbook_snapshots` | 委託簿，`UNIQUE (code, event_ts, source)` 讓重複 flush 冪等 |
 | `reversal_events` | 反轉型態（append-only） |
-| `telegram_alerts` | `UNIQUE (code, hour_start, box_type, kind)` **就是**每小時每側每類最多一則的限流 |
+| `telegram_alerts` | `kind` = 規則名、`box_type` = 對象（`support:7`、`line:3`）、`hour_start` = 觸發的 1 分 K；冷卻與「只通知一次」都從這張表讀回 |
+| `trendlines` | 手畫線錨點（JSON）與 `kind`（`line`/`curve`），`enabled=0` 為軟刪除 |
 | `backfill_progress` | 回補進度，中斷可續 |
 
 ---

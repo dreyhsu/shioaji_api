@@ -25,6 +25,8 @@ advance across the forming one.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -166,6 +168,7 @@ def collect_snr_boxes(
     atr_length: int = DEFAULT_ATR_LENGTH,
     box_width: float = DEFAULT_BOX_WIDTH,
     creation_limit: int | None = None,
+    overrides: Mapping[tuple[str, pd.Timestamp], tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
     """Every support/resistance box the Pine indicator would draw over ``bars``.
 
@@ -177,6 +180,11 @@ def collect_snr_boxes(
     ``len(closed_bars) - 1`` when the last row is an unfinished bar: Pine confirms
     boxes only on closed bars, but the break/hold crosses and the right edge still
     have to advance across the forming one.  ``None`` means no cap.
+
+    ``overrides`` maps ``(box_type, created_time)`` to a hand-set ``(top, bottom)``.
+    It replaces the computed edges at birth, so the break/hold crosses afterwards
+    run against the adjusted levels -- the same ones the monitor alerts on.
+    ``created_time`` is the key because ``box_id`` is renumbered on every pass.
     """
     if lookback < 1 or volume_length < 1 or atr_length < 1:
         raise ValueError("lookback, volume_length, and atr_length must be positive")
@@ -214,7 +222,7 @@ def collect_snr_boxes(
             "state": "fresh",
             "top": top,
             "bottom": bottom,
-            "pivot_price": top if box_type == "support" else bottom,
+            "pivot_price": float(closes.iloc[pivot_index]),
             "atr_width": top - bottom,
             "delta_volume": float(delta.iloc[index]),
             "left_time": timestamps.iloc[pivot_index],
@@ -228,6 +236,14 @@ def collect_snr_boxes(
         }
         boxes.append(record)
         return record
+
+    overrides = {(kind, pd.Timestamp(when)): edges for (kind, when), edges in (overrides or {}).items()}
+
+    def _edges(box_type: str, index: int, top: float, bottom: float) -> tuple[float, float]:
+        edges = overrides.get((box_type, pd.Timestamp(timestamps.iloc[index])))
+        if edges is None:
+            return top, bottom
+        return float(edges[0]), float(edges[1])
 
     may_create_until = len(frame) - 1 if creation_limit is None else creation_limit
 
@@ -248,8 +264,9 @@ def collect_snr_boxes(
                 and pivot_close == float(window.min())
                 and current_delta > float(high_filter)
             ):
-                support_top = pivot_close
-                support_bottom = pivot_close - width
+                support_top, support_bottom = _edges(
+                    "support", index, pivot_close, pivot_close - width
+                )
                 support = _open_box("support", index, pivot_index, support_top, support_bottom)
 
             if (
@@ -257,8 +274,9 @@ def collect_snr_boxes(
                 and pivot_close == float(window.max())
                 and current_delta < float(low_filter)
             ):
-                resistance_bottom = pivot_close
-                resistance_top = pivot_close + width
+                resistance_top, resistance_bottom = _edges(
+                    "resistance", index, pivot_close + width, pivot_close
+                )
                 resistance = _open_box(
                     "resistance", index, pivot_index, resistance_top, resistance_bottom
                 )

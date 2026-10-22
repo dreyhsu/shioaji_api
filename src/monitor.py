@@ -9,12 +9,14 @@ One cycle per minute:
    bar is normally still forming, so ``creation_limit`` stops it creating boxes
    while still letting it break or hold existing ones -- what Pine does.
 3. Step each side's :class:`box_watch.BoxWatcher` with the newest **1-minute** bar.
-   Entering a box opens a visit, starts persisting the order book (plus the
-   buffered run-up as ``pre_entry``) and sends an immediate Telegram message;
-   staying keeps flushing the book and sends at most one reminder per hour;
-   leaving closes the visit and stops persisting.
+   Entering a box opens a visit and starts persisting the order book (plus the
+   buffered run-up as ``pre_entry``); staying keeps flushing the book; leaving
+   closes the visit and stops persisting.
 4. While inside, look for hourly reversal patterns on the forming bar and log any
    hit together with the book snapshot at that moment.
+5. Check the Telegram rules in ``alert_rules`` (configured by
+   ``config/alerts.json``) against the newest minute close, and send what has
+   not been sent within its cooldown.
 
 Everything that could repeat is idempotent at the database level, so a retried or
 restarted cycle cannot double-write books or double-send alerts.  A failing cycle
@@ -35,14 +37,16 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import alert_rules as ar
 import db
+import market_clock
 import orderbook as ob
 import patterns as pt
 import session_bars as sb
@@ -75,10 +79,11 @@ class MonitorConfig:
     once: bool = False
     idle_sleep_seconds: int = 300
     patterns: pt.PatternConfig = field(default_factory=pt.PatternConfig)
+    alerts_config: Path = ar.DEFAULT_CONFIG_PATH
 
 
 def log(message: str) -> None:
-    print(f"[{pd.Timestamp.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+    print(f"[{market_clock.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -138,6 +143,7 @@ def build_state(conn, config: MonitorConfig, now: pd.Timestamp) -> MarketState:
             atr_length=config.atr_length,
             box_width=config.box_width,
             creation_limit=closed_through if closed_through >= 0 else None,
+            overrides=db.load_box_overrides(conn, config.code),
         )
         atr_series = snr.pine_atr(hourly, config.atr_length)
         anchor = closed_through if closed_through >= 0 else len(hourly) - 1
@@ -242,28 +248,65 @@ class BookRecorder:
 # --------------------------------------------------------------------------------------
 # Alerts
 # --------------------------------------------------------------------------------------
-def maybe_send(conn, config: MonitorConfig, *, hour_start, box_type, box_id, visit_id, kind, message) -> bool:
-    """Claim the (hour, side, kind) slot in the DB, and send only if we won it."""
+def send_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar.Candidate, minute_start) -> bool:
+    """Send one rule hit unless it is inside its cooldown or already sent once.
+
+    Both checks read the alert rows back, measured on the triggering minute
+    rather than the wall clock, so a restart or a replay throttles the same way.
+    """
+    last = db.last_alert_at(conn, config.code, candidate.key, candidate.rule)
+    if last is not None:
+        if candidate.once:
+            return False
+        cooldown = pd.Timedelta(minutes=alerts.cooldown_minutes(candidate.rule))
+        if pd.Timestamp(minute_start) - last < cooldown:
+            return False
     alert_id = db.record_alert(
         conn,
         config.code,
-        hour_start=hour_start,
-        box_type=box_type,
-        box_id=box_id,
-        visit_id=visit_id,
-        kind=kind,
-        message=message,
+        hour_start=minute_start,
+        box_type=candidate.key,
+        box_id=None,
+        visit_id=None,
+        kind=candidate.rule,
+        message=candidate.message,
     )
     if alert_id is None:
-        return False  # already claimed this hour -- nothing owed
+        return False  # this minute is already claimed -- a re-polled cycle
     if not config.enable_telegram:
         db.mark_alert_sent(conn, alert_id, False)
-        log(f"  [telegram disabled] would send {kind} alert for {box_type}")
+        log(f"  [telegram disabled] would send {candidate.rule} ({candidate.key})")
         return False
-    ok = tg.send_message(message)
+    ok = tg.send_message(candidate.message)
     db.mark_alert_sent(conn, alert_id, ok)
-    log(f"  telegram {kind} alert for {box_type}: {'sent' if ok else 'FAILED'}")
+    log(f"  telegram {candidate.rule} ({candidate.key}): {'sent' if ok else 'FAILED'}")
     return ok
+
+
+def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "MarketState") -> int:
+    """Evaluate every rule on the newest minute and send what is owed."""
+    if alerts.reload():
+        log(f"  alert config loaded from {alerts.path}")
+    if alerts.last_error:
+        log(f"  WARNING alert config: {alerts.last_error}")
+    minute = state.latest_minute
+    if minute is None:
+        return 0
+    bars = state.minute_bars
+    candidates = ar.evaluate(
+        code=config.code,
+        minute_bar=minute,
+        boxes={side: snr.current_box(state.boxes, side) for side in SIDES},
+        prev_minute_bar=bars.iloc[-2] if len(bars) >= 2 else None,
+        hourly=state.hourly,
+        trendlines=db.load_trendlines(conn, config.code),
+        hourly_atr=state.hourly_atr,
+        config=alerts,
+    )
+    return sum(
+        send_rule(conn, config, alerts, candidate, minute["minute_start"])
+        for candidate in candidates
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -275,25 +318,29 @@ def handle_side(
     state: MarketState,
     watcher: BoxWatcher,
     recorder: BookRecorder,
-) -> None:
+) -> list:
+    """Step one side; returns ``[(exit transition, box it left)]``."""
     box = snr.current_box(state.boxes, watcher.box_type)
     minute = state.latest_minute
     if minute is None:
-        return
+        return []
 
     transition = watcher.step(minute, box, state.hourly_atr)
     if transition is None:
-        return
+        return []
 
+    exits = []
     for step in (transition, transition.follow_up):
         if step is None:
             continue
         if step.kind == "exit":
             _on_exit(conn, config, state, watcher, recorder, step)
+            exits.append((step, box))
         elif step.kind == "enter":
             _on_enter(conn, config, state, watcher, recorder, step, box)
         elif step.kind == "stay":
             _on_stay(conn, config, state, watcher, recorder, step, box)
+    return exits
 
 
 def _on_enter(conn, config, state, watcher, recorder, step, box) -> None:
@@ -305,7 +352,7 @@ def _on_enter(conn, config, state, watcher, recorder, step, box) -> None:
         box_top=float(box["top"]),
         box_bottom=float(box["bottom"]),
         box_state=str(box["state"]),
-        entered_at=pd.Timestamp.now(),
+        entered_at=market_clock.now(),
         entry_minute_start=step.minute_start,
         entry_price=step.price,
         entry_zone_pct=step.zone_pct,
@@ -318,30 +365,6 @@ def _on_enter(conn, config, state, watcher, recorder, step, box) -> None:
 
     written = recorder.flush(conn, visit_id, phase="pre_entry")
     log(f"  book rows written (pre_entry): {written}")
-
-    maybe_send(
-        conn,
-        config,
-        hour_start=state.hour_start,
-        box_type=step.box_type,
-        box_id=step.box_id,
-        visit_id=visit_id,
-        kind="entry",
-        message=tg.format_entry_alert(
-            code=config.code,
-            box_type=step.box_type,
-            box_id=step.box_id,
-            box_top=float(box["top"]),
-            box_bottom=float(box["bottom"]),
-            box_state=str(box["state"]),
-            price=step.price,
-            zone_pct=step.zone_pct,
-            minute_start=step.minute_start,
-            hourly_atr=state.hourly_atr,
-            book_source=recorder.source,
-            book_levels=recorder.levels,
-        ),
-    )
 
 
 def _on_stay(conn, config, state, watcher, recorder, step, box) -> None:
@@ -356,44 +379,6 @@ def _on_stay(conn, config, state, watcher, recorder, step, box) -> None:
     )
     recorder.flush(conn, watcher.visit_id, phase="in_box")
 
-    # One reminder per hourly bar while price stays inside.
-    visit = conn.execute(
-        "SELECT * FROM box_visits WHERE id = ?", (watcher.visit_id,)
-    ).fetchone()
-    patterns_seen = [
-        row["pattern"]
-        for row in conn.execute(
-            "SELECT DISTINCT pattern FROM reversal_events WHERE visit_id = ?",
-            (watcher.visit_id,),
-        ).fetchall()
-    ]
-    maybe_send(
-        conn,
-        config,
-        hour_start=state.hour_start,
-        box_type=step.box_type,
-        box_id=step.box_id,
-        visit_id=watcher.visit_id,
-        kind="hourly",
-        message=tg.format_hourly_alert(
-            code=config.code,
-            box_type=step.box_type,
-            box_id=step.box_id,
-            box_top=float(box["top"]),
-            box_bottom=float(box["bottom"]),
-            box_state=str(box["state"]),
-            price=step.price,
-            zone_pct=step.zone_pct,
-            hour_start=state.hour_start,
-            minutes_in_box=watcher.minutes_in_box,
-            min_zone_pct=visit["min_zone_pct"] if visit else None,
-            max_zone_pct=visit["max_zone_pct"] if visit else None,
-            orderbook_rows=visit["orderbook_rows"] if visit else 0,
-            patterns=patterns_seen,
-            hourly_atr=state.hourly_atr,
-        ),
-    )
-
 
 def _on_exit(conn, config, state, watcher, recorder, step) -> None:
     # The watcher has already reset itself, so the visit id rides on the transition.
@@ -404,7 +389,7 @@ def _on_exit(conn, config, state, watcher, recorder, step) -> None:
     db.close_visit(
         conn,
         visit_id,
-        exited_at=pd.Timestamp.now(),
+        exited_at=market_clock.now(),
         exit_minute_start=step.minute_start,
         exit_price=step.price,
         exit_reason=step.exit_reason or "left_box",
@@ -448,7 +433,7 @@ def detect_reversals(
                 config.code,
                 {
                     "visit_id": watcher.visit_id,
-                    "detected_at": pd.Timestamp.now(),
+                    "detected_at": market_clock.now(),
                     "hour_start": bar["hour_start"],
                     "bar_closed": False,
                     "minutes_into_bar": minutes_into_bar,
@@ -482,34 +467,12 @@ def detect_reversals(
             recorder.record_at_reversal(conn, watcher.visit_id, reversal_id)
             log(f"  REVERSAL {hit['pattern']} ({box_type}) -> id {reversal_id}")
 
-            maybe_send(
-                conn,
-                config,
-                hour_start=bar["hour_start"],
-                box_type=box_type,
-                box_id=int(box["box_id"]),
-                visit_id=watcher.visit_id,
-                kind=f"reversal:{hit['pattern']}",
-                message=tg.format_reversal_alert(
-                    code=config.code,
-                    box_type=box_type,
-                    box_id=int(box["box_id"]),
-                    box_top=float(box["top"]),
-                    box_bottom=float(box["bottom"]),
-                    pattern=hit["pattern"],
-                    direction=hit["direction"],
-                    detail=hit["detail"],
-                    price=price,
-                    zone_pct=zone,
-                    hour_start=bar["hour_start"],
-                    minutes_into_bar=minutes_into_bar,
-                    bar_closed=False,
-                ),
-            )
 
-
-def run_cycle(api, contract, conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder) -> MarketState:
-    now = pd.Timestamp.now()
+def run_cycle(
+    api, contract, conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder,
+    alerts: ar.AlertConfig,
+) -> MarketState:
+    now = market_clock.now()
 
     fresh = sc.fetch_latest_minute_bars(api, contract)
     stored = db.upsert_minute_bars(conn, config.code, fresh)
@@ -536,6 +499,7 @@ def run_cycle(api, contract, conn, config: MonitorConfig, watchers: dict, record
     for box_type in SIDES:
         handle_side(conn, config, state, watchers[box_type], recorder)
     detect_reversals(conn, config, state, watchers, recorder)
+    check_alerts(conn, config, alerts, state)
     return state
 
 
@@ -544,7 +508,7 @@ def run_cycle(api, contract, conn, config: MonitorConfig, watchers: dict, record
 # --------------------------------------------------------------------------------------
 def backfill(api, contract, conn, config: MonitorConfig) -> int:
     last = db.last_minute_start(conn, config.code)
-    today = date.today()
+    today = market_clock.today()
     if last is None:
         start = today - timedelta(days=config.backfill_days)
         log(f"empty store -> backfilling {config.backfill_days} days from {start}")
@@ -578,7 +542,7 @@ def shutdown(conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder
             db.close_visit(
                 conn,
                 watcher.visit_id,
-                exited_at=pd.Timestamp.now(),
+                exited_at=market_clock.now(),
                 exit_minute_start=watcher.last_minute_start,
                 exit_price=None,
                 exit_reason="shutdown",
@@ -617,6 +581,12 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument("--min-range-atr", type=float, default=pt.PatternConfig.min_range_atr)
     parser.add_argument("--wick-body-ratio", type=float, default=pt.PatternConfig.wick_body_ratio)
+    parser.add_argument(
+        "--alerts-config",
+        type=Path,
+        default=ar.DEFAULT_CONFIG_PATH,
+        help="JSON file with the Telegram rule switches and thresholds",
+    )
     args = parser.parse_args(argv)
 
     return MonitorConfig(
@@ -636,6 +606,7 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
         patterns=pt.PatternConfig(
             min_range_atr=args.min_range_atr, wick_body_ratio=args.wick_body_ratio
         ),
+        alerts_config=args.alerts_config,
     )
 
 
@@ -662,6 +633,8 @@ def main(argv: list[str] | None = None) -> int:
         watchers = restore_watchers(conn, config)
         recorder = BookRecorder(api, contract, config)
         log(f"order book: {recorder.start()}")
+        alerts = ar.AlertConfig(config.alerts_config)
+        log(f"alert config: {alerts.path}" + (f" ({alerts.last_error})" if alerts.last_error else ""))
 
         try:
             while True:
@@ -676,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 try:
-                    run_cycle(api, contract, conn, config, watchers, recorder)
+                    run_cycle(api, contract, conn, config, watchers, recorder, alerts)
                 except Exception as error:  # noqa: BLE001 - a bad cycle must not end the run
                     log(f"cycle failed: {type(error).__name__}: {error}")
                     traceback.print_exc()

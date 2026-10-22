@@ -28,6 +28,8 @@ from datetime import time
 
 import pandas as pd
 
+import market_clock
+
 DAY_START = time(8, 45)
 DAY_END = time(13, 45)  # exclusive: drops the 13:45:00 closing auction
 NIGHT_START = time(15, 0)
@@ -55,7 +57,7 @@ def is_trading_time(timestamp: pd.Timestamp | None = None) -> bool:
     Only a clock test -- it does not know about holidays, so a holiday still looks
     like trading time.  The monitor notices a holiday by getting no fresh bars.
     """
-    stamp = pd.Timestamp.now() if timestamp is None else timestamp
+    stamp = market_clock.now() if timestamp is None else timestamp
     return session_fields(stamp) is not None
 
 
