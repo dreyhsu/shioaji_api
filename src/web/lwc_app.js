@@ -1,9 +1,8 @@
 'use strict';
 // The chart half of the dashboard, on lightweight-charts 5.2.1.
 //
-// Replaces the server-rendered Plotly figure: the server now sends plain data
-// (/api/chart) and the drawing happens here.  That drops a 4.8 MB plotly bundle
-// to a 195 KB one and makes pan/zoom a canvas redraw instead of an SVG rebuild.
+// The server sends plain data (/api/chart) and the drawing happens here, making
+// pan/zoom a canvas redraw.
 //
 // Note there is no equivalent of snr_core.session_rangebreaks here, and none is
 // needed: lightweight-charts' horizontal scale is a *logical index* scale, so it
@@ -704,8 +703,7 @@ async function refreshChart() {
   // A full setData keeps barSpacing and the visible window -- it is not a view
   // reset -- and when bars are appended the library either follows the newest
   // bar (if you are parked at the right edge) or compensates the scroll so the
-  // bars under the cursor stay put.  That is exactly the Plotly.react behaviour
-  // this page replaces, so there is no visible-range save/restore here.
+  // bars under the cursor stay put, so there is no visible-range save/restore.
   candles.setData(lastBars);
   applySeries(payload.series || []);
 

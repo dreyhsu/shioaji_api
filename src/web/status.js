@@ -1,8 +1,7 @@
 'use strict';
 // Everything that renders /api/state: the header pills, the two side cards and
-// the three tables.  Extracted from app.js so the Plotly page and the
-// lightweight-charts page share one copy -- a new /api/state field then lands in
-// one place instead of two.  Touches only ids that both pages carry.
+// the three tables, kept separate from the chart rendering code so a new
+// /api/state field lands in one focused place.
 
 (function () {
   // Data is minute-granular, so anything beyond a couple of minutes means the

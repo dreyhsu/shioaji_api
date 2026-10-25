@@ -140,7 +140,8 @@ def test_thin_endpoints_agree_with_the_combined_one(client):
 def test_pages_and_assets_are_served(client):
     dashboard.ensure_lwc_bundle()  # raises with the curl command if unvendored
     assert client.get("/").status_code == 200
-    assert client.get("/plotly").status_code == 200
+    assert client.get("/plotly").status_code == 404
+    assert client.get("/api/figure").status_code == 404
 
 
 def test_missing_code_is_a_404(client):

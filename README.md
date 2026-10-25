@@ -191,12 +191,10 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | 路由 | 內容 |
 |---|---|
 | `/` | lightweight-charts 圖表頁（`src/web/lwc.html`） |
-| `/plotly` | 舊的 Plotly 頁，留著對照箱體幾何用 |
 | `/api/chart` | `bars` + `boxes` + `series`，同一次 DB 讀取產生，所以三者必然一致 |
 | `/api/bars`、`/api/boxes`、`/api/series` | `/api/chart` 的單項版本，除錯用 |
 | `/api/trendlines` | `GET` 列表、`POST` 新增（`anchors:[{time,price},…]`）、`DELETE /{id}` 軟刪除 |
 | `/api/state` | 現價、落後分鐘、兩側箱體、近期停留／型態／通知 |
-| `/api/figure` | 舊的 Plotly figure JSON，只有 `/plotly` 在用 |
 
 兩件圖表層容易踩到、已經在 code 裡註解過的事：
 
@@ -254,9 +252,6 @@ conda env `tss`，Python 3.10。不需安裝任何新套件（sqlite3 是 stdlib
   curl -fsSL -o src/web/lightweight-charts.standalone.production.js \
     https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js
   ```
-
-* `src/web/plotly.min.js`（4.8 MB）由 `plotly.offline.get_plotlyjs()` 從已安裝套件
-  取出，只有 `/plotly` 對照頁還在用。
 
 `.env` 需要：`SHIOAJI_API_KEY`、`SHIOAJI_SECRET_KEY`、`SHIOAJI_SIMULATION`、
 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`。

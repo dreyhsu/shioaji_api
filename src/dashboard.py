@@ -6,8 +6,7 @@ and if the dashboard crashes the monitor keeps recording.  sqlite runs in WAL mo
 so the two overlap without blocking.
 
 The page re-fetches once a minute, which matches how often the monitor has
-anything new.  At that cadence a whole-figure ``Plotly.react`` over ~800 bars is
-imperceptible, so there is no incremental-update machinery to get wrong.
+anything new.
 
 ``/api/state`` carries a ``stale_minutes`` field: the page turns red when the data
 stops advancing, which is the only way to notice from the browser that the monitor
@@ -22,18 +21,16 @@ has died.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
 import pandas as pd
-import plotly.io as pio
 from fastapi import FastAPI, HTTPException, Query
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,7 +42,6 @@ import snr_core as snr
 import trendline as tl
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-PLOTLY_BUNDLE = WEB_DIR / "plotly.min.js"
 LWC_BUNDLE = WEB_DIR / "lightweight-charts.standalone.production.js"
 LWC_VERSION = "5.2.1"
 LWC_URL = (
@@ -68,22 +64,11 @@ app = FastAPI(title="TMF S/R monitor")
 CONFIG = {"code": "TMFR1", "db_path": db.DEFAULT_DB_PATH, "days": 30}
 
 
-def ensure_plotly_bundle() -> None:
-    """Vendor plotly.js out of the installed package so the page works offline."""
-    if PLOTLY_BUNDLE.exists():
-        return
-    from plotly.offline import get_plotlyjs
-
-    WEB_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTLY_BUNDLE.write_text(get_plotlyjs(), encoding="utf-8")
-
-
 def ensure_lwc_bundle() -> None:
     """lightweight-charts ships no Python package, so the file is vendored by hand.
 
-    Vendored rather than loaded from a CDN for the same reason plotly is: a
-    monitoring page that goes blank when the network hiccups is worse than no
-    page at all.
+    Vendored rather than loaded from a CDN because a monitoring page that goes
+    blank when the network hiccups is worse than no page at all.
     """
     if LWC_BUNDLE.exists():
         return
@@ -329,12 +314,6 @@ def index() -> FileResponse:
     return FileResponse(WEB_DIR / "lwc.html")
 
 
-@app.get("/plotly")
-def plotly_page() -> FileResponse:
-    """The old server-rendered Plotly page, kept as a reference to diff against."""
-    return FileResponse(WEB_DIR / "index.html")
-
-
 @app.get("/api/chart")
 def api_chart(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365)
@@ -382,36 +361,6 @@ def api_series(
 ) -> dict:
     payload = api_chart(code=code, days=days)
     return {k: payload[k] for k in ("code", "generated_at", "series")}
-
-
-@app.get("/api/figure")
-def api_figure(
-    code: str | None = None, days: int = Query(default=0, ge=0, le=365)
-) -> Response:
-    code = code or CONFIG["code"]
-    window = days or CONFIG["days"]
-    data = _cached_load(code, window)
-    if data is None:
-        raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
-
-    visible = data["visible"]
-    boxes = snr.clip_boxes(
-        data["boxes"], visible["timestamp"].iloc[0], visible["timestamp"].iloc[-1]
-    ) if not data["boxes"].empty else data["boxes"]
-
-    span = f"{visible['hour_start'].iloc[0]:%Y-%m-%d} to {visible['hour_start'].iloc[-1]:%Y-%m-%d}"
-    figure = snr.build_figure(
-        visible,
-        boxes,
-        title=f"{code} 1h Support &amp; Resistance boxes ({span})",
-        instrument=code,
-        reversals=data["reversals"] if not data["reversals"].empty else None,
-    )
-    # plotly.io.to_json is the only serializer that agrees with the bundled
-    # plotly.js about dates and typed arrays -- a hand-rolled encoder emits
-    # datetimes as raw nanosecond ints, which the browser reads as milliseconds
-    # and plots tens of millions of years into the future.
-    return Response(content=pio.to_json(figure), media_type="application/json")
 
 
 # --------------------------------------------------------------------------------------
@@ -579,7 +528,6 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_args(argv)
     CONFIG.update({"code": args.code, "db_path": args.db, "days": args.days})
-    ensure_plotly_bundle()
     ensure_lwc_bundle()
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
     print(f"dashboard for {args.code} -> http://{args.host}:{args.port}", flush=True)
