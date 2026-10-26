@@ -137,6 +137,57 @@ def test_thin_endpoints_agree_with_the_combined_one(client):
     assert client.get("/api/series").json()["series"] == whole["series"]
 
 
+@pytest.mark.parametrize("timeframe,step", [("1m", 60), ("5m", 300), ("15m", 900)])
+def test_chart_timeframes_keep_hourly_boxes_and_align_volume(client, timeframe, step):
+    hourly = client.get("/api/chart?days=1").json()
+    query = f"?days=1&timeframe={timeframe}"
+    response = client.get("/api/chart" + query)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["timeframe"] == timeframe
+    bars = payload["bars"]
+    assert len(bars) > len(hourly["bars"])
+    times = [bar["time"] for bar in bars]
+    assert times == sorted(set(times))
+    assert times[1] - times[0] == step
+    assert all(sb.session_fields(pd.Timestamp(t, unit="s")) for t in times)
+    volume = next(s for s in payload["series"] if s["name"] == "volume")
+    assert [p["time"] for p in volume["data"]] == times
+    assert [p["value"] for p in volume["data"]] == [bar["volume"] for bar in bars]
+    hourly_boxes = {b["box_id"]: b for b in hourly["boxes"]}
+    for box in payload["boxes"]:
+        reference = hourly_boxes[box["box_id"]]
+        assert (box["top"], box["bottom"]) == (reference["top"], reference["bottom"])
+        assert times[0] <= box["left_time"] <= box["right_time"] <= times[-1]
+    assert any(box["open"] for box in payload["boxes"])
+    assert client.get("/api/bars" + query).json()["bars"] == bars
+    assert client.get("/api/series" + query).json()["series"] == payload["series"]
+    assert client.get("/api/boxes" + query).json()["boxes"] == payload["boxes"]
+    # Changing views must not replace the cached hourly data used by the monitor.
+    assert client.get("/api/chart?days=1").json()["bars"] == hourly["bars"]
+
+
+def test_invalid_timeframe_is_rejected(client):
+    assert client.get("/api/chart?timeframe=2m").status_code == 422
+
+
+def test_hourly_drawing_keeps_its_values_on_minute_views(client):
+    bars = client.get("/api/chart?days=1").json()["bars"]
+    a, b = bars[-3]["time"], bars[-2]["time"]
+    created = client.post("/api/trendlines", json={"anchors": [
+        {"time": a, "price": 20000}, {"time": b, "price": 20120}
+    ]})
+    line_id = created.json()["id"]
+    payload = client.get("/api/chart?days=1&timeframe=5m").json()
+    spec = next(s for s in payload["series"] if s["name"] == f"trendline_{line_id}")
+    assert [p["time"] for p in spec["data"]] == [bar["time"] for bar in payload["bars"]]
+    values = {point["time"]: point.get("value") for point in spec["data"]}
+    assert values[a] == pytest.approx(20000)
+    assert values[a + 300] == pytest.approx(20010)
+    assert values[b] == pytest.approx(20120)
+    assert values[b + 300] == pytest.approx(20130)
+
+
 def test_pages_and_assets_are_served(client):
     dashboard.ensure_lwc_bundle()  # raises with the curl command if unvendored
     assert client.get("/").status_code == 200

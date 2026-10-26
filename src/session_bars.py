@@ -124,6 +124,17 @@ def minute_bars_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
     ``timestamp`` = ``hour_start`` so the result drops straight into
     :func:`snr_core.collect_snr_boxes`, which keys off ``timestamp``.
     """
+    return minute_bars_to_interval(minute_bars, 60).rename(columns={"bar_start": "hour_start"})
+
+
+def minute_bars_to_interval(minute_bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Aggregate OHLCV in buckets anchored to each session's opening minute.
+
+    Keep gaps empty and include the final partial bucket. ``timestamp`` and
+    ``bar_start`` both identify the opening minute of the resulting candle.
+    """
+    if minutes not in (1, 5, 15, 60):
+        raise ValueError("Unsupported candle interval")
     required = {"minute_start", "open", "high", "low", "close", "volume"}
     missing = required.difference(minute_bars.columns)
     if missing:
@@ -134,7 +145,7 @@ def minute_bars_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "timestamp",
-                "hour_start",
+                "bar_start",
                 "session_id",
                 "open",
                 "high",
@@ -153,11 +164,11 @@ def minute_bars_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
 
     anchors = {sid: session_anchor(sid) for sid in frame["session_id"].unique()}
     anchor_series = frame["session_id"].map(anchors)
-    elapsed = ((frame["minute_start"] - anchor_series) // pd.Timedelta(hours=1)).astype(int)
-    frame["hour_start"] = anchor_series + pd.to_timedelta(elapsed, unit="h")
+    elapsed = ((frame["minute_start"] - anchor_series) // pd.Timedelta(minutes=minutes)).astype(int)
+    frame["bar_start"] = anchor_series + pd.to_timedelta(elapsed * minutes, unit="min")
 
     grouped = (
-        frame.groupby(["session_id", "hour_start"], sort=True)
+        frame.groupby(["session_id", "bar_start"], sort=True)
         .agg(
             open=("open", "first"),
             high=("high", "max"),
@@ -169,13 +180,13 @@ def minute_bars_to_hourly(minute_bars: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    grouped["timestamp"] = grouped["hour_start"]
+    grouped["timestamp"] = grouped["bar_start"]
     return (
-        grouped.sort_values("hour_start", kind="stable")
+        grouped.sort_values("bar_start", kind="stable")
         .reset_index(drop=True)[
             [
                 "timestamp",
-                "hour_start",
+                "bar_start",
                 "session_id",
                 "open",
                 "high",

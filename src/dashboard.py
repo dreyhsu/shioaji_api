@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +41,7 @@ import market_clock
 import session_bars as sb
 import snr_core as snr
 import trendline as tl
+import trading
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LWC_BUNDLE = WEB_DIR / "lightweight-charts.standalone.production.js"
@@ -52,6 +54,8 @@ LWC_URL = (
 UP_COLOR = "#20ca26"
 DOWN_COLOR = "#e92929"
 TRENDLINE_COLOR = "#f5c542"
+Timeframe = Literal["1m", "5m", "15m", "1h"]
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
 
 # ``_load`` re-reads every minute bar and resamples, so one browser poll hitting
 # four endpoints would do that work four times over.  The monitor only has
@@ -60,8 +64,29 @@ TRENDLINE_COLOR = "#f5c542"
 _LOAD_TTL_SECONDS = 5.0
 _LOAD_CACHE: dict[tuple[str, int], tuple[float, object]] = {}
 
-app = FastAPI(title="TMF S/R monitor")
 CONFIG = {"code": "TMFR1", "db_path": db.DEFAULT_DB_PATH, "days": 30}
+_TRADING_SERVICE: trading.TradingService | None = None
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    try:
+        yield
+    finally:
+        if _TRADING_SERVICE is not None:
+            _TRADING_SERVICE.close()
+
+
+app = FastAPI(title="TMF S/R monitor", lifespan=_lifespan)
+
+
+def _trading_service() -> trading.TradingService:
+    global _TRADING_SERVICE
+    if _TRADING_SERVICE is None or _TRADING_SERVICE.db_path != Path(CONFIG["db_path"]):
+        if _TRADING_SERVICE is not None:
+            _TRADING_SERVICE.close()
+        _TRADING_SERVICE = trading.TradingService(CONFIG["db_path"], CONFIG["code"])
+    return _TRADING_SERVICE
 
 
 def ensure_lwc_bundle() -> None:
@@ -105,7 +130,7 @@ def _epochs(stamps: pd.Series) -> list[int]:
 
 
 def _bars_payload(data) -> list[dict]:
-    hourly, visible = data["hourly"], data["visible"]
+    hourly, visible = data.get("chart_bars", data["hourly"]), data["visible"]
     tail = len(visible)
     # delta volume holds its direction across doji bars, so it has to be computed
     # on the full history and sliced afterwards -- computing it on the visible
@@ -164,6 +189,28 @@ def _boxes_payload(data) -> list[dict]:
     return rows
 
 
+def _drawing_values(data, line: dict) -> pd.Series:
+    """Sample an hourly drawing on the selected candle grid without changing it."""
+    hourly = data["hourly"]
+    anchors, kind = line["anchors"], line.get("kind") or "line"
+    if "chart_bars" not in data:
+        return tl.line_values(hourly, anchors, kind)
+    bars = data["chart_bars"]
+    points = tl.anchor_indices(hourly, anchors, kind)
+    if points is None:
+        return pd.Series(float("nan"), index=bars.index)
+    starts = pd.DatetimeIndex(hourly["timestamp"])
+    indices = starts.get_indexer(bars["timestamp"], method="pad")
+    values = []
+    for stamp, index in zip(bars["timestamp"], indices):
+        if index < 0:
+            values.append(None)
+            continue
+        fraction = min(float((stamp - starts[index]) / pd.Timedelta(hours=1)), 1.0)
+        values.append(tl.value_at(points, index + fraction, kind))
+    return pd.Series(values, index=bars.index, dtype=float)
+
+
 def _series_payload(data) -> list[dict]:
     """Indicator curves as a generic, open-ended list.
 
@@ -175,7 +222,7 @@ def _series_payload(data) -> list[dict]:
     ``autoscale: False`` keeps a series out of the price scale's fit: the zoom
     follows the candles, not a trendline extended far off-screen.
     """
-    hourly, visible = data["hourly"], data["visible"]
+    hourly, visible = data.get("chart_bars", data["hourly"]), data["visible"]
     tail = len(visible)
     times = _epochs(visible["timestamp"])
     rising = (visible["close"] >= visible["open"]).to_numpy()
@@ -203,7 +250,7 @@ def _series_payload(data) -> list[dict]:
                 "line_width": 2,
                 "last_value_visible": True,
                 "autoscale": False,
-                "values": tl.line_values(hourly, line["anchors"], line.get("kind") or "line"),
+                "values": _drawing_values(data, line),
                 "precision": 0,
             }
         )
@@ -316,7 +363,8 @@ def index() -> FileResponse:
 
 @app.get("/api/chart")
 def api_chart(
-    code: str | None = None, days: int = Query(default=0, ge=0, le=365)
+    code: str | None = None, days: int = Query(default=0, ge=0, le=365),
+    timeframe: Timeframe = "1h",
 ) -> dict:
     """Bars, boxes and indicator curves from a single read, so they agree.
 
@@ -328,9 +376,14 @@ def api_chart(
     data = _cached_load(code, days or CONFIG["days"])
     if data is None:
         raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
+    if timeframe != "1h":
+        bars = sb.minute_bars_to_interval(data["minute_bars"], TIMEFRAME_MINUTES[timeframe])
+        # Share the hourly view's cutoff so the same historical boxes remain visible.
+        visible = bars[bars["timestamp"] >= data["visible"]["timestamp"].iloc[0]].reset_index(drop=True)
+        data = {**data, "chart_bars": bars, "visible": visible}
     return {
         "code": code,
-        "timeframe": "1h",
+        "timeframe": timeframe,
         "generated_at": market_clock.now().isoformat(sep=" "),
         "bars": _bars_payload(data),
         "boxes": _boxes_payload(data),
@@ -341,25 +394,28 @@ def api_chart(
 
 @app.get("/api/bars")
 def api_bars(
-    code: str | None = None, days: int = Query(default=0, ge=0, le=365)
+    code: str | None = None, days: int = Query(default=0, ge=0, le=365),
+    timeframe: Timeframe = "1h",
 ) -> dict:
-    payload = api_chart(code=code, days=days)
+    payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "timeframe", "generated_at", "bars")}
 
 
 @app.get("/api/boxes")
 def api_boxes(
-    code: str | None = None, days: int = Query(default=0, ge=0, le=365)
+    code: str | None = None, days: int = Query(default=0, ge=0, le=365),
+    timeframe: Timeframe = "1h",
 ) -> dict:
-    payload = api_chart(code=code, days=days)
+    payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "generated_at", "boxes")}
 
 
 @app.get("/api/series")
 def api_series(
-    code: str | None = None, days: int = Query(default=0, ge=0, le=365)
+    code: str | None = None, days: int = Query(default=0, ge=0, le=365),
+    timeframe: Timeframe = "1h",
 ) -> dict:
-    payload = api_chart(code=code, days=days)
+    payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "generated_at", "series")}
 
 
@@ -414,6 +470,125 @@ def api_delete_trendline(line_id: int) -> dict:
             raise HTTPException(status_code=404, detail=f"no trendline {line_id}")
     _invalidate_cache()
     return {"deleted": line_id}
+
+
+class OrderIn(BaseModel):
+    contract_code: str = Field(min_length=1, max_length=24)
+    action: Literal["Buy", "Sell"]
+    quantity: int = Field(ge=1, le=100)
+    price: float = Field(ge=0)
+    price_type: Literal["LMT", "MKT", "MKP"] = "LMT"
+    order_type: Literal["ROD", "IOC", "FOK"] = "ROD"
+    curve_id: int | None = None
+    simulation: bool
+    confirmed: bool = False
+
+
+class TradeLevelsIn(BaseModel):
+    stop_price: float
+    target_price: float | None = None
+
+
+class TradeCurveIn(BaseModel):
+    target_price: float
+
+
+class TradeCurveSelectionIn(BaseModel):
+    curve_id: int | None = None
+
+
+class ContractSubscriptionIn(BaseModel):
+    contract_code: str = Field(min_length=1, max_length=24)
+
+
+@app.get("/api/trading/status")
+def api_trading_status() -> dict:
+    return _trading_service().status()
+
+
+@app.get("/api/trading/contracts")
+def api_trading_contracts() -> list[dict]:
+    try:
+        return _trading_service().contracts()
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/trading/subscribe")
+def api_subscribe_trading_contract(body: ContractSubscriptionIn) -> dict:
+    try:
+        return _trading_service().subscribe_contract(body.contract_code)
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/trading/margin")
+def api_trading_margin() -> dict:
+    try:
+        return _trading_service().margin()
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/trading/orders")
+def api_trading_orders() -> list[dict]:
+    return _trading_service().orders()
+
+
+@app.post("/api/trading/orders")
+def api_place_order(body: OrderIn) -> dict:
+    try:
+        return _trading_service().place_order(body.model_dump())
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/trading/orders/{order_id}/cancel")
+def api_cancel_trade_entry(order_id: str) -> dict:
+    try:
+        return _trading_service().cancel_entry(order_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.put("/api/trading/orders/{order_id}/levels")
+def api_update_trade_levels(order_id: str, body: TradeLevelsIn) -> dict:
+    try:
+        return _trading_service().update_levels(order_id, body.stop_price, body.target_price)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.put("/api/trading/orders/{order_id}/curve")
+def api_update_trade_curve(order_id: str, body: TradeCurveIn) -> dict:
+    try:
+        result = _trading_service().update_curve(order_id, body.target_price)
+        _invalidate_cache()
+        return result
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.put("/api/trading/orders/{order_id}/curve-selection")
+def api_select_trade_curve(order_id: str, body: TradeCurveSelectionIn) -> dict:
+    try:
+        result = _trading_service().set_order_curve(order_id, body.curve_id)
+        _invalidate_cache()
+        return result
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 class BoxOverrideIn(BaseModel):

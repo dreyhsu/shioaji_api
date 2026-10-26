@@ -160,6 +160,35 @@ def test_hourly_ohlcv_aggregates_correctly():
     assert bar["volume"] == 120.0    # summed, not averaged
 
 
+@pytest.mark.parametrize("interval,count", [(1, 1140), (5, 228), (15, 76), (60, 19)])
+def test_intervals_preserve_session_boundaries_and_volume(full_trading_day, interval, count):
+    bars = sb.minute_bars_to_interval(full_trading_day, interval)
+    assert len(bars) == count
+    assert bars["volume"].sum() == full_trading_day["volume"].sum()
+    assert bars["minutes"].eq(interval).all()
+    assert bars["timestamp"].is_unique
+    assert bars["timestamp"].is_monotonic_increasing
+    assert bars["timestamp"].map(sb.session_fields).notna().all()
+    assert bars.groupby("session_id")["timestamp"].first().tolist() == [
+        pd.Timestamp("2026-10-08 08:45"), pd.Timestamp("2026-10-08 15:00")
+    ]
+
+
+def test_five_minute_candles_include_partial_buckets_and_skip_missing_minutes():
+    frame = minutes("2026-10-08 08:45", "2026-10-08 08:57")
+    frame["open"] = range(13)
+    frame["close"] = frame["open"] + 0.5
+    frame["high"] = frame["open"] + 2
+    frame["low"] = frame["open"] - 1
+    frame = frame.drop(index=range(5, 10))  # a wholly missing bucket stays empty
+    bars = sb.minute_bars_to_interval(frame, 5)
+    assert bars["timestamp"].tolist() == [pd.Timestamp("2026-10-08 08:45"), pd.Timestamp("2026-10-08 08:55")]
+    assert bars["minutes"].tolist() == [5, 3]
+    first = bars.iloc[0]
+    assert (first.open, first.high, first.low, first.close, first.volume) == (0, 6, -1, 4.5, 5)
+    assert bars.iloc[-1].close == 12.5
+
+
 def test_timestamp_mirrors_hour_start_for_the_indicator(full_trading_day):
     """collect_snr_boxes keys off `timestamp`, so the fold must provide it."""
     hourly = sb.minute_bars_to_hourly(full_trading_day)

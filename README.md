@@ -178,7 +178,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `src/market_clock.py` | 市場時鐘（UTC + `config/alerts.json` 的 `utc_offset_hours`） |
 | `src/telegram_notify.py` | 通知格式與發送 |
 | `src/monitor.py` | 每分鐘主迴圈（寫 DB、發通知） |
-| `src/dashboard.py` + `src/web/` | 唯讀儀表板，每 60 秒更新；圖表用 lightweight-charts |
+| `src/dashboard.py` + `src/web/` | 行情圖表與期貨下單介面；圖表用 lightweight-charts |
 | `src/backfill_orderbook.py` | 歷史一檔委託簿回補（只抓箱體期間） |
 | `src/probe_history.py` | API 能力探測 |
 | `src/snr_1_hour_chart.py` | 靜態 HTML 繪圖 CLI |
@@ -190,11 +190,24 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 
 | 路由 | 內容 |
 |---|---|
-| `/` | lightweight-charts 圖表頁（`src/web/lwc.html`） |
+| `/` | lightweight-charts 圖表與期貨下單頁（`src/web/lwc.html`） |
 | `/api/chart` | `bars` + `boxes` + `series`，同一次 DB 讀取產生，所以三者必然一致 |
 | `/api/bars`、`/api/boxes`、`/api/series` | `/api/chart` 的單項版本，除錯用 |
 | `/api/trendlines` | `GET` 列表、`POST` 新增（`anchors:[{time,price},…]`）、`DELETE /{id}` 軟刪除 |
 | `/api/state` | 現價、落後分鐘、兩側箱體、近期停留／型態／通知 |
+| `/api/trading/*` | Shioaji 合約、委託、保證金、即時出場監控 |
+
+下單介面使用 `.env` 的 `SHIOAJI_SIMULATION` 決定模擬或正式環境，頁面會顯示目前模式；正式下單需設定 `SHIOAJI_CA_PATH`、`SHIOAJI_CA_PASSWD`、`SHIOAJI_PERSON_ID`。新倉送出前會顯示確認摘要。`config/trading.json` 的 `auto_exit_enabled` 預設為 `true`；設為 `false` 時停損／停利觸發只提醒，不會自動送平倉單。
+
+停損與固定停利預設為實際成交均價上下各 2 倍 1 小時 ATR，可在圖上拖曳調整。持倉成交後可由該筆部位選擇已保存的 1 小時曲線，曲線取代固定 +2 ATR 停利，但保留 -2 ATR 停損；多單在 1 分 K 收盤由曲線上方穿越到下方時觸發停利，空單反向。拖曳移動停利線會平移已保存曲線。停損依即時 tick 監控，曲線停利依已收盤的 1 分 K 監控，觸發後送市價 IOC 平倉；服務、行情 tick 與分鐘 K 資料需持續更新。委託回報不明時會停止自動重送，須核對券商端委託。
+
+委託列表可取消尚未成交的委託；部分成交時只取消剩餘未成交口數，已成交部位會保留。`Submitted` / `PreSubmitted` 代表委託尚未成交，需等待模擬撮合回報成為 `Filled` 才會是模擬持倉並啟動出場監控。成交部位可直接切換固定 +2 ATR 或已保存的 1 小時曲線停利。點選委託或持倉後，圖表顯示限價委託／成交均價、停損和停利價位；未成交限價單以預覽線呈現。模擬環境的 margin 回傳值可能為零，不能用它判斷成交或持倉，應以委託／成交回報為準。
+
+圖表右上可切換 **1m / 5m / 15m / 1h**，預設 1h，選擇會保留在網址的
+`timeframe` 參數。K 棒與成交量依所選週期彙整，各週期都以日／夜盤開盤時間
+對齊，不補休市或缺資料的空棒。「最近」顯示最新 120 根 K 棒。
+支撐／阻力箱、ATR 與已儲存的趨勢線仍依 1h 計算；畫線工具限 1h，維持與通知規則一致。
+`/api/chart` 及其單項版本也接受 `timeframe=1m|5m|15m|1h`。
 
 兩件圖表層容易踩到、已經在 code 裡註解過的事：
 

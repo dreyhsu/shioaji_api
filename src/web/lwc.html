@@ -23,14 +23,73 @@
     </div>
   </header>
 
-  <section class="sides">
-    <article class="side" id="side-support">
-      <h2>🟩 支撐箱</h2>
-      <div class="side-body">尚無資料</div>
+  <section class="trade-layout" aria-label="期貨下單與帳戶資訊">
+    <article class="trade-card trade-entry">
+      <div class="trade-card-head">
+        <h2>期貨下單</h2>
+        <span id="trade-mode" class="trade-badge">連線中…</span>
+      </div>
+      <div id="trade-connection" class="trade-connection">等待 Shioaji 連線</div>
+      <label class="trade-field">商品月份
+        <select id="trade-contract" disabled><option value="">載入合約中…</option></select>
+      </label>
+      <div class="trade-field">
+        <span>方向</span>
+        <div class="trade-toggle">
+          <button type="button" data-action="Buy" class="active">買進 / 多單</button>
+          <button type="button" data-action="Sell">賣出 / 空單</button>
+        </div>
+      </div>
+      <div class="trade-row">
+        <label class="trade-field">價格類別
+          <select id="trade-price-type">
+            <option value="LMT">限價</option>
+            <option value="MKT">市價</option>
+            <option value="MKP">範圍市價</option>
+          </select>
+        </label>
+        <label class="trade-field">委託條件
+          <select id="trade-order-type">
+            <option value="ROD">ROD</option>
+            <option value="IOC">IOC</option>
+            <option value="FOK">FOK</option>
+          </select>
+        </label>
+      </div>
+      <div class="trade-row">
+        <label class="trade-field">限價
+          <input id="trade-price" type="number" min="0" step="1" inputmode="decimal" placeholder="輸入價格">
+        </label>
+        <label class="trade-field">口數
+          <input id="trade-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+        </label>
+      </div>
+      <div class="trade-field">停利方式
+        <select id="trade-curve"><option value="">固定 +2 ATR</option></select>
+      </div>
+      <div id="trade-preview" class="trade-preview">選擇商品並輸入價格以預覽停損停利</div>
+      <button type="button" id="trade-submit" class="trade-submit" disabled>確認下單</button>
+      <div id="trade-message" class="trade-message" role="status"></div>
     </article>
-    <article class="side" id="side-resistance">
-      <h2>🟥 阻力箱</h2>
-      <div class="side-body">尚無資料</div>
+
+    <article class="trade-card trade-account">
+      <div class="trade-card-head">
+        <h2>期貨帳戶保證金</h2>
+        <button type="button" id="margin-refresh">更新</button>
+      </div>
+      <div id="margin-status" class="trade-muted">等待查詢</div>
+      <div class="margin-grid">
+        <div><span>風險指標</span><b id="margin-risk">—</b></div>
+        <div><span>維持保證金</span><b id="margin-maintenance">—</b></div>
+        <div><span>原始保證金</span><b id="margin-initial">—</b></div>
+        <div><span>可動用保證金</span><b id="margin-available">—</b></div>
+      </div>
+      <div class="trade-card-head position-heading">
+        <h2>本介面委託 / 部位</h2>
+        <span id="auto-exit-state" class="trade-muted">自動出場設定讀取中</span>
+      </div>
+      <div id="managed-orders" class="managed-orders"><div class="empty">尚無委託</div></div>
+      <div class="trade-muted order-help">點選委託後，圖表會標出委託價／成交均價、停損與停利。未成交委託可取消；部分成交取消時只撤銷未成交口數。</div>
     </article>
   </section>
 
@@ -38,13 +97,21 @@
     <div class="chart-head">
       <div id="legend-series" class="legend"></div>
       <div class="chart-tools">
+        <div id="timeframes" class="timeframes" role="group" aria-label="K 棒週期">
+          <button type="button" data-timeframe="1m" aria-pressed="false">1m</button>
+          <button type="button" data-timeframe="5m" aria-pressed="false">5m</button>
+          <button type="button" data-timeframe="15m" aria-pressed="false">15m</button>
+          <button type="button" data-timeframe="1h" aria-pressed="true" class="active">1h</button>
+        </div>
         <button type="button" id="draw-line">畫線</button>
         <button type="button" id="draw-curve">曲線</button>
         <button type="button" id="draw-done" hidden>完成</button>
-        <button type="button" id="recent">近 6 日</button>
+        <button type="button" id="recent" title="顯示最近 120 根 K 棒">最近</button>
         <button type="button" id="fit">全部</button>
       </div>
     </div>
+    <div class="chart-note">支撐／阻力箱、趨勢線與 ATR 依 1h 計算；畫線請切換至 1h。</div>
+    <div id="trade-chart-range" class="trade-chart-range" role="status">選取右側委託／部位，在圖表查看進場、停損與停利價位。</div>
     <div id="legend-ohlc" class="legend-ohlc"></div>
     <div id="trendlines" class="trendline-list"></div>
     <div id="draw-hint" class="draw-hint" hidden></div>
@@ -67,11 +134,12 @@
   </section>
 
   <footer>
-    每 60 秒自動更新 · 僅為監控與提示，不下單
+    圖表每 60 秒更新 · 期貨委託與自動出場依即時行情監控
   </footer>
 
   <script src="/static/status.js"></script>
   <script src="/static/boxes_primitive.js"></script>
   <script src="/static/lwc_app.js"></script>
+  <script src="/static/trading.js"></script>
 </body>
 </html>

@@ -32,6 +32,11 @@ const C = {
 const params = new URLSearchParams(location.search);
 const CODE = params.get('code') || '';
 const DAYS = Number(params.get('days')) || 0;
+const TIMEFRAMES = ['1m', '5m', '15m', '1h'];
+let timeframe = TIMEFRAMES.includes(params.get('timeframe')) ? params.get('timeframe') : '1h';
+let displayedTimeframe = null;
+let chartRequest = 0;
+let switchingTimeframe = false;
 
 let chart = null;
 let candles = null;
@@ -39,6 +44,10 @@ let boxes = null;
 let framed = false;
 const indicators = new Map(); // name -> { series, spec }
 let lastBars = [];
+let tradeOrder = null;
+let tradeLevelScaleKey = null;
+const tradePriceLines = { entry: null, stop: null, target: null };
+const tradeLevelDrag = { part: null, startY: 0, startPrice: 0, levels: null, moved: false, autoScale: true };
 
 // ---------------------------------------------------------------- formatters
 // Every timestamp is a naive Taipei stamp sent as if it were UTC, and the
@@ -150,6 +159,7 @@ function initChart() {
 
   chart.subscribeCrosshairMove(onCrosshairMove);
   listenForBoxEdits(document.getElementById('chart'));
+  listenForTradeLevelEdits(document.getElementById('chart'));
   listenForDrawClicks(document.getElementById('chart'));
   chart.subscribeCrosshairMove(onDrawHover);
 }
@@ -222,7 +232,7 @@ function applySeries(specs) {
 // ---------------------------------------------------------------- legend
 function renderLegendRows() {
   const rows = [
-    '<span class="lg"><i style="background:' + C.up + '"></i>' + (CODE || 'TMF') + ' 1h</span>',
+    '<span class="lg"><i style="background:' + C.up + '"></i>' + (CODE || 'TMF') + ' ' + (displayedTimeframe || timeframe) + '</span>',
   ];
   for (const [, entry] of indicators) {
     rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + entry.spec.label + '</span>');
@@ -285,6 +295,7 @@ const HINTS = {
 };
 
 function setDrawing(kind) {
+  if (kind && (timeframe !== '1h' || displayedTimeframe !== '1h')) return;
   draw.kind = kind;
   draw.anchors = [];
   draw.hover = null;
@@ -647,6 +658,203 @@ function listenForBoxEdits(el) {
   );
 }
 
+function clearTradePriceLines() {
+  for (const key of ['entry', 'stop', 'target']) {
+    if (tradePriceLines[key]) candles.removePriceLine(tradePriceLines[key]);
+    tradePriceLines[key] = null;
+  }
+}
+
+function tradeLevelAutoscaleInfo(original) {
+  const info = original();
+  if (!info || !tradeOrder) return info;
+  const levels = [tradeOrder.stop_price, tradeOrder.target_price, tradeOrder.curve_price]
+    .filter((value) => value !== null && value !== undefined)
+    .map(Number).filter(Number.isFinite);
+  const entry = Number(tradeOrder.avg_fill_price || tradeOrder.price);
+  if (Number.isFinite(entry) && entry > 0) levels.push(entry);
+  if (!levels.length) return info;
+  return {
+    ...info,
+    priceRange: {
+      minValue: Math.min(info.priceRange.minValue, ...levels),
+      maxValue: Math.max(info.priceRange.maxValue, ...levels),
+    },
+  };
+}
+
+function setTradeOrder(order) {
+  const hasOpenFill = order && Number(order.filled_quantity) > Number(order.exit_filled_quantity);
+  const hasLimitPreview = order && Number(order.active) && order.price_type === 'LMT'
+    && Number(order.price) > 0 && Number(order.atr) > 0;
+  const next = order && (hasOpenFill || hasLimitPreview)
+    ? order
+    : null;
+  const changed = !tradeOrder || !next || tradeOrder.id !== next.id;
+  const scaleKey = next
+    ? [next.id, next.filled_quantity, next.exit_filled_quantity, next.price, next.avg_fill_price, next.stop_price, next.target_price, next.curve_price].join('|')
+    : null;
+  const scaleChanged = scaleKey !== tradeLevelScaleKey;
+  if (changed) clearTradePriceLines();
+  tradeOrder = next;
+  if (candles && scaleChanged) {
+    candles.applyOptions({ autoscaleInfoProvider: tradeLevelAutoscaleInfo });
+    tradeLevelScaleKey = scaleKey;
+  }
+  if (!tradeOrder) {
+    const range = document.getElementById('trade-chart-range');
+    if (range) {
+      range.textContent = '選取右側委託／部位，在圖表查看進場、停損與停利價位。';
+      range.classList.remove('held', 'pending');
+    }
+    return;
+  }
+  const entry = Number(tradeOrder.avg_fill_price || tradeOrder.price);
+  let stop = tradeOrder.stop_price === null ? null : Number(tradeOrder.stop_price);
+  let target = tradeOrder.target_price === null ? null : Number(tradeOrder.target_price);
+  if (Number(tradeOrder.filled_quantity) === 0 && tradeOrder.price_type !== 'LMT') return;
+  if (stop === null && entry && Number(tradeOrder.atr) > 0) {
+    const direction = tradeOrder.action === 'Buy' ? 1 : -1;
+    stop = entry - direction * 2 * Number(tradeOrder.atr);
+    target = entry + direction * 2 * Number(tradeOrder.atr);
+  }
+  const specs = {
+    entry: {
+      price: entry,
+      color: '#f5c542',
+      title: Number(tradeOrder.filled_quantity) > 0 ? '成交均價' : '未成交委託價',
+      lineStyle: Number(tradeOrder.filled_quantity) > 0 ? 0 : 2,
+    },
+    stop: { price: stop, color: '#ef5350', title: '停損' },
+    target: {
+      price: Number(tradeOrder.curve_id) ? Number(tradeOrder.curve_price) : target,
+      color: '#26a69a', title: Number(tradeOrder.curve_id) ? '移動停利' : '停利',
+    },
+  };
+  const filled = Number(tradeOrder.filled_quantity) > 0;
+  const range = document.getElementById('trade-chart-range');
+  if (range) {
+    const basis = filled ? `模擬持倉 ${tradeOrder.filled_quantity - Number(tradeOrder.exit_filled_quantity || 0)}/${tradeOrder.quantity} 口 · 成交均價` : '限價委託預覽 · 尚未成交';
+    const curvePrice = tradeOrder.curve_price;
+    const targetText = Number(tradeOrder.curve_id)
+      ? `1h 曲線停利 ${curvePrice === null || curvePrice === undefined ? '—' : Number(curvePrice).toLocaleString('en-US')}（1m 收盤穿越）`
+      : `停利 ${target === null ? '—' : Number(target).toLocaleString('en-US')}`;
+    range.textContent = `${tradeOrder.contract_code} ${tradeOrder.action === 'Buy' ? '多單' : '空單'} · ${basis} ${entry.toLocaleString('en-US')} · 停損 ${stop === null ? '—' : Number(stop).toLocaleString('en-US')} · ${targetText}`;
+    range.classList.toggle('held', filled);
+    range.classList.toggle('pending', !filled);
+  }
+  for (const key of ['entry', 'stop', 'target']) {
+    const spec = specs[key];
+    if (spec.price === null || !Number.isFinite(spec.price)) {
+      if (tradePriceLines[key]) candles.removePriceLine(tradePriceLines[key]);
+      tradePriceLines[key] = null;
+      continue;
+    }
+    if (!tradePriceLines[key]) {
+      tradePriceLines[key] = candles.createPriceLine({
+        price: spec.price, color: spec.color, lineWidth: 2, lineStyle: spec.lineStyle ?? 2,
+        axisLabelVisible: true, title: spec.title,
+      });
+    } else {
+      tradePriceLines[key].applyOptions({ price: spec.price, title: spec.title, lineStyle: spec.lineStyle ?? 2 });
+    }
+  }
+}
+
+function tradeLineHit(el, event) {
+  if (!tradeOrder || draw.kind || boxDrag.hit) return null;
+  const rect = el.getBoundingClientRect();
+  const y = event.clientY - rect.top;
+  if (y < 0 || y > chart.panes()[PANE_PRICE].getHeight()) return null;
+  if (event.clientX - rect.left > chart.timeScale().width()) return null;
+  for (const key of ['stop', 'target']) {
+    const line = tradePriceLines[key];
+    if (!line) continue;
+    const coordinate = candles.priceToCoordinate(line.options().price);
+    if (coordinate !== null && Math.abs(y - coordinate) <= 7) return key;
+  }
+  return null;
+}
+
+function listenForTradeLevelEdits(el) {
+  el.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || !tradeOrder) return;
+    const part = tradeLineHit(el, event);
+    if (!part) return;
+    event.stopPropagation();
+    event.preventDefault();
+    el.setPointerCapture(event.pointerId);
+    tradeLevelDrag.part = part;
+    tradeLevelDrag.startY = event.clientY;
+    tradeLevelDrag.startPrice = candles.priceToCoordinate(tradePriceLines[part].options().price) === null
+      ? null
+      : tradePriceLines[part].options().price;
+    tradeLevelDrag.levels = {
+      stop: tradePriceLines.stop ? tradePriceLines.stop.options().price : null,
+      target: tradePriceLines.target ? tradePriceLines.target.options().price : null,
+    };
+    tradeLevelDrag.moved = false;
+    const scale = candles.priceScale();
+    tradeLevelDrag.autoScale = scale.options().autoScale;
+    scale.applyOptions({ autoScale: false });
+    el.style.cursor = 'ns-resize';
+  }, true);
+
+  el.addEventListener('pointermove', (event) => {
+    if (!tradeLevelDrag.part) {
+      if (event.buttons === 0) el.style.cursor = tradeLineHit(el, event) ? 'ns-resize' : '';
+      return;
+    }
+    event.stopPropagation();
+    const rect = el.getBoundingClientRect();
+    const price = candles.coordinateToPrice(event.clientY - rect.top);
+    if (price === null) return;
+    const entry = Number(tradeOrder.avg_fill_price || tradeOrder.price);
+    const long = tradeOrder.action === 'Buy';
+    const part = tradeLevelDrag.part;
+    const bounded = part === 'stop'
+      ? (long ? Math.min(price, entry - 1) : Math.max(price, entry + 1))
+      : (long ? Math.max(price, entry + 1) : Math.min(price, entry - 1));
+    const value = Math.round(bounded);
+    tradePriceLines[part].applyOptions({ price: value });
+    tradeLevelDrag.levels[part] = value;
+    if (Math.abs(event.clientY - tradeLevelDrag.startY) > 2) tradeLevelDrag.moved = true;
+  }, true);
+
+  const finish = async (event) => {
+    if (!tradeLevelDrag.part) return;
+    event.stopPropagation();
+    const part = tradeLevelDrag.part;
+    const levels = { ...tradeLevelDrag.levels };
+    const moved = tradeLevelDrag.moved;
+    tradeLevelDrag.part = null;
+    el.style.cursor = '';
+    candles.priceScale().applyOptions({ autoScale: tradeLevelDrag.autoScale });
+    if (!moved) return;
+    try {
+      const curveSelected = Number(tradeOrder.curve_id) > 0;
+      const endpoint = curveSelected ? '/curve' : '/levels';
+      const payload = curveSelected
+        ? { target_price: levels.target }
+        : { stop_price: levels.stop, target_price: levels.target };
+      const response = await fetch('/api/trading/orders/' + encodeURIComponent(tradeOrder.id) + endpoint, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error((await response.json()).detail || '儲存出場價失敗');
+      if (curveSelected) await refreshChart();
+      window.TradingUI?.refreshOrders();
+    } catch (error) {
+      tradePriceLines[part]?.applyOptions({ price: tradeLevelDrag.startPrice });
+      window.TradingUI?.message(error.message, true);
+    }
+  };
+  el.addEventListener('pointerup', finish, true);
+  el.addEventListener('pointercancel', finish, true);
+}
+
+window.SNRChart = { setTradeOrder, refresh: () => refreshChart() };
+
 function boxKey(box) {
   const body = { box_type: box.box_type, created_time: box.created_time };
   if (CODE) body.code = CODE;
@@ -690,15 +898,62 @@ document.getElementById('recent').addEventListener('click', () => {
   frameInitialViewport(lastBars.length);
 });
 
+function updateTimeframeButtons(loading = false) {
+  const group = document.getElementById('timeframes');
+  group.setAttribute('aria-busy', String(loading));
+  for (const button of group.querySelectorAll('[data-timeframe]')) {
+    const selected = button.dataset.timeframe === timeframe;
+    button.classList.toggle('active', selected);
+    button.setAttribute('aria-pressed', String(selected));
+    button.disabled = loading;
+  }
+  for (const tool of ['line', 'curve']) {
+    const button = document.getElementById('draw-' + tool);
+    button.disabled = loading || timeframe !== '1h';
+    button.title = timeframe === '1h' ? '' : '切換至 1h 畫線';
+  }
+}
+
+async function selectTimeframe(next) {
+  if (next === timeframe || boxDrag.hit) return;
+  const previous = timeframe;
+  timeframe = next;
+  switchingTimeframe = true;
+  setDrawing(null);
+  updateTimeframeButtons(true);
+  try {
+    await refreshChart();
+    const url = new URL(location.href);
+    url.searchParams.set('timeframe', timeframe);
+    history.replaceState(null, '', url);
+  } catch (error) {
+    timeframe = previous;
+    SNRStatus.setFreshness('週期切換失敗，請重試', 'bad');
+    console.error(error);
+  } finally {
+    switchingTimeframe = false;
+    updateTimeframeButtons();
+  }
+}
+
+for (const button of document.querySelectorAll('[data-timeframe]')) {
+  button.addEventListener('click', () => selectTimeframe(button.dataset.timeframe));
+}
+
 // ---------------------------------------------------------------- refresh loop
 async function refreshChart() {
-  const query = [];
+  const request = ++chartRequest;
+  const query = ['timeframe=' + timeframe];
   if (CODE) query.push('code=' + encodeURIComponent(CODE));
   if (DAYS) query.push('days=' + DAYS);
-  const response = await fetch('/api/chart' + (query.length ? '?' + query.join('&') : ''));
+  const response = await fetch('/api/chart?' + query.join('&'));
+  if (request !== chartRequest) return;
   if (!response.ok) throw new Error('chart ' + response.status);
   const payload = await response.json();
+  if (request !== chartRequest) return;
 
+  const switched = displayedTimeframe !== payload.timeframe;
+  displayedTimeframe = payload.timeframe;
   lastBars = payload.bars || [];
   // A full setData keeps barSpacing and the visible window -- it is not a view
   // reset -- and when bars are appended the library either follows the newest
@@ -715,7 +970,9 @@ async function refreshChart() {
 
   renderLegendRows();
   renderTrendlineList(payload.trendlines || []);
-  if (!framed && lastBars.length) {
+  if ((!framed || switched) && lastBars.length) {
+    document.getElementById('legend-ohlc').textContent = '';
+    candles.priceScale().applyOptions({ autoScale: true });
     frameInitialViewport(lastBars.length);
     framed = true;
   }
@@ -723,6 +980,7 @@ async function refreshChart() {
 }
 
 async function refresh() {
+  if (switchingTimeframe) return;
   try {
     const stateUrl = '/api/state' + (CODE ? '?code=' + encodeURIComponent(CODE) : '');
     const [stateResponse] = await Promise.all([fetch(stateUrl), refreshChart()]);
@@ -738,5 +996,6 @@ async function refresh() {
 }
 
 initChart();
+updateTimeframeButtons();
 refresh();
 setInterval(refresh, REFRESH_MS);

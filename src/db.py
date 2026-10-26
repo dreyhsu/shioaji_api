@@ -146,6 +146,43 @@ CREATE TABLE IF NOT EXISTS trendlines (
 );
 CREATE INDEX IF NOT EXISTS idx_trendlines_code ON trendlines (code, enabled);
 
+CREATE TABLE IF NOT EXISTS managed_orders (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  contract_code TEXT NOT NULL,
+  action TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  filled_quantity INTEGER NOT NULL DEFAULT 0,
+  avg_fill_price REAL,
+  price REAL NOT NULL,
+  price_type TEXT NOT NULL,
+  order_type TEXT NOT NULL,
+  atr REAL NOT NULL,
+  stop_price REAL,
+  target_price REAL,
+  curve_id INTEGER,
+  curve_armed INTEGER NOT NULL DEFAULT 0,
+  curve_check_from TEXT,
+  levels_customized INTEGER NOT NULL DEFAULT 0,
+  auto_exit INTEGER NOT NULL DEFAULT 1,
+  simulation INTEGER NOT NULL,
+  entry_trade_id TEXT NOT NULL,
+  entry_status TEXT NOT NULL,
+  exit_trade_id TEXT,
+  exit_status TEXT,
+  exit_filled_quantity INTEGER NOT NULL DEFAULT 0,
+  triggered_at TEXT,
+  trigger_reason TEXT,
+  last_quote REAL,
+  last_quote_at TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_managed_orders_active
+  ON managed_orders (active, code, contract_code);
+
 CREATE TABLE IF NOT EXISTS backfill_progress (
   code TEXT NOT NULL,
   task TEXT NOT NULL,
@@ -185,6 +222,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
+    ("managed_orders", "curve_check_from", "ALTER TABLE managed_orders ADD COLUMN curve_check_from TEXT"),
 )
 
 
@@ -789,6 +827,19 @@ def delete_trendline(conn: sqlite3.Connection, line_id: int) -> bool:
     """Soft delete: past ``telegram_alerts`` rows keep pointing at a real line."""
     cursor = conn.execute(
         "UPDATE trendlines SET enabled = 0 WHERE id = ? AND enabled = 1", (int(line_id),)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def update_trendline_anchors(conn: sqlite3.Connection, line_id: int, anchors: Sequence[dict]) -> bool:
+    ordered = sorted(
+        ({"time": int(anchor["time"]), "price": float(anchor["price"])} for anchor in anchors),
+        key=lambda anchor: anchor["time"],
+    )
+    cursor = conn.execute(
+        "UPDATE trendlines SET anchors = ? WHERE id = ? AND enabled = 1 AND kind = 'curve'",
+        (json.dumps(ordered), int(line_id)),
     )
     conn.commit()
     return cursor.rowcount > 0
