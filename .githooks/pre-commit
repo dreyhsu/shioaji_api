@@ -1,0 +1,9 @@
+#!/bin/sh
+# Enable explicitly: git config --local core.hooksPath .githooks
+set -eu
+if ! command -v conda >/dev/null 2>&1; then
+    echo "提交檢查需要 conda tss 環境；請從可使用 conda 的終端機提交。" >&2
+    exit 1
+fi
+cd "$(git rev-parse --show-toplevel)"
+exec conda run --no-capture-output -n tss python tools/test_runner.py --all

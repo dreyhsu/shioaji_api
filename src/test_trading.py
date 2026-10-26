@@ -104,8 +104,8 @@ def fake_service(tmp_path, monkeypatch):
     ))
     monkeypatch.setenv("SHIOAJI_SIMULATION", "1")
     service = trading.TradingService(
-        db_path, "TMFR1", settings_path=Path(__file__).parents[1] / "config" / "trading.json",
-        api_factory=factory,
+        db_path, "TMFR1", settings_path=tmp_path / "trading.json",
+        api_factory=factory, start_worker=False,
     )
     service._risk_context = lambda code: (120.0, pd.DataFrame())
     yield service, api, factory_modes
@@ -279,6 +279,7 @@ def test_form_displays_the_selected_production_mode(tmp_path, monkeypatch):
     service = trading.TradingService(
         tmp_path / "production.db", "TMFR1",
         api_factory=lambda simulation: (modes.append(simulation) or api),
+        start_worker=False,
     )
     try:
         status = service.status()

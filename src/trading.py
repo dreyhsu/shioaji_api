@@ -22,6 +22,8 @@ import session_bars as sb
 import snr_core as snr
 import shioaji_client as sc
 import trendline as tl
+from place_order import OrderRequest, OrderContext, validate_request, place_order
+from shioaji_order_adapter import ShioajiOrderAdapter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config" / "trading.json"
@@ -128,11 +130,19 @@ class TradingService:
         *,
         settings_path: Path | str = DEFAULT_SETTINGS_PATH,
         api_factory=None,
+        simulation: bool | None = None,
+        clock=None,
+        start_worker: bool = True,
+        sdk=None,
     ) -> None:
         self.db_path = Path(db_path)
         self.code = code
         self.settings_path = Path(settings_path)
         self.api_factory = api_factory
+        self._simulation = simulation
+        self._now = clock or (lambda: market_clock.now())
+        self._worker_enabled = start_worker
+        self._sdk = sdk or sj
         self._lock = threading.RLock()
         self._api = None
         self._api_context: AbstractContextManager | None = None
@@ -148,6 +158,8 @@ class TradingService:
 
     @property
     def simulation(self) -> bool:
+        if self._simulation is not None:
+            return self._simulation
         load_dotenv(PROJECT_ROOT / ".env")
         return os.getenv("SHIOAJI_SIMULATION", "1") == "1"
 
@@ -214,6 +226,8 @@ class TradingService:
                 self._connect_error = f"合約行情恢復失敗：{error}"
 
     def _start_worker(self) -> None:
+        if not self._worker_enabled:
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
@@ -232,7 +246,7 @@ class TradingService:
         if code in self._subscribed:
             return
         self._api.quote.subscribe(
-            contract, quote_type=sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+            contract, quote_type=self._sdk.QuoteType.Tick, version=self._sdk.QuoteVersion.v1
         )
         self._subscribed.add(code)
 
@@ -241,7 +255,7 @@ class TradingService:
             alias = str(_value(quote, "code", ""))
             code = self._quote_aliases.get(alias, alias)
             price = float(_value(quote, "close"))
-            stamp = pd.Timestamp(_value(quote, "datetime", market_clock.now()))
+            stamp = pd.Timestamp(_value(quote, "datetime", self._now()))
             if stamp.tzinfo is not None:
                 stamp = stamp.tz_convert(None)
             if not math.isfinite(price) or price <= 0:
@@ -266,7 +280,7 @@ class TradingService:
             return {}
 
     def _persist_trade_state(self, row_id: str, *, entry=None, exit_trade=None) -> None:
-        now = market_clock.now().isoformat(sep=" ")
+        now = self._now().isoformat(sep=" ")
         updates: dict[str, Any] = {"updated_at": now}
         if entry is not None:
             filled, avg = _fill_summary(entry)
@@ -280,7 +294,7 @@ class TradingService:
                 updates["exit_status"] = None
             if (filled > 0 and current.get("curve_id") is not None
                     and int(current.get("filled_quantity", 0)) == 0):
-                updates["curve_check_from"] = pd.Timestamp(market_clock.now()).ceil("min").isoformat(sep=" ")
+                updates["curve_check_from"] = pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ")
             if filled > 0 and avg is not None:
                 updates["avg_fill_price"] = avg
                 if not int(current.get("levels_customized", 0)):
@@ -342,7 +356,7 @@ class TradingService:
             self._curve_break_cache[cache_key] = (time.monotonic(), "curve_unavailable")
             return "curve_unavailable"
 
-        now = pd.Timestamp(market_clock.now())
+        now = pd.Timestamp(self._now())
         minutes = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now]
         if len(minutes) < 2:
             self._curve_break_cache[cache_key] = (time.monotonic(), "curve_unavailable")
@@ -434,7 +448,7 @@ class TradingService:
             conn.execute(
                 "UPDATE managed_orders SET triggered_at = COALESCE(triggered_at, ?), "
                 "trigger_reason = COALESCE(trigger_reason, ?), updated_at = ? WHERE id = ?",
-                (market_clock.now().isoformat(sep=" "), reason, market_clock.now().isoformat(sep=" "), row["id"]),
+                (self._now().isoformat(sep=" "), reason, self._now().isoformat(sep=" "), row["id"]),
             )
             conn.commit()
         if (not self.auto_exit_enabled() or row.get("exit_trade_id")
@@ -450,7 +464,7 @@ class TradingService:
                 with db.session(self.db_path) as conn:
                     conn.execute(
                         "UPDATE managed_orders SET exit_status = 'unknown', error = ?, updated_at = ? WHERE id = ?",
-                        ("進場委託仍可能成交，但券商狀態無法查詢；已暫停自動平倉", market_clock.now().isoformat(sep=" "), row["id"]),
+                        ("進場委託仍可能成交，但券商狀態無法查詢；已暫停自動平倉", self._now().isoformat(sep=" "), row["id"]),
                     )
                     conn.commit()
                 return
@@ -458,7 +472,7 @@ class TradingService:
                 cursor = conn.execute(
                     "UPDATE managed_orders SET exit_status = 'cancelling_entry', updated_at = ? "
                     "WHERE id = ? AND exit_trade_id IS NULL AND exit_status IS NULL",
-                    (market_clock.now().isoformat(sep=" "), row["id"]),
+                    (self._now().isoformat(sep=" "), row["id"]),
                 )
                 conn.commit()
             if not cursor.rowcount:
@@ -468,14 +482,14 @@ class TradingService:
                 with db.session(self.db_path) as conn:
                     conn.execute(
                         "UPDATE managed_orders SET exit_status = 'waiting_entry_cancel', updated_at = ? WHERE id = ?",
-                        (market_clock.now().isoformat(sep=" "), row["id"]),
+                        (self._now().isoformat(sep=" "), row["id"]),
                     )
                     conn.commit()
             except Exception as error:  # noqa: BLE001 - uncertain cancellation must not race an exit
                 with db.session(self.db_path) as conn:
                     conn.execute(
                         "UPDATE managed_orders SET exit_status = 'unknown', error = ?, updated_at = ? WHERE id = ?",
-                        (f"取消未成交進場委託失敗，請先核對券商端：{error}", market_clock.now().isoformat(sep=" "), row["id"]),
+                        (f"取消未成交進場委託失敗，請先核對券商端：{error}", self._now().isoformat(sep=" "), row["id"]),
                     )
                     conn.commit()
             return
@@ -489,21 +503,21 @@ class TradingService:
                 "UPDATE managed_orders SET exit_status = 'submitting', triggered_at = COALESCE(triggered_at, ?), "
                 "trigger_reason = COALESCE(trigger_reason, ?), updated_at = ? "
                 "WHERE id = ? AND active = 1 AND exit_trade_id IS NULL AND exit_status IS NULL",
-                (market_clock.now().isoformat(sep=" "), reason, market_clock.now().isoformat(sep=" "), row["id"]),
+                (self._now().isoformat(sep=" "), reason, self._now().isoformat(sep=" "), row["id"]),
             )
             conn.commit()
         if not cursor.rowcount:
             return
         try:
             contract = self._find_contract(row["contract_code"])
-            action = sj.Action.Sell if row["action"] == "Buy" else sj.Action.Buy
-            order = sj.Order(
+            action = self._sdk.Action.Sell if row["action"] == "Buy" else self._sdk.Action.Buy
+            order = self._sdk.Order(
                 action=action,
                 price=0,
                 quantity=quantity,
-                price_type=sj.FuturesPriceType.MKT,
-                order_type=sj.OrderType.IOC,
-                octype=sj.FuturesOCType.Cover,
+                price_type=self._sdk.FuturesPriceType.MKT,
+                order_type=self._sdk.OrderType.IOC,
+                octype=self._sdk.FuturesOCType.Cover,
                 account=self._api.futopt_account,
             )
             trade = self._api.place_order(contract, order)
@@ -513,14 +527,14 @@ class TradingService:
             with db.session(self.db_path) as conn:
                 conn.execute(
                     "UPDATE managed_orders SET exit_trade_id = ?, exit_status = ?, updated_at = ? WHERE id = ?",
-                    (str(trade_id), _trade_status(trade), market_clock.now().isoformat(sep=" "), row["id"]),
+                    (str(trade_id), _trade_status(trade), self._now().isoformat(sep=" "), row["id"]),
                 )
                 conn.commit()
         except Exception as error:  # noqa: BLE001 - don't blindly retry an uncertain order
             with db.session(self.db_path) as conn:
                 conn.execute(
                     "UPDATE managed_orders SET exit_status = 'unknown', error = ?, updated_at = ? WHERE id = ?",
-                    (str(error), market_clock.now().isoformat(sep=" "), row["id"]),
+                    (str(error), self._now().isoformat(sep=" "), row["id"]),
                 )
                 conn.commit()
 
@@ -559,13 +573,13 @@ class TradingService:
                 quote = self._quotes.get(row["contract_code"])
             if not quote:
                 continue
-            age = (market_clock.now() - quote["at"]).total_seconds()
+            age = (self._now() - quote["at"]).total_seconds()
             if age < -5 or age > TICK_STALE_SECONDS:
                 continue
             with db.session(self.db_path) as conn:
                 conn.execute(
                     "UPDATE managed_orders SET last_quote = ?, last_quote_at = ?, updated_at = ? WHERE id = ?",
-                    (quote["price"], quote["at"].isoformat(sep=" "), market_clock.now().isoformat(sep=" "), row["id"]),
+                    (quote["price"], quote["at"].isoformat(sep=" "), self._now().isoformat(sep=" "), row["id"]),
                 )
                 conn.commit()
             signal = self._exit_signal(row, quote["price"])
@@ -575,7 +589,7 @@ class TradingService:
                 with db.session(self.db_path) as conn:
                     conn.execute(
                         "UPDATE managed_orders SET error = ?, updated_at = ? WHERE id = ?",
-                        ("1 小時曲線或已收盤 1 分 K 資料暫不可用；曲線停利暫停，固定停損仍監控", market_clock.now().isoformat(sep=" "), row["id"]),
+                        ("1 小時曲線或已收盤 1 分 K 資料暫不可用；曲線停利暫停，固定停損仍監控", self._now().isoformat(sep=" "), row["id"]),
                     )
                     conn.commit()
 
@@ -601,7 +615,7 @@ class TradingService:
         with self._lock:
             if self._quotes:
                 latest = max(self._quotes.values(), key=lambda row: row["at"])
-        age = None if latest is None else max(0.0, (market_clock.now() - latest["at"]).total_seconds())
+        age = None if latest is None else max(0.0, (self._now() - latest["at"]).total_seconds())
         return {
             "simulation": self.simulation,
             "mode": "模擬環境" if self.simulation else "正式環境",
@@ -630,7 +644,7 @@ class TradingService:
                 continue
             if delivery_date:
                 try:
-                    if pd.Timestamp(delivery_date) < pd.Timestamp(market_clock.today()):
+                    if pd.Timestamp(delivery_date) < pd.Timestamp(self._now()).normalize():
                         continue
                 except (TypeError, ValueError):
                     continue
@@ -676,7 +690,7 @@ class TradingService:
         status = _value(result, "status", "Fetched")
         return {
             "status": _enum_text(status),
-            "fetched_at": market_clock.now().isoformat(sep=" "),
+            "fetched_at": self._now().isoformat(sep=" "),
             "risk_indicator": _value(result, "risk_indicator"),
             "maintenance_margin": _value(result, "maintenance_margin"),
             "initial_margin": _value(result, "initial_margin"),
@@ -697,24 +711,13 @@ class TradingService:
         return float(raw), hourly
 
     def place_order(self, request: dict) -> dict:
-        if not request.get("confirmed"):
-            raise ValueError("送單前必須確認委託摘要")
-        if bool(request.get("simulation")) != self.simulation:
-            raise ValueError("下單環境已改變，請重新確認目前環境後再送單")
-        action = request.get("action")
-        if action not in {"Buy", "Sell"}:
-            raise ValueError("請選擇買進或賣出")
-        quantity = int(request.get("quantity", 0))
-        if quantity < 1:
-            raise ValueError("口數必須至少為 1")
-        price_type = request.get("price_type", "LMT")
-        order_type = request.get("order_type", "ROD")
-        if price_type not in {"LMT", "MKT", "MKP"} or order_type not in {"ROD", "IOC", "FOK"}:
-            raise ValueError("不支援的價格類別或委託條件")
-        price = float(request.get("price", 0) or 0)
-        if price_type == "LMT" and (not math.isfinite(price) or price <= 0):
-            raise ValueError("限價必須是大於 0 的數字")
-        contract_code = str(request.get("contract_code", ""))
+        order_request = OrderRequest(**{
+            key: value for key, value in request.items() if key in OrderRequest.__dataclass_fields__
+        })
+        validate_request(order_request, self.simulation)
+        action, quantity = order_request.action, order_request.quantity
+        price_type, order_type = order_request.price_type, order_request.order_type
+        price, contract_code = order_request.price, order_request.contract_code
         contracts = {item["code"]: item for item in self.contracts()}
         if contract_code not in contracts:
             raise ValueError("請選擇有效的微型臺指期貨月份合約")
@@ -732,28 +735,18 @@ class TradingService:
         contract = self._find_contract(contract_code)
         canonical_code = str(contract.code)
         tick = float(_value(contract, "tick", 1) or 1)
-        if price_type == "LMT":
-            price = round(round(price / tick) * tick, 8)
-        order = sj.Order(
-            action=sj.Action.Buy if action == "Buy" else sj.Action.Sell,
-            price=price if price_type == "LMT" else 0,
-            quantity=quantity,
-            price_type={"LMT": sj.FuturesPriceType.LMT, "MKT": sj.FuturesPriceType.MKT, "MKP": sj.FuturesPriceType.MKP}[price_type],
-            order_type={"ROD": sj.OrderType.ROD, "IOC": sj.OrderType.IOC, "FOK": sj.OrderType.FOK}[order_type],
-            octype=sj.FuturesOCType.Auto,
-            account=api.futopt_account,
-        )
         with self._lock:
-            trade = api.place_order(contract, order)
-            trade_id = _trade_id(trade)
-            if not trade_id:
-                raise RuntimeError("Shioaji 沒有回傳委託編號，請立即至券商端確認委託狀態")
-            trade_id = str(trade_id)
+            result = place_order(
+                order_request,
+                context=OrderContext(canonical_code, tick, self.simulation),
+                broker=ShioajiOrderAdapter(api, contract, sdk=self._sdk),
+            )
+            trade_id, price = result.trade_id, result.price
             self._subscribe(contract)
         preview_price = price if price_type == "LMT" else None
         stop, target = (stop_target_prices(action, preview_price, atr) if preview_price else (None, None))
         row_id = str(uuid.uuid4())
-        now = market_clock.now().isoformat(sep=" ")
+        now = self._now().isoformat(sep=" ")
         with db.session(self.db_path) as conn:
             conn.execute(
                 """INSERT INTO managed_orders (
@@ -763,9 +756,9 @@ class TradingService:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (row_id, self.code, canonical_code, action, quantity, price, price_type, order_type,
                  atr, stop, target, curve_id,
-                 pd.Timestamp(market_clock.now()).ceil("min").isoformat(sep=" ") if curve_id is not None else None,
+                 pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ") if curve_id is not None else None,
                  int(self.auto_exit_enabled()), int(self.simulation),
-                 trade_id, _trade_status(trade), now, now),
+                 trade_id, result.status, now, now),
             )
             conn.commit()
         self._start_worker()
@@ -787,7 +780,7 @@ class TradingService:
         with db.session(self.db_path) as conn:
             conn.execute(
                 "UPDATE managed_orders SET stop_price = ?, target_price = ?, levels_customized = 1, updated_at = ? WHERE id = ?",
-                (stop, target, market_clock.now().isoformat(sep=" "), row_id),
+                (stop, target, self._now().isoformat(sep=" "), row_id),
             )
             conn.commit()
         return self._public_order(self._active_order(row_id))
@@ -842,12 +835,12 @@ class TradingService:
                 ).fetchone()
             if curve is None:
                 raise ValueError("選用的 1 小時曲線不存在或已刪除")
-            check_from = pd.Timestamp(market_clock.now()).ceil("min").isoformat(sep=" ")
+            check_from = pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ")
         with db.session(self.db_path) as conn:
             conn.execute(
                 "UPDATE managed_orders SET curve_id = ?, target_price = ?, curve_check_from = ?, "
                 "curve_armed = 0, updated_at = ? WHERE id = ?",
-                (curve_id, target, check_from, market_clock.now().isoformat(sep=" "), row_id),
+                (curve_id, target, check_from, self._now().isoformat(sep=" "), row_id),
             )
             conn.commit()
         if row.get("curve_id") is not None:
@@ -914,7 +907,7 @@ class TradingService:
                     try:
                         contract = self._find_contract(code)
                         self._api.quote.unsubscribe(
-                            contract, quote_type=sj.QuoteType.Tick, version=sj.QuoteVersion.v1
+                            contract, quote_type=self._sdk.QuoteType.Tick, version=self._sdk.QuoteVersion.v1
                         )
                     except Exception:  # noqa: BLE001
                         pass

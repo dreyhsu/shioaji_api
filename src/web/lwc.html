@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=mock-3">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -22,6 +22,39 @@
       <span>更新於 <b id="updated">—</b></span>
     </div>
   </header>
+
+  <section id="mock-panel" class="mock-panel" hidden aria-label="離線 Mock API 測試">
+    <div class="trade-card-head"><h2>離線 Mock API · V 型行情回放</h2><b id="mock-phase">載入中</b></div>
+    <p>行情先長時間下跌，再 V 型反彈，最後回檔。<span id="mock-timing"></span>所有委託只在本機模擬。</p>
+    <div class="mock-controls">
+      <button id="mock-play" type="button">播放</button>
+      <button type="button" data-mock-step="1">+1 分鐘</button>
+      <button type="button" data-mock-step="10">+10 分鐘</button>
+      <button type="button" data-mock-step="60">+60 分鐘</button>
+      <button id="mock-reset" type="button">重設情境</button>
+      <span id="mock-progress"></span>
+    </div>
+    <div class="mock-controls">
+      <label>突破買入曲線 <select id="mock-entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select></label>
+      <label>口數 <input id="mock-entry-quantity" type="number" min="1" max="100" step="1" value="1"></label>
+      <button id="mock-entry-arm" type="button">啟用一次突破買入</button>
+      <button id="mock-entry-cancel" type="button">取消等待買入</button>
+    </div>
+    <p>測試 1：手動下單，點選成交部位查看 ±2 ATR。測試 2：在 1h 圖畫曲線，再從部位選擇曲線並「套用停利」。測試 3：選曲線啟用突破買入，再推進反彈行情。</p>
+    <p>突破買入採已收盤 1 分 K 由曲線下方向上穿越；只買入一次。曲線停利採多單收盤向下穿越，保留原停損。</p>
+    <div id="mock-entry-state" role="status"></div>
+    <div id="mock-message" class="trade-message" role="status"></div>
+  </section>
+
+  <dialog id="mock-confirm" aria-labelledby="mock-confirm-title">
+    <form method="dialog">
+      <h2 id="mock-confirm-title">離線 Mock 操作確認</h2>
+      <pre id="mock-confirm-summary"></pre>
+      <div class="mock-controls">
+        <button value="cancel">取消</button><button value="confirm">確認</button>
+      </div>
+    </form>
+  </dialog>
 
   <section class="trade-layout" aria-label="期貨下單與帳戶資訊">
     <article class="trade-card trade-entry">
@@ -137,9 +170,10 @@
     圖表每 60 秒更新 · 期貨委託與自動出場依即時行情監控
   </footer>
 
-  <script src="/static/status.js"></script>
+  <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
-  <script src="/static/lwc_app.js"></script>
-  <script src="/static/trading.js"></script>
+  <script src="/static/lwc_app.js?v=mock-6"></script>
+  <script src="/static/trading.js?v=mock-6"></script>
+  <script src="/static/mock_replay.js?v=mock-6"></script>
 </body>
 </html>

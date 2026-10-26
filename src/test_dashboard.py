@@ -199,10 +199,7 @@ def test_missing_code_is_a_404(client):
     assert client.get("/api/chart?code=NOPE").status_code == 404
 
 
-@pytest.mark.skipif(
-    not db.DEFAULT_DB_PATH.exists(), reason="needs the recorded data/tmf.db"
-)
-def test_real_db_box_18_extends_past_the_last_bar(monkeypatch):
+def test_box_right_edge_extends_past_the_last_bar(client):
     """The case that silently breaks a naive implementation.
 
     Box 18's recorded right edge is 05:00 while the last hourly bar is 04:00, so
@@ -210,13 +207,16 @@ def test_real_db_box_18_extends_past_the_last_bar(monkeypatch):
     return null for it and the box would vanish; the browser uses
     ``timeToIndex(..., findNearest=True)`` instead, and the server marks it open.
     """
-    monkeypatch.setitem(dashboard.CONFIG, "db_path", db.DEFAULT_DB_PATH)
+    with db.session(dashboard.CONFIG["db_path"]) as conn:
+        minutes = db.load_minute_bars(conn, "TMFR1")
+        last = sb.minute_bars_to_hourly(minutes)["hour_start"].iloc[-1]
+        conn.execute("UPDATE snr_boxes SET right_time = ? WHERE state != 'broken'", (str(last + pd.Timedelta(hours=1)),))
+        conn.commit()
     dashboard._LOAD_CACHE.clear()
     payload = TestClient(dashboard.app).get("/api/chart?code=TMFR1&days=30").json()
     dashboard._LOAD_CACHE.clear()
 
     assert len(payload["bars"]) > 300
-    assert payload["bars"][0]["time"] == 1788926400  # 2026-09-09 08:00 Taipei
     open_boxes = [box for box in payload["boxes"] if box["open"]]
     assert open_boxes, "the newest box of a side should still be advancing"
     assert all(len(s["data"]) == len(payload["bars"]) for s in payload["series"])

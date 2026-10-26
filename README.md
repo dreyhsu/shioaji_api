@@ -4,7 +4,128 @@
 Resistance (High Volume Boxes)」箱體，當 **1 分 K 價格進入箱體**時開始記錄委託簿並發
 Telegram 通知，並偵測箱體內的小時 K 棒反轉型態。
 
-**只做監控與通知，不下任何單。**
+包含行情監控、通知與手動期貨下單；可使用下方離線 Mock API 測試，不需券商帳密。
+
+## 離線 Mock API：V 型行情測試
+
+```bash
+conda run --no-capture-output -n tss python src/dashboard.py --mock --port 8766
+```
+
+開啟 [Mock Dashboard](http://127.0.0.1:8766)。不需啟動 `monitor.py`，不讀券商帳密；
+每次啟動建立新的暫存資料庫，不使用 `data/tmf.db`。畫面顯示「離線 Mock API」，
+與 Shioaji 的券商模擬環境是不同模式。
+
+情境為 **60 小時下跌 → 8 小時 V 型反彈 → 2 小時回檔**（按有效交易分鐘計）。
+目前 `config/mock.json` 設為 `replay.start_bar: 0`，從 **0/4200 根**空圖開始，
+不預載歷史資料。播放速度依 `replay.interval_seconds`（目前 0.1 秒推進
+1 分鐘），也可按 +1 / +10 / +60 分鐘。未推進的資料不參與指標與策略。
+
+Mock 的可調參數集中在 [`config/mock.json`](config/mock.json)，**修改後需重新啟動 Mock Dashboard**。
+啟動時載入並驗證；缺少的欄位沿用預設值，未知欄位、錯誤型別或不合法數值會顯示錯誤。
+JSON 內每個參數旁的 `_comment_參數名稱` 是中文說明；`_comment` 與 `_comment_` 開頭的欄位會在讀取時忽略，可自由修改說明文字。
+
+| 設定區塊 | 參數 | 用途（預設值） |
+| --- | --- | --- |
+| `market` | `start_time` | 資料起始時間（`2026-10-05 08:45`，使用本地交易時間，不帶時區）；非交易分鐘自動跳過 |
+| `market` | `decline_minutes` / `rebound_minutes` / `pullback_minutes` | 下跌／反彈／回檔的有效交易分鐘數（3600／480／120） |
+| `market` | `start_price` | 起始價格（27000） |
+| `market` | `decline_points_per_minute` / `rebound_points_per_minute` / `pullback_points_per_minute` | 各階段每分鐘下跌／上漲／回檔點數（0.8／2／2，均填正數）；轉折價格隨前一階段自動銜接 |
+| `market` | `wave_amplitude` / `wave_scale_minutes` | 正弦波動振幅（0.6，可設 0）與時間尺度（7；完整週期為 `2π × wave_scale_minutes` 分鐘） |
+| `market` | `wick_points` | K 棒實體上下各加的影線點數（2） |
+| `market` | `volume_base` / `volume_cycle_minutes` | 每分鐘成交量為 `volume_base + 分鐘索引 % volume_cycle_minutes`（10／17） |
+| `replay` | `start_bar` | 直接指定初始已載入的 K 棒數，優先於相對起點。`0` 從空圖開始、`4020` 從 4020/4200 開始；範圍為 0 到情境總根數。設為 `null` 或省略才使用 `start_at` |
+| `replay` | `start_at` | 僅在 `start_bar` 為 `null` 時使用：`before_bottom` 為谷底前，適合突破買入；`before_pullback` 為反彈結束前，適合回檔曲線停利。省略時沿用 `before_bottom` |
+| `replay` | `minutes_before_bottom` | `start_at=before_bottom` 時，初始停在谷底前幾個有效交易分鐘（60，須小於下跌分鐘數） |
+| `replay` | `minutes_before_pullback` | `start_at=before_pullback` 時，初始停在反彈結束前幾個有效交易分鐘（60，不得大於反彈分鐘數）；之前的 K 棒作為歷史資料 |
+| `replay` | `interval_seconds` | 每播放一根 1 分 K 等待的真實秒數（1）；設為 60 即約每真實分鐘更新一根 |
+| `replay` | `browser_poll_seconds` | 網頁查詢回放進度的間隔秒數（1.5） |
+| `broker` | `equity` | 模擬帳戶權益（1000000） |
+| `broker` | `initial_margin_per_contract` / `maintenance_margin_per_contract` | 每口原始／維持保證金（22000／18000） |
+
+例如想放慢為每 5 秒更新一根 1 分 K，將 `replay.interval_seconds` 改成 `5`。
+初始仍為暫停，按「播放」才推進；「重設情境」沿用本次啟動載入的設定。
+
+### 從第零根開始
+
+將 `replay.start_bar` 設為 `0` 並重啟。初始顯示 **0/4200**，圖表為空、現價顯示「—」；
+按「+1 分鐘」後顯示 **1/4200** 與第一根 K 棒，按「播放」則持續逐根加入。
+尚未累積足夠的 1 小時 ATR 前，下單按鈕會停用；不會使用未回放的資料來補指標。
+按「重設情境」會再次回到 0 根。
+
+想從任意位置開始，只需改同一個 `start_bar`，例如 `4020` 用於下方回檔停利測試。
+
+### 回檔曲線停利測試
+
+設定 `replay.start_bar: 4020`；或將 `start_bar` 設為 `null`，再設定
+`start_at: "before_pullback"`、`minutes_before_pullback: 60`。重啟後行情暫停在
+約 **24958**，還有 60 根 1 分 K 反彈至約 **25080**，之後按每分鐘約 2 點回檔。
+以下價格以目前的 `market` 設定為準，調整行情參數後需重新選擇曲線價格。
+
+1. 保持暫停，用市價 **Buy 1 口**建立多單。
+2. 切至 **1h**，按「曲線」；在近期歷史 K 棒範圍依序點起點、終點、中間控制點，
+   三點價格都放在約 **25040**，先用水平曲線確認觸發流程。
+3. 在右側已成交部位的停利選單選該曲線，按「套用停利」並確認。
+   此時固定 +2 ATR 停利停用，原停損保留。
+4. 按 **+60 分鐘**：反彈接近高點，部位應仍未平倉；再按 **+10 分鐘**三次，
+   回檔的 1 分 K 收盤向下穿越約 25040 時，觸發曲線出場並模擬賣出平倉。
+   預期出場價高於進場價、持倉歸零，觸發原因為 `curve`。
+
+測試完成後按「重設情境」即可回到同一起點（會清除本次 Mock 委託、曲線及進場設定）。
+這個流程使用持倉的「套用停利」；上方「啟用一次突破買入」是另一個進場測試。
+
+1. **手動下單與 ±2 ATR**：選月份、方向與市價，確認下單。Mock 立即按當前價格成交；
+   點選右側部位，在圖上檢查成交均價、停損與停利。多單為均價 −2 ATR / +2 ATR，空單相反。
+2. **手動曲線移動停利**：切到 1h，按「曲線」，依提示點起點、終點與中間控制點。
+   在右側已成交部位選該曲線，按「套用停利」。固定停利停用，原停損保留；
+   多單於已收盤 1 分 K 向下穿越曲線時平倉，空單反向。可拖曳圖上移動停利線平移曲線。
+3. **曲線突破買入**：先保存曲線，在 Mock 控制區選曲線與口數，按「啟用一次突破買入」。
+   只有啟用後的已收盤 1 分 K 從曲線下方（含相等）向上穿越才會買入一次；
+   成交後使用 ±2 ATR。進場曲線不會自動成為停利曲線，可再按流程 2 設定。
+   測試此流程時，先將 `replay.start_bar` 改成 `null`、`start_at` 改成 `before_bottom`，
+   並設 `minutes_before_bottom: 60` 後重啟；
+   可畫接近 **24150** 的水平曲線，再推進約 90 分鐘，觀察下跌後反彈的突破。
+
+三種流程共用既有交易服務、ATR 計算、持倉記錄與出場邏輯。曲線自動買入本次僅接到
+Mock API，正式模式不提供該自動進場端點。啟用時不補做歷史訊號，取消或刪除曲線後不買入，
+錯誤時停止且不自動重送。「重設情境」確認後會清除本次 Mock 委託、曲線與進場設定。
+
+Mock 市價與範圍市價按最新回放收盤成交；限價只有報價符合時成交，否則 ROD 等待、
+IOC/FOK 取消。模擬採無限流動性、全額成交，不模擬部分成交、手續費、滑價或券商延遲。
+停損停利是程式監控後送出平倉委託，不是預掛在券商端的兩張委託。
+
+## 獨立測試與開發流程
+
+```bash
+# 不開 Dashboard、不登入券商，單獨測試下單
+conda run -n tss python -m pytest src/test_place_order.py -q
+
+# 三個 Mock 操作流程的整合測試，不啟動網頁伺服器
+conda run -n tss python -m pytest src/test_mock_runtime.py -q
+
+# 完整離線回歸測試，或僅跑某個層級
+conda run -n tss python -m pytest -q
+conda run -n tss python -m pytest -m unit -q
+conda run -n tss python -m pytest -m integration -q
+
+# 開發期間自動監看，存檔後執行相關測試
+conda run --no-capture-output -n tss python tools/test_runner.py --watch
+
+# 手動依修改的模組挑測試
+conda run --no-capture-output -n tss python tools/test_runner.py --related src/place_order.py
+```
+
+測試預設禁止真實券商初始化、外部網路與私人 `.env` 載入；資料庫僅允許暫存目錄。
+FastAPI 測試使用記憶體內的 TestClient，券商一律使用 Fake/Mock。正式模式顯示的測試也只使用 Fake。
+
+如需提交前自動檢查，請自行執行一次：
+
+```bash
+git config --local core.hooksPath .githooks
+```
+
+之後每次提交會在 `tss` 執行完整離線測試，失敗即阻止提交。本次未自動變更 Git 設定。
+架構責任、模組介面與新增功能步驟見 [模組化與測試規範](doc/modular_testing.md)。
 
 ---
 
@@ -170,6 +291,11 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `src/session_bars.py` | 台指盤別時段 ＋ 1分K → 時段對齊 60分K |
 | `src/db.py` | sqlite schema 與存取 |
 | `src/shioaji_client.py` | 登入、合約解析、kbars/ticks 取得（含 API 怪癖處理） |
+| `src/place_order.py` + `src/shioaji_order_adapter.py` | 獨立委託驗證與券商介面轉換，可只用 Mock 測試 |
+| `src/trading.py` | 交易協調、持倉同步與停損停利監控，可注入時鐘、API 與停用 worker |
+| `src/curve_entry.py` | 已收盤 1 分 K 向上突破 1h 曲線的純訊號判斷 |
+| `src/mock_market_data.py` + `src/mock_broker.py` | 固定 V 型行情、純記憶體委託撮合 |
+| `src/mock_runtime.py` + `src/mock_routes.py` | 離線回放組裝、一次曲線買入與操作 API |
 | `src/box_watch.py` | 進/出箱狀態機 |
 | `src/patterns.py` | 小時 K 棒反轉型態 |
 | `src/orderbook.py` | 五檔訂閱、環形緩衝、降頻、歷史 tick 轉換 |
@@ -183,7 +309,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `src/probe_history.py` | API 能力探測 |
 | `src/snr_1_hour_chart.py` | 靜態 HTML 繪圖 CLI |
 
-兩個常駐行程：`monitor.py` 寫、`dashboard.py` 唯讀。sqlite 跑 WAL 模式，互不阻塞；
+正式行情使用兩個常駐行程：`monitor.py` 寫行情，`dashboard.py` 讀圖表並處理下單／畫線。sqlite 跑 WAL 模式；
 儀表板掛掉不影響資料收集。
 
 ### 儀表板路由
@@ -253,7 +379,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 
 ## 環境
 
-conda env `tss`，Python 3.10。不需安裝任何新套件（sqlite3 是 stdlib）。
+conda env `tss`，Python 3.10。Mock、測試監看與 Git hook 不需安裝新套件（sqlite3 是 stdlib）。
 
 前端沒有 node／npm／打包步驟，JS 一律用 `<script>` 直接載入本地檔案：
 

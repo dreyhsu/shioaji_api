@@ -59,6 +59,7 @@
 
   function renderSide(kind, side, price) {
     const card = $(`side-${kind}`);
+    if (!card) return; // Trading layout can omit the optional box summary cards.
     const body = card.querySelector('.side-body');
     card.classList.remove('inside');
 
@@ -151,12 +152,18 @@
 
   window.SNRStatus = {
     renderAll(state) {
+      if (state.ready === false) {
+        state = { ...state, last_price: null, hourly_atr: null, hourly_bars: 0,
+          last_minute_start: null, in_session: false, sides: { support: null, resistance: null },
+          recent_visits: [], recent_reversals: [], recent_alerts: [] };
+      }
       renderStatus(state);
       renderSide('support', state.sides.support, state.last_price);
       renderSide('resistance', state.sides.resistance, state.last_price);
       renderVisits(state.recent_visits || []);
       renderReversals(state.recent_reversals || []);
       renderAlerts(state.recent_alerts || []);
+      if (state.ready === false) setPill($('freshness'), state.message || '尚無資料', 'warn');
     },
     setFreshness(text, cls) {
       setPill($('freshness'), text, cls);

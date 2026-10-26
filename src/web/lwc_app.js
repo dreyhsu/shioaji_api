@@ -484,16 +484,20 @@ async function saveDrawing() {
     return;
   }
   setDrawing(null);
+  document.dispatchEvent(new Event('trendlines-changed'));
   refresh();
 }
 
 async function deleteTrendline(id) {
-  if (!confirm('刪除 #' + id + '？')) return;
+  const accepted = window.MockReplay?.enabled
+    ? await window.MockReplay.confirm('刪除 #' + id + '？') : confirm('刪除 #' + id + '？');
+  if (!accepted) return;
   const response = await fetch('/api/trendlines/' + id, { method: 'DELETE' });
   if (!response.ok && response.status !== 404) {
     alert('刪除失敗：' + response.status);
     return;
   }
+  document.dispatchEvent(new Event('trendlines-changed'));
   refresh();
 }
 
@@ -853,7 +857,7 @@ function listenForTradeLevelEdits(el) {
   el.addEventListener('pointercancel', finish, true);
 }
 
-window.SNRChart = { setTradeOrder, refresh: () => refreshChart() };
+window.SNRChart = { setTradeOrder, refresh: () => refresh() };
 
 function boxKey(box) {
   const body = { box_type: box.box_type, created_time: box.created_time };
@@ -970,6 +974,10 @@ async function refreshChart() {
 
   renderLegendRows();
   renderTrendlineList(payload.trendlines || []);
+  if (!lastBars.length) {
+    document.getElementById('legend-ohlc').textContent = '';
+    framed = false;
+  }
   if ((!framed || switched) && lastBars.length) {
     document.getElementById('legend-ohlc').textContent = '';
     candles.priceScale().applyOptions({ autoScale: true });
@@ -986,8 +994,7 @@ async function refresh() {
     const [stateResponse] = await Promise.all([fetch(stateUrl), refreshChart()]);
     if (stateResponse.ok) {
       const state = await stateResponse.json();
-      if (state.ready) SNRStatus.renderAll(state);
-      else SNRStatus.setFreshness(state.message || '尚無資料', 'warn');
+      SNRStatus.renderAll(state);
     }
   } catch (error) {
     SNRStatus.setFreshness('連線失敗', 'bad');

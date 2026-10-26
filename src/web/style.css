@@ -166,3 +166,16 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 0 20
   .trade-layout { grid-template-columns: 1fr; padding-inline: 12px; }
   #chart { height: 520px; }
 }
+/* Offline replay tools are visible only when --mock is explicitly enabled. */
+.mock-panel { margin: 16px; padding: 16px 20px; border: 1px solid #26a69a; border-radius: 10px; background: #122925; }
+.mock-panel[hidden] { display: none; }
+.mock-panel h2 { margin: 0; font-size: 17px; }
+.mock-panel p { font-size: 13px; line-height: 1.6; }
+.mock-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0; }
+.mock-controls button, .mock-controls input, .mock-controls select { font: inherit; padding: 7px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; }
+.mock-controls button { cursor: pointer; }
+.mock-controls button:disabled { opacity: .5; cursor: default; }
+.mock-controls input { width: 65px; }
+#mock-confirm { max-width: min(560px, 90vw); color: var(--text); background: var(--panel); border: 1px solid var(--support); border-radius: 10px; padding: 24px; }
+#mock-confirm::backdrop { background: #0009; }
+#mock-confirm pre { white-space: pre-wrap; font: inherit; line-height: 1.7; }

@@ -5,10 +5,14 @@
   const number = (value, digits = 0) => value === null || value === undefined || !Number.isFinite(Number(value))
     ? '—'
     : Number(value).toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits });
-  const state = { simulation: true, connected: false, price: null, atr: null, contracts: [], orders: [], selectedId: null, curves: [] };
+  const state = { simulation: true, connected: false, price: null, atr: null, contracts: [], orders: [], selectedId: null, curves: [], curveChoices: {} };
   let lastMarginAt = 0;
   let lastStateAt = 0;
   let busy = false;
+
+  async function confirmOperation(text) {
+    return state.mock && window.MockReplay ? window.MockReplay.confirm(text) : window.confirm(text);
+  }
 
   function message(text, bad = false) {
     $('trade-message').textContent = text || '';
@@ -20,6 +24,7 @@
   }
 
   function setMode(info) {
+    state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
     const badge = $('trade-mode');
@@ -34,7 +39,7 @@
     $('auto-exit-state').textContent = info.auto_exit_enabled
       ? (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick')
       : '自動出場：停用（僅監控提醒）';
-    state.price = info.last_quote === null ? state.price : Number(info.last_quote);
+    state.price = info.last_quote === null ? (state.mock ? null : state.price) : Number(info.last_quote);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
     $('trade-submit').disabled = !info.connected || !selectedContract() || busy;
   }
@@ -109,7 +114,7 @@
     else $('trade-price').disabled = false;
     if (!contract || !entry || !atr || !Number.isFinite(entry) || !Number.isFinite(atr)) {
       preview.textContent = '需要有效商品、價格與 1 小時 ATR 才能計算出場價';
-      $('trade-submit').disabled = !state.connected || !contract || busy;
+      $('trade-submit').disabled = true;
       return;
     }
     const direction = action === 'Buy' ? 1 : -1;
@@ -163,7 +168,7 @@
     const choice = curveId
       ? `1 小時曲線 #${curveId}；多單在 1 分 K 收盤跌破曲線時停利，空單反向。原 -2 ATR 停損保留，固定 +2 ATR 停利停用。`
       : '固定 +2 ATR 停利；原停損維持不變。';
-    if (!window.confirm(`變更 ${order.contract_code} 這筆持倉的停利方式？\n${choice}`)) return;
+    if (!await confirmOperation(`變更 ${order.contract_code} 這筆持倉的停利方式？\n${choice}`)) return;
     button.disabled = true;
     try {
       const response = await fetch(`/api/trading/orders/${encodeURIComponent(order.id)}/curve-selection`, {
@@ -172,6 +177,7 @@
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || '變更停利方式失敗');
+      delete state.curveChoices[order.id];
       state.orders = state.orders.map((item) => item.id === result.id ? result : item);
       renderOrders();
       message(curveId ? '已啟用 1 小時曲線；停利將依 1 分 K 收盤穿越判斷。' : '已恢復固定 +2 ATR 停利。');
@@ -187,7 +193,7 @@
     const remaining = Math.max(0, Number(order.quantity) - filled);
     const action = order.action === 'Buy' ? '買進' : '賣出';
     const text = `確定取消 ${order.contract_code} ${action}委託？\n已成交 ${filled} 口；將取消尚未成交的 ${remaining} 口。已成交部位會保留並繼續監控停損停利。`;
-    if (!window.confirm(text)) return;
+    if (!await confirmOperation(text)) return;
     button.disabled = true;
     message('正在向券商取消未成交委託…');
     try {
@@ -208,6 +214,8 @@
 
   function renderOrders() {
     const list = $('managed-orders');
+    // Polling must not close a dropdown or discard a user's pending selection.
+    if (list.contains(document.activeElement) && document.activeElement.matches('[data-order-curve]')) return;
     if (!state.orders.length) {
       list.innerHTML = '<div class="empty">尚無委託</div>';
       window.SNRChart?.setTradeOrder(null);
@@ -225,10 +233,11 @@
       const entryLabel = filled > 0 ? '成交均價' : '委託價';
       const actions = [];
       if (canManageCurve(order)) {
+        const chosen = state.curveChoices[order.id] ?? (order.curve_id ? String(order.curve_id) : '');
         const curveOptions = state.curves.map((line) =>
-          `<option value="${line.id}" ${Number(order.curve_id) === Number(line.id) ? 'selected' : ''}>${escapeHtml(line.label || `曲線 #${line.id}`)}</option>`
+          `<option value="${line.id}" ${chosen === String(line.id) ? 'selected' : ''}>${escapeHtml(line.label || `曲線 #${line.id}`)}</option>`
         ).join('');
-        actions.push(`<select data-order-curve="${escapeHtml(order.id)}" aria-label="${escapeHtml(order.contract_code)} 停利方式"><option value="" ${order.curve_id ? '' : 'selected'}>固定 +2 ATR</option>${curveOptions}</select><button type="button" data-apply-curve="${escapeHtml(order.id)}">套用停利</button>`);
+        actions.push(`<select data-order-curve="${escapeHtml(order.id)}" aria-label="${escapeHtml(order.contract_code)} 停利方式"><option value="" ${chosen === '' ? 'selected' : ''}>固定 +2 ATR</option>${curveOptions}</select><button type="button" data-apply-curve="${escapeHtml(order.id)}">套用停利</button>`);
       }
       if (canCancelEntry(order)) actions.push(`<button type="button" class="cancel-entry" data-cancel-order="${escapeHtml(order.id)}">${filled ? '取消未成交餘量' : '取消委託'}</button>`);
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
@@ -259,7 +268,10 @@
     });
     list.querySelectorAll('[data-order-curve]').forEach((select) => {
       select.addEventListener('click', (event) => event.stopPropagation());
-      select.addEventListener('change', (event) => event.stopPropagation());
+      select.addEventListener('change', (event) => {
+        state.curveChoices[select.dataset.orderCurve] = select.value;
+        event.stopPropagation();
+      });
     });
     window.SNRChart?.setTradeOrder(state.orders.find((order) => order.id === state.selectedId) || null);
   }
@@ -280,14 +292,14 @@
     try {
       const [response, stateResponse] = await Promise.all([
         fetch('/api/trading/status'),
-        Date.now() - lastStateAt > 30000 ? fetch('/api/state') : Promise.resolve(null),
+        state.mock || Date.now() - lastStateAt > 30000 ? fetch('/api/state') : Promise.resolve(null),
       ]);
       const info = await response.json();
       setMode(info);
       if (info.orders) state.orders = info.orders;
       renderOrders();
       if (state.contracts.length === 0 && info.connected) await loadContracts();
-      if (Date.now() - lastMarginAt > 30000 && info.connected) await loadAccountMargin();
+      if ((state.mock || Date.now() - lastMarginAt > 30000) && info.connected) await loadAccountMargin();
       if (stateResponse) {
         if (stateResponse.ok) state.atr = (await stateResponse.json()).hourly_atr;
         lastStateAt = Date.now();
@@ -333,7 +345,7 @@
     const stop = entry && atr ? entry - (action === 'Buy' ? 1 : -1) * 2 * atr : null;
     const target = entry && atr ? entry + (action === 'Buy' ? 1 : -1) * 2 * atr : null;
     const summary = `環境：${state.simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? '1h 曲線，1m K 收盤穿越觸發' : number(target)}\n\n確認送單？`;
-    if (!window.confirm(summary)) return;
+    if (!await confirmOperation(summary)) return;
     busy = true;
     $('trade-submit').disabled = true;
     message('委託送出中…');
@@ -370,7 +382,8 @@
   $('trade-submit').addEventListener('click', submitOrder);
   $('margin-refresh').addEventListener('click', loadAccountMargin);
 
-  window.TradingUI = { message, refreshOrders };
+  window.TradingUI = { message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves };
+  document.addEventListener('trendlines-changed', () => loadCurves().catch((error) => message(error.message, true)));
   fetch('/api/state').then((response) => response.json()).then((data) => {
     state.atr = data.hourly_atr;
     renderPreview();

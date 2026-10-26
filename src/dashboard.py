@@ -1,9 +1,8 @@
-"""Read-only dashboard over the monitor's database.
+"""Market chart and order dashboard, with optional offline Mock API replay.
 
-Deliberately separate from ``monitor.py`` and deliberately read-only: it never
-touches Shioaji, so a browser left open overnight cannot disturb data collection,
-and if the dashboard crashes the monitor keeps recording.  sqlite runs in WAL mode
-so the two overlap without blocking.
+The monitor collects production market data in a separate process. Order routes
+delegate to TradingService. ``--mock`` instead supplies a local broker and a fresh
+isolated database; no monitor process or broker credentials are needed.
 
 The page re-fetches once a minute, which matches how often the monitor has
 anything new.
@@ -23,7 +22,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from contextlib import asynccontextmanager
+from functools import wraps
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +42,7 @@ import session_bars as sb
 import snr_core as snr
 import trendline as tl
 import trading
+from mock_routes import router as mock_router
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LWC_BUNDLE = WEB_DIR / "lightweight-charts.standalone.production.js"
@@ -70,18 +71,45 @@ _TRADING_SERVICE: trading.TradingService | None = None
 
 @asynccontextmanager
 async def _lifespan(_app):
+    runtime = getattr(_app.state, "mock_runtime", None)
+    if runtime is not None:
+        runtime.start()
     try:
         yield
     finally:
+        if runtime is not None:
+            runtime.close()
         if _TRADING_SERVICE is not None:
             _TRADING_SERVICE.close()
 
 
 app = FastAPI(title="TMF S/R monitor", lifespan=_lifespan)
+app.include_router(mock_router)
+
+
+def _mock_runtime():
+    return getattr(app.state, "mock_runtime", None)
+
+
+def _dashboard_now():
+    runtime = _mock_runtime()
+    return runtime.now() if runtime is not None else market_clock.now()
+
+
+def _mock_locked(function):
+    """Keep replay/reset and a complete dashboard request on the same state."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        runtime = _mock_runtime()
+        with runtime.lock if runtime else nullcontext():
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def _trading_service() -> trading.TradingService:
     global _TRADING_SERVICE
+    if _mock_runtime() is not None:
+        return _mock_runtime().service
     if _TRADING_SERVICE is None or _TRADING_SERVICE.db_path != Path(CONFIG["db_path"]):
         if _TRADING_SERVICE is not None:
             _TRADING_SERVICE.close()
@@ -104,6 +132,9 @@ def ensure_lwc_bundle() -> None:
 
 
 def _cached_load(code: str, days: int):
+    if _mock_runtime() is not None:
+        with _mock_runtime().lock:
+            return _load(code, days)
     key = (code, days)
     now = time.monotonic()
     cached = _LOAD_CACHE.get(key)
@@ -362,6 +393,7 @@ def index() -> FileResponse:
 
 
 @app.get("/api/chart")
+@_mock_locked
 def api_chart(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
     timeframe: Timeframe = "1h",
@@ -375,6 +407,11 @@ def api_chart(
     code = code or CONFIG["code"]
     data = _cached_load(code, days or CONFIG["days"])
     if data is None:
+        runtime = _mock_runtime()
+        if runtime is not None and code == runtime.code and runtime.cursor == 0:
+            return {"code": code, "timeframe": timeframe,
+                    "generated_at": _dashboard_now().isoformat(sep=" "),
+                    "bars": [], "boxes": [], "series": [], "trendlines": []}
         raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
     if timeframe != "1h":
         bars = sb.minute_bars_to_interval(data["minute_bars"], TIMEFRAME_MINUTES[timeframe])
@@ -384,7 +421,7 @@ def api_chart(
     return {
         "code": code,
         "timeframe": timeframe,
-        "generated_at": market_clock.now().isoformat(sep=" "),
+        "generated_at": _dashboard_now().isoformat(sep=" "),
         "bars": _bars_payload(data),
         "boxes": _boxes_payload(data),
         "series": _series_payload(data),
@@ -393,6 +430,7 @@ def api_chart(
 
 
 @app.get("/api/bars")
+@_mock_locked
 def api_bars(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
     timeframe: Timeframe = "1h",
@@ -402,6 +440,7 @@ def api_bars(
 
 
 @app.get("/api/boxes")
+@_mock_locked
 def api_boxes(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
     timeframe: Timeframe = "1h",
@@ -411,6 +450,7 @@ def api_boxes(
 
 
 @app.get("/api/series")
+@_mock_locked
 def api_series(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
     timeframe: Timeframe = "1h",
@@ -425,7 +465,7 @@ def api_series(
 # --------------------------------------------------------------------------------------
 class Anchor(BaseModel):
     time: int
-    price: float
+    price: float = Field(allow_inf_nan=False)
 
 
 class TrendlineIn(BaseModel):
@@ -441,6 +481,7 @@ def _invalidate_cache() -> None:
 
 
 @app.get("/api/trendlines")
+@_mock_locked
 def api_trendlines(code: str | None = None) -> list[dict]:
     code = code or CONFIG["code"]
     with db.session(CONFIG["db_path"]) as conn:
@@ -448,6 +489,7 @@ def api_trendlines(code: str | None = None) -> list[dict]:
 
 
 @app.post("/api/trendlines")
+@_mock_locked
 def api_create_trendline(body: TrendlineIn) -> dict:
     code = body.code or CONFIG["code"]
     anchors = [anchor.model_dump() for anchor in body.anchors]
@@ -464,6 +506,7 @@ def api_create_trendline(body: TrendlineIn) -> dict:
 
 
 @app.delete("/api/trendlines/{line_id}")
+@_mock_locked
 def api_delete_trendline(line_id: int) -> dict:
     with db.session(CONFIG["db_path"]) as conn:
         if not db.delete_trendline(conn, line_id):
@@ -475,8 +518,8 @@ def api_delete_trendline(line_id: int) -> dict:
 class OrderIn(BaseModel):
     contract_code: str = Field(min_length=1, max_length=24)
     action: Literal["Buy", "Sell"]
-    quantity: int = Field(ge=1, le=100)
-    price: float = Field(ge=0)
+    quantity: int = Field(ge=1, le=100, strict=True)
+    price: float = Field(ge=0, allow_inf_nan=False)
     price_type: Literal["LMT", "MKT", "MKP"] = "LMT"
     order_type: Literal["ROD", "IOC", "FOK"] = "ROD"
     curve_id: int | None = None
@@ -502,11 +545,18 @@ class ContractSubscriptionIn(BaseModel):
 
 
 @app.get("/api/trading/status")
+@_mock_locked
 def api_trading_status() -> dict:
-    return _trading_service().status()
+    runtime = _mock_runtime()
+    with runtime.lock if runtime else nullcontext():
+        result = _trading_service().status()
+        if runtime:
+            result.update(mock=True, mode="離線 Mock API")
+        return result
 
 
 @app.get("/api/trading/contracts")
+@_mock_locked
 def api_trading_contracts() -> list[dict]:
     try:
         return _trading_service().contracts()
@@ -515,6 +565,7 @@ def api_trading_contracts() -> list[dict]:
 
 
 @app.post("/api/trading/subscribe")
+@_mock_locked
 def api_subscribe_trading_contract(body: ContractSubscriptionIn) -> dict:
     try:
         return _trading_service().subscribe_contract(body.contract_code)
@@ -523,6 +574,7 @@ def api_subscribe_trading_contract(body: ContractSubscriptionIn) -> dict:
 
 
 @app.get("/api/trading/margin")
+@_mock_locked
 def api_trading_margin() -> dict:
     try:
         return _trading_service().margin()
@@ -531,14 +583,25 @@ def api_trading_margin() -> dict:
 
 
 @app.get("/api/trading/orders")
+@_mock_locked
 def api_trading_orders() -> list[dict]:
-    return _trading_service().orders()
+    runtime = _mock_runtime()
+    with runtime.lock if runtime else nullcontext():
+        return _trading_service().orders()
 
 
 @app.post("/api/trading/orders")
+@_mock_locked
 def api_place_order(body: OrderIn) -> dict:
     try:
-        return _trading_service().place_order(body.model_dump())
+        runtime = _mock_runtime()
+        with runtime.lock if runtime else nullcontext():
+            service = _trading_service()
+            result = service.place_order(body.model_dump())
+            if runtime:
+                runtime.sync()
+                result = service._public_order(service._active_order(result["id"]))
+            return result
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except Exception as error:  # noqa: BLE001
@@ -546,6 +609,7 @@ def api_place_order(body: OrderIn) -> dict:
 
 
 @app.post("/api/trading/orders/{order_id}/cancel")
+@_mock_locked
 def api_cancel_trade_entry(order_id: str) -> dict:
     try:
         return _trading_service().cancel_entry(order_id)
@@ -558,6 +622,7 @@ def api_cancel_trade_entry(order_id: str) -> dict:
 
 
 @app.put("/api/trading/orders/{order_id}/levels")
+@_mock_locked
 def api_update_trade_levels(order_id: str, body: TradeLevelsIn) -> dict:
     try:
         return _trading_service().update_levels(order_id, body.stop_price, body.target_price)
@@ -568,6 +633,7 @@ def api_update_trade_levels(order_id: str, body: TradeLevelsIn) -> dict:
 
 
 @app.put("/api/trading/orders/{order_id}/curve")
+@_mock_locked
 def api_update_trade_curve(order_id: str, body: TradeCurveIn) -> dict:
     try:
         result = _trading_service().update_curve(order_id, body.target_price)
@@ -580,6 +646,7 @@ def api_update_trade_curve(order_id: str, body: TradeCurveIn) -> dict:
 
 
 @app.put("/api/trading/orders/{order_id}/curve-selection")
+@_mock_locked
 def api_select_trade_curve(order_id: str, body: TradeCurveSelectionIn) -> dict:
     try:
         result = _trading_service().set_order_curve(order_id, body.curve_id)
@@ -600,6 +667,7 @@ class BoxOverrideIn(BaseModel):
 
 
 @app.put("/api/boxes/override")
+@_mock_locked
 def api_set_box_override(body: BoxOverrideIn) -> dict:
     code = body.code or CONFIG["code"]
     if not body.top > body.bottom:
@@ -614,6 +682,7 @@ def api_set_box_override(body: BoxOverrideIn) -> dict:
 
 
 @app.delete("/api/boxes/override")
+@_mock_locked
 def api_delete_box_override(
     box_type: Literal["support", "resistance"], created_time: str, code: str | None = None
 ) -> dict:
@@ -626,17 +695,22 @@ def api_delete_box_override(
 
 
 @app.get("/api/state")
+@_mock_locked
 def api_state(code: str | None = None) -> dict:
     code = code or CONFIG["code"]
     data = _cached_load(code, CONFIG["days"])
     if data is None:
+        runtime = _mock_runtime()
+        if runtime is not None and code == runtime.code and runtime.cursor == 0:
+            return {"code": code, "ready": False,
+                    "message": "回放尚未開始，按播放或 +1 分鐘載入第一根 K 棒"}
         return {"code": code, "ready": False, "message": "no minute bars stored yet"}
 
     minute_bars = data["minute_bars"]
     last_minute = minute_bars.iloc[-1]
     last_price = float(last_minute["close"])
     last_stamp = pd.Timestamp(last_minute["minute_start"])
-    stale_minutes = (market_clock.now() - last_stamp).total_seconds() / 60.0
+    stale_minutes = (_dashboard_now() - last_stamp).total_seconds() / 60.0
 
     sides = {}
     for box_type in ("support", "resistance"):
@@ -670,11 +744,11 @@ def api_state(code: str | None = None) -> dict:
     return {
         "code": code,
         "ready": True,
-        "server_time": market_clock.now().isoformat(sep=" "),
+        "server_time": _dashboard_now().isoformat(sep=" "),
         "last_minute_start": last_stamp.isoformat(sep=" "),
         "last_price": last_price,
         "stale_minutes": round(stale_minutes, 1),
-        "in_session": sb.is_trading_time(),
+        "in_session": sb.is_trading_time(_dashboard_now()),
         "hourly_bars": len(data["hourly"]),
         "minute_bars": len(minute_bars),
         "hourly_atr": data["atr"],
@@ -691,7 +765,8 @@ def api_state(code: str | None = None) -> dict:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--code", default="TMFR1")
-    parser.add_argument("--db", type=Path, default=db.DEFAULT_DB_PATH)
+    parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--mock", action="store_true", help="離線 V 型行情與 Mock 券商，不讀取券商帳密")
     parser.add_argument("--days", type=int, default=30, help="how much history to chart")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -702,7 +777,14 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     args = parse_args(argv)
-    CONFIG.update({"code": args.code, "db_path": args.db, "days": args.days})
+    db_path = args.db or db.DEFAULT_DB_PATH
+    if args.mock:
+        from tempfile import mkdtemp
+        from mock_runtime import MockRuntime
+        db_path = args.db or Path(mkdtemp(prefix="shioaji-mock-")) / "mock.db"
+        app.state.mock_runtime = MockRuntime(db_path, args.code)
+        print(f"離線 Mock API · 獨立資料庫 {db_path} · 回放初始暫停", flush=True)
+    CONFIG.update({"code": args.code, "db_path": db_path, "days": args.days})
     ensure_lwc_bundle()
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
     print(f"dashboard for {args.code} -> http://{args.host}:{args.port}", flush=True)
