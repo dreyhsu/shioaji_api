@@ -183,6 +183,24 @@ CREATE TABLE IF NOT EXISTS managed_orders (
 CREATE INDEX IF NOT EXISTS idx_managed_orders_active
   ON managed_orders (active, code, contract_code);
 
+CREATE TABLE IF NOT EXISTS curve_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,
+  simulation INTEGER NOT NULL,
+  curve_id INTEGER NOT NULL,
+  contract_code TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  armed_at TEXT NOT NULL,
+  check_from TEXT NOT NULL,
+  last_checked_minute TEXT,
+  triggered_at TEXT,
+  order_id TEXT,
+  error TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_curve_entries_pending
+  ON curve_entries (code, simulation) WHERE state IN ('armed', 'submitting');
+
 CREATE TABLE IF NOT EXISTS backfill_progress (
   code TEXT NOT NULL,
   task TEXT NOT NULL,

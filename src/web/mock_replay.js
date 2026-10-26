@@ -6,17 +6,7 @@
   let lastCursor = null;
   let busy = false;
 
-  function confirmMock(text) {
-    const dialog = $('mock-confirm');
-    if (dialog.open) return Promise.resolve(false);
-    $('mock-confirm-summary').textContent = text;
-    dialog.returnValue = '';
-    return new Promise((resolve) => {
-      dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
-      dialog.showModal();
-    });
-  }
-  window.MockReplay = { enabled: false, confirm: confirmMock };
+  window.MockReplay = { enabled: false, confirm: (text) => window.TradingUI.confirm(text) };
 
   function message(text, bad = false) {
     $('mock-message').textContent = text;
@@ -44,31 +34,12 @@
     $('mock-phase').textContent = info.phase;
     $('mock-play').textContent = info.playing ? '暫停' : '播放';
     $('mock-progress').textContent = `${info.time} · ${info.cursor}/${info.total} 根 · 現價 ${info.price ?? '—'}`;
-    const entry = info.entry;
-    const labels = { armed: '等待向上突破', submitting: '送單中', triggered: '已觸發買入', failed: '已停止', cancelled: '已取消' };
-    $('mock-entry-state').textContent = entry
-      ? `曲線 #${entry.curve_id}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
-      : '尚未啟用曲線買入';
-    $('mock-entry-arm').disabled = busy || ['armed', 'submitting'].includes(entry?.state);
-    $('mock-entry-cancel').disabled = busy || entry?.state !== 'armed';
     $('mock-play').disabled = busy || info.remaining === 0;
     document.querySelectorAll('[data-mock-step]').forEach((button) => { button.disabled = busy || info.remaining === 0; });
   }
 
   async function refreshViews() {
     await Promise.all([window.SNRChart?.refresh(), window.TradingUI?.refresh()]);
-  }
-
-  async function curves() {
-    const response = await fetch('/api/trendlines');
-    if (!response.ok) return;
-    const select = $('mock-entry-curve');
-    const previous = select.value;
-    select.replaceChildren(new Option('選擇手動保存的 1h 曲線', ''));
-    for (const line of await response.json()) {
-      if (line.kind === 'curve') select.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
-    }
-    if (Array.from(select.options).some((option) => option.value === previous)) select.value = previous;
   }
 
   async function run(action) {
@@ -101,33 +72,17 @@
   $('mock-panel').hidden = false;
   render(initial);
   lastCursor = initial.cursor;
-  await curves();
 
   $('mock-play').addEventListener('click', () => run(() => request('/api/mock/control', { action: snapshot.playing ? 'pause' : 'play' })));
   document.querySelectorAll('[data-mock-step]').forEach((button) => button.addEventListener('click', () => run(() =>
     request('/api/mock/control', { action: 'step', steps: Number(button.dataset.mockStep) }))));
   $('mock-reset').addEventListener('click', async () => {
-    if (!await confirmMock('清除本次 Mock 委託、曲線與進場設定，從設定的回放起點重新開始？')) return;
+    if (!await window.TradingUI.confirm('清除本次 Mock 委託、曲線與進場設定，從設定的回放起點重新開始？')) return;
     run(async () => {
       await request('/api/mock/control', { action: 'reset', confirmed: true });
-      await curves();
       await window.TradingUI?.refreshCurves();
     });
   });
-  $('mock-entry-arm').addEventListener('click', async () => {
-    const curveId = Number($('mock-entry-curve').value);
-    const quantity = Number($('mock-entry-quantity').value);
-    const contract = $('trade-contract').value;
-    if (!curveId || !contract || !Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
-      message('請先保存曲線、選擇合約，並輸入 1 到 100 的整數口數。', true);
-      return;
-    }
-    if (!await confirmMock(`離線 Mock：啟用曲線 #${curveId} 向上突破買入 ${quantity} 口？\n僅觸發一次，成交後設定 ±2 ATR。`)) return;
-    run(() => request('/api/mock/curve-entry', { curve_id: curveId, contract_code: contract, quantity, confirmed: true }));
-  });
-  $('mock-entry-cancel').addEventListener('click', () => run(() => request('/api/mock/curve-entry', null, 'DELETE')));
-  document.addEventListener('trendlines-changed', () => curves().catch((error) => message(error.message, true)));
-
   async function poll() {
     try {
       if (!busy) {

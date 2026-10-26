@@ -79,20 +79,95 @@ JSON 內每個參數旁的 `_comment_參數名稱` 是中文說明；`_comment` 
 2. **手動曲線移動停利**：切到 1h，按「曲線」，依提示點起點、終點與中間控制點。
    在右側已成交部位選該曲線，按「套用停利」。固定停利停用，原停損保留；
    多單於已收盤 1 分 K 向下穿越曲線時平倉，空單反向。可拖曳圖上移動停利線平移曲線。
-3. **曲線突破買入**：先保存曲線，在 Mock 控制區選曲線與口數，按「啟用一次突破買入」。
+3. **曲線突破買入**：先保存曲線，在共用的「曲線突破自動進場」區選曲線與口數，按「啟用一次突破買入」。
    只有啟用後的已收盤 1 分 K 從曲線下方（含相等）向上穿越才會買入一次；
    成交後使用 ±2 ATR。進場曲線不會自動成為停利曲線，可再按流程 2 設定。
    測試此流程時，先將 `replay.start_bar` 改成 `null`、`start_at` 改成 `before_bottom`，
    並設 `minutes_before_bottom: 60` 後重啟；
    可畫接近 **24150** 的水平曲線，再推進約 90 分鐘，觀察下跌後反彈的突破。
 
-三種流程共用既有交易服務、ATR 計算、持倉記錄與出場邏輯。曲線自動買入本次僅接到
-Mock API，正式模式不提供該自動進場端點。啟用時不補做歷史訊號，取消或刪除曲線後不買入，
+三種流程在 Mock、券商 Simulation 與正式模式共用交易服務、ATR、設定開關、持倉記錄與進出場邏輯。
+曲線突破自動買入統一使用 `/api/trading/curve-entry`。啟用時不補做歷史訊號，取消或刪除曲線後不買入，
 錯誤時停止且不自動重送。「重設情境」確認後會清除本次 Mock 委託、曲線與進場設定。
 
 Mock 市價與範圍市價按最新回放收盤成交；限價只有報價符合時成交，否則 ROD 等待、
 IOC/FOK 取消。模擬採無限流動性、全額成交，不模擬部分成交、手續費、滑價或券商延遲。
 停損停利是程式監控後送出平倉委託，不是預掛在券商端的兩張委託。
+
+## 三種模式的共用交易操作
+
+Mock 只替換行情來源、時鐘與委託撮合，提供播放／暫停／快轉及重設；所有模式的
+突破進場、一次觸發、ATR、固定停損停利、曲線出場與操作介面都使用相同交易服務。
+
+非 Mock 使用 `.env` 的 `SHIOAJI_SIMULATION=1` 連券商模擬環境，`0` 為正式環境。
+需由 `monitor.py` 持續寫入相同資料庫的已收盤 1 分 K，Dashboard 負責交易監控。
+例如在兩個終端機分別執行（先設定好 `.env` 與必要帳戶權限）：
+
+```bash
+conda run --no-capture-output -n tss python src/monitor.py --code TMFR1 --no-telegram
+conda run --no-capture-output -n tss python src/dashboard.py --code TMFR1 --port 8765
+```
+
+三種模式的操作相同：在下單區選月份合約，在 1h 圖保存曲線，於「曲線突破自動進場」區選曲線與口數，
+按「啟用一次突破買入」，確認目前環境／合約／口數。之後僅在啟用後的相鄰已收盤 1 分 K 向上突破時
+送出一筆市價 IOC 買單，成交後設定進場 ATR 的 ±2 倍。可由「取消等待買入」停止等待；
+進場曲線不會自動成為出場曲線，需在持倉區另行「套用停利」。
+
+`config/trading.json` 的開關在全部模式即時讀取：
+
+| 設定 | 行為 |
+| --- | --- |
+| `auto_entry_enabled` | 預設 `true`，允許手動確認後等待突破；設為 `false` 時禁止新啟用，既有等待在下個監控週期取消，重新開啟後需再次手動啟用 |
+| `auto_exit_enabled` | 預設 `true`，停損停利觸發後自動平倉；設為 `false` 時只記錄觸發，不送平倉單；Mock 同樣遵守 |
+
+等待與觸發狀態存入 SQLite，送單前以原子更新取得一次送單資格。重新啟動也不重送已觸發／失敗的進場；
+若程序在送單期間中斷，保留「送單中」狀態供人工核對。不同交易環境的等待與持倉分開查詢。
+交易環境變更須重啟服務並重新確認。Mock 預設使用獨立暫存資料庫，重設會清除本次狀態。
+
+跨模式離線一致性測試（含正式模式的注入假券商，不連外送單）：
+
+```bash
+conda run --no-capture-output -n tss python -m pytest src/test_trading_parity.py -q
+```
+
+## Mock 流程的一鍵自動測試
+
+在專案資料夾執行：
+
+```bash
+conda run --no-capture-output -n tss python tools/test_mock_flows.py
+```
+
+腳本會自動進場、建立並套用曲線、推進 1 分 K、檢查成交與持倉，最後逐項印出
+`PASS`／`FAIL`、進出場價格、ATR、觸發原因與剩餘部位。
+
+| 流程 | 自動驗證內容 |
+| --- | --- |
+| `fixed-atr` | 多單成交後，停利設定為進場價 +2 ATR；價格到達後以 `target` 原因平倉、獲利且部位歸零 |
+| `curve-exit` | 多單在反彈尾段進場，套用約 25040 的曲線；固定停利停用、原停損保留；先漲後回檔跌破曲線，以 `curve` 原因獲利平倉 |
+| `curve-entry` | 啟用曲線突破買入後不立即進場；後續反彈向上突破才買入一次，成交後建立 ±2 ATR，繼續推進不重複買入 |
+| `curve-entry-stop` | 向上突破曲線後自動買入，固定停損為成交價 −2 倍進場 ATR；短暫反彈後回檔，觸及停損以 `stop` 原因賣出平倉，部位歸零且不重複下單 |
+
+不需先啟動 Dashboard。測試透過 FastAPI 的記憶體內測試用戶端使用相同 Mock API 與交易服務，
+每個流程使用獨立暫存資料庫與固定行情；不讀取 `config/mock.json`，也不操作目前開啟的回放。
+回放直接逐分鐘推進，不必等待 `interval_seconds`。這些測試涵蓋 API 與交易流程；瀏覽器畫線手勢不在此腳本範圍內。
+
+可單獨執行一個流程，或另存 JSON 報告：
+
+```bash
+conda run --no-capture-output -n tss python tools/test_mock_flows.py --case fixed-atr
+conda run --no-capture-output -n tss python tools/test_mock_flows.py --case curve-exit
+conda run --no-capture-output -n tss python tools/test_mock_flows.py --case curve-entry
+conda run --no-capture-output -n tss python tools/test_mock_flows.py --case curve-entry-stop
+conda run --no-capture-output -n tss python tools/test_mock_flows.py --report out/mock-flow-report.json
+```
+
+全部通過時結束碼為 `0`；失敗、跳過或未完成的測試會回傳 `1`，並顯示 pytest 診斷，方便接入自動檢查。
+
+`curve-entry-stop` 使用獨立的「反彈 30 分鐘、再回檔 120 分鐘」測試情境，
+讓進場後先回檔觸及 −2 ATR，而不先碰到 +2 ATR 停利。
+停損依進場時 ATR 固定，後續 ATR 變化不會移動停損。Mock 在第一根觸及／跌破停損的分鐘收盤價成交，
+因此實際損失可能略大於 2 ATR；報告會列出停損門檻和實際出場價。
 
 ## 獨立測試與開發流程
 
@@ -293,7 +368,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `src/shioaji_client.py` | 登入、合約解析、kbars/ticks 取得（含 API 怪癖處理） |
 | `src/place_order.py` + `src/shioaji_order_adapter.py` | 獨立委託驗證與券商介面轉換，可只用 Mock 測試 |
 | `src/trading.py` | 交易協調、持倉同步與停損停利監控，可注入時鐘、API 與停用 worker |
-| `src/curve_entry.py` | 已收盤 1 分 K 向上突破 1h 曲線的純訊號判斷 |
+| `src/curve_entry.py` + `src/curve_entry_controller.py` | 共用突破訊號、持久化的一次進場狀態與送單控制 |
 | `src/mock_market_data.py` + `src/mock_broker.py` | 固定 V 型行情、純記憶體委託撮合 |
 | `src/mock_runtime.py` + `src/mock_routes.py` | 離線回放組裝、一次曲線買入與操作 API |
 | `src/box_watch.py` | 進/出箱狀態機 |

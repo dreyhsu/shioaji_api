@@ -30,7 +30,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -542,6 +542,39 @@ class TradeCurveSelectionIn(BaseModel):
 
 class ContractSubscriptionIn(BaseModel):
     contract_code: str = Field(min_length=1, max_length=24)
+
+
+class CurveEntryIn(BaseModel):
+    curve_id: int = Field(gt=0, strict=True)
+    contract_code: str = Field(min_length=1, max_length=24)
+    quantity: int = Field(default=1, ge=1, le=100, strict=True)
+    simulation: StrictBool
+    confirmed: StrictBool = False
+
+
+@app.get("/api/trading/curve-entry")
+@_mock_locked
+def api_curve_entry_status() -> dict:
+    service = _trading_service()
+    return {"entry": service.curve_entry.snapshot(), "auto_entry_enabled": service.auto_entry_enabled(),
+            "simulation": service.simulation}
+
+
+@app.post("/api/trading/curve-entry")
+@_mock_locked
+def api_arm_curve_entry(body: CurveEntryIn) -> dict:
+    try:
+        return _trading_service().curve_entry.arm(**body.model_dump())
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.delete("/api/trading/curve-entry")
+@_mock_locked
+def api_cancel_curve_entry() -> dict:
+    return {"entry": _trading_service().curve_entry.cancel()}
 
 
 @app.get("/api/trading/status")

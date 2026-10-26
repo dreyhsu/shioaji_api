@@ -1,7 +1,7 @@
-"""Offline composition root: replay -> storage -> curve signal -> real trading service.
+"""Offline market-data/clock driver for the shared trading service.
 
 This module alone owns replay orchestration. MockBroker owns matching;
-mock_market_data owns the scenario; curve_entry owns signal math. A fresh,
+mock_market_data owns the scenario; TradingService owns all trading decisions. A fresh,
 dedicated SQLite path is mandatory. No production credentials are consulted.
 """
 from __future__ import annotations
@@ -10,44 +10,37 @@ import threading
 import pandas as pd
 
 import db
-import session_bars as sb
-import trendline as tl
-from curve_entry import crossed_above_curve
 from mock_broker import MockBroker
 from mock_market_data import v_shape_bars
 from mock_config import MockConfig, load_mock_config
-from place_order import OrderRequest, validate_request
 from trading import TradingService
 from pathlib import Path
 
 
 class MockRuntime:
-    def __init__(self, db_path, code="TMFR1", *, config: MockConfig | None = None):
+    def __init__(self, db_path, code="TMFR1", *, config: MockConfig | None = None, settings_path=None):
         self.db_path = Path(db_path)
         if self.db_path.exists():
             raise ValueError("Mock 模式必須使用新的獨立資料庫路徑")
         self.code = code
         self.config = config if config is not None else load_mock_config()
+        self.settings_path = settings_path
         self.lock = threading.RLock()
         self.bars = v_shape_bars(self.config.market)
         self.playing = False
         self._stop = threading.Event()
         self._thread = None
-        self._sequence = 0
-        self.entry = None
         self._initialize()
 
     def _initialize(self):
         self.cursor = self.config.warmup_minutes
         self.playing = False
-        self.entry = None
         self.broker = MockBroker(clock=self.now, root=self.code[:3], settings=self.config.broker)
         self.service = TradingService(
             self.db_path, self.code, api_factory=lambda simulation: self.broker,
             simulation=True, clock=self.now, start_worker=False, sdk=self.broker.sdk,
+            **({"settings_path": self.settings_path} if self.settings_path is not None else {}),
         )
-        # Mock exits always run, independent of the user's production settings.
-        self.service.auto_exit_enabled = lambda: True
         with db.session(self.db_path) as conn:
             db.upsert_minute_bars(conn, self.code, self.bars.iloc[:self.cursor])
         self.service.ensure_connected()
@@ -71,16 +64,14 @@ class MockRuntime:
                     "price": self.broker.price, "entry": None if self.entry is None else dict(self.entry),
                     "replay": self.config.replay.model_dump()}
 
+    @property
+    def entry(self):
+        return self.service.curve_entry.snapshot()
+
     def sync(self):
         """Reconcile fills deterministically without a background trading worker."""
         with self.lock:
-            self.service._last_sync = 0
-            self.service._curve_break_cache.clear()
-            self.service._curve_cache.clear()
-            self.service._monitor_once()
-            # A close submitted during the first pass is filled synchronously.
-            self.service._last_sync = 0
-            self.service._monitor_once()
+            self.service.process_market_update()
 
     def advance(self, steps=1):
         if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= 600:
@@ -93,61 +84,19 @@ class MockRuntime:
                     db.upsert_minute_bars(conn, self.code, row)
                 self.broker.publish(float(row.iloc[0]["close"]))
                 self.sync()
-                self._check_entry()
-                self.sync()
             if self.cursor == len(self.bars):
                 self.playing = False
             return self.snapshot()
 
     def arm_entry(self, curve_id, contract_code, quantity):
         with self.lock:
-            if self.entry and self.entry["state"] in {"armed", "submitting"}:
-                raise ValueError("已有啟用中的曲線進場，請先取消")
             if self.cursor == len(self.bars):
                 raise ValueError("行情已播完，請重設情境")
-            validate_request(OrderRequest(contract_code, "Buy", quantity, price_type="MKT", order_type="IOC",
-                                          confirmed=True), True)
-            if contract_code not in {self.broker.contract.code, self.broker.contract.symbol}:
-                raise ValueError("無效的 Mock 合約")
-            curve = self._curve(curve_id)
-            hourly = sb.minute_bars_to_hourly(self.bars.iloc[:self.cursor])
-            if curve is None or not tl.anchor_indices(hourly, curve["anchors"], "curve"):
-                raise ValueError("請選擇已保存、有效的 1 小時曲線")
-            self._sequence += 1
-            self.entry = {"id": self._sequence, "curve_id": curve_id, "contract_code": contract_code,
-                          "quantity": quantity, "state": "armed", "armed_at": str(self.now()),
-                          "order_id": None, "error": None}
-            return dict(self.entry)
-
-    def _curve(self, curve_id):
-        with db.session(self.db_path) as conn:
-            return next((curve for curve in db.load_trendlines(conn, self.code)
-                         if curve["id"] == curve_id and curve["kind"] == "curve"), None)
-
-    def _check_entry(self):
-        if self.entry is None or self.entry["state"] != "armed":
-            return
-        curve = self._curve(self.entry["curve_id"])
-        if curve is None:
-            self.entry.update(state="failed", error="曲線已刪除，進場已停用")
-            return
-        if not crossed_above_curve(self.bars.iloc[:self.cursor], curve["anchors"], self.now()):
-            return
-        # Claim before sending. Errors must not re-arm a possibly received order.
-        self.entry["state"] = "submitting"
-        try:
-            result = self.service.place_order({
-                "contract_code": self.entry["contract_code"], "action": "Buy", "quantity": self.entry["quantity"],
-                "price_type": "MKT", "order_type": "IOC", "price": 0, "confirmed": True, "simulation": True,
-            })
-            self.entry.update(state="triggered", order_id=result["id"], triggered_at=str(self.now()))
-        except Exception as error:
-            self.entry.update(state="failed", error=str(error))
+            return self.service.curve_entry.arm(curve_id, contract_code, quantity, simulation=True, confirmed=True)
 
     def cancel_entry(self):
         with self.lock:
-            if self.entry and self.entry["state"] == "armed":
-                self.entry["state"] = "cancelled"
+            self.service.curve_entry.cancel()
             return self.snapshot()
 
     def reset(self):
@@ -155,7 +104,7 @@ class MockRuntime:
             self.service.close()
             # This path was created by this runtime and cannot be a user database.
             with db.session(self.db_path) as conn:
-                for table in ("managed_orders", "trendlines", "minute_bars"):
+                for table in ("curve_entries", "managed_orders", "trendlines", "minute_bars"):
                     conn.execute(f"DELETE FROM {table}")
                 conn.commit()
             self._initialize()

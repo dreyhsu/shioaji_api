@@ -176,6 +176,6 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 0 20
 .mock-controls button { cursor: pointer; }
 .mock-controls button:disabled { opacity: .5; cursor: default; }
 .mock-controls input { width: 65px; }
-#mock-confirm { max-width: min(560px, 90vw); color: var(--text); background: var(--panel); border: 1px solid var(--support); border-radius: 10px; padding: 24px; }
-#mock-confirm::backdrop { background: #0009; }
-#mock-confirm pre { white-space: pre-wrap; font: inherit; line-height: 1.7; }
+#trade-confirm { max-width: min(560px, 90vw); color: var(--text); background: var(--panel); border: 1px solid var(--support); border-radius: 10px; padding: 24px; }
+#trade-confirm::backdrop { background: #0009; }
+#trade-confirm pre { white-space: pre-wrap; font: inherit; line-height: 1.7; }

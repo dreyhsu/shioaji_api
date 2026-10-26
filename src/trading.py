@@ -24,6 +24,7 @@ import shioaji_client as sc
 import trendline as tl
 from place_order import OrderRequest, OrderContext, validate_request, place_order
 from shioaji_order_adapter import ShioajiOrderAdapter
+from curve_entry_controller import CurveEntryController
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config" / "trading.json"
@@ -155,6 +156,8 @@ class TradingService:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_sync = 0.0
+        self._connected_simulation = None
+        self.curve_entry = CurveEntryController(self)
 
     @property
     def simulation(self) -> bool:
@@ -164,15 +167,22 @@ class TradingService:
         return os.getenv("SHIOAJI_SIMULATION", "1") == "1"
 
     def auto_exit_enabled(self) -> bool:
+        return self._setting_enabled("auto_exit_enabled")
+
+    def auto_entry_enabled(self) -> bool:
+        return self._setting_enabled("auto_entry_enabled")
+
+    def _setting_enabled(self, key) -> bool:
         try:
             config = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            return bool(config.get("auto_exit_enabled", True))
+            return config.get(key, True) is True
         except (OSError, ValueError, AttributeError):
             return True
 
     def _open(self):
         if self._api is not None:
             return self._api
+        mode = self.simulation
         if self.api_factory is not None:
             self._api = self.api_factory(self.simulation)
         else:
@@ -191,6 +201,7 @@ class TradingService:
                     person_id=os.environ["SHIOAJI_PERSON_ID"],
                 )
         self._api.set_on_tick_fop_v1_callback(self._on_tick)
+        self._connected_simulation = mode
         self._connect_error = None
         self._start_worker()
         self._recover_subscriptions()
@@ -209,11 +220,17 @@ class TradingService:
                 pass
         self._api = None
         self._api_context = None
+        self._connected_simulation = None
+
+    def _validate_connected_mode(self):
+        if self._api is not None and self._connected_simulation != self.simulation:
+            raise ValueError("交易環境已改變，請重啟服務並重新確認")
 
     def _active_orders(self) -> list[dict]:
         with db.session(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT * FROM managed_orders WHERE active = 1 ORDER BY created_at DESC"
+                "SELECT * FROM managed_orders WHERE active = 1 AND code = ? AND simulation = ? ORDER BY created_at DESC",
+                (self.code, int(self.simulation)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -224,6 +241,12 @@ class TradingService:
                 self._subscribe(contract)
             except Exception as error:  # noqa: BLE001
                 self._connect_error = f"合約行情恢復失敗：{error}"
+        entry = self.curve_entry.snapshot()
+        if entry and entry["state"] == "armed":
+            try:
+                self._subscribe(self._find_contract(entry["contract_code"]))
+            except Exception as error:
+                self._connect_error = f"進場行情恢復失敗：{error}"
 
     def _start_worker(self) -> None:
         if not self._worker_enabled:
@@ -299,7 +322,7 @@ class TradingService:
                 updates["avg_fill_price"] = avg
                 if not int(current.get("levels_customized", 0)):
                     stop, target = stop_target_prices(current["action"], avg, current["atr"])
-                    updates.update(stop_price=stop, target_price=target)
+                    updates.update(stop_price=stop, target_price=None if current.get("curve_id") else target)
             if terminal and filled == 0 and status in {"Cancelled", "Failed", "Rejected"}:
                 updates.update(active=0, auto_exit=0)
         if exit_trade is not None:
@@ -322,7 +345,8 @@ class TradingService:
 
     def _active_order(self, row_id: str) -> dict:
         with db.session(self.db_path) as conn:
-            row = conn.execute("SELECT * FROM managed_orders WHERE id = ?", (row_id,)).fetchone()
+            row = conn.execute("SELECT * FROM managed_orders WHERE id = ? AND code = ? AND simulation = ?",
+                               (row_id, self.code, int(self.simulation))).fetchone()
         return {} if row is None else dict(row)
 
     def _exit_signal(self, row: dict, price: float) -> str | None:
@@ -541,13 +565,31 @@ class TradingService:
     def _monitor_loop(self) -> None:
         while not self._stop.wait(MONITOR_INTERVAL_SECONDS):
             try:
-                self._monitor_once()
+                self.process_market_update()
             except Exception as error:  # noqa: BLE001 - keep the watchdog alive
-                self._connect_error = f"出場監控錯誤：{error}"
+                self._connect_error = f"交易監控錯誤：{error}"
+
+    def process_market_update(self):
+        """Run the same signal/fill/exit cycle for replay and wall-clock drivers."""
+        with self._lock:
+            self._last_sync = 0
+            self._curve_break_cache.clear()
+            self._curve_cache.clear()
+            self._monitor_once()
+            # Reconcile synchronous fills; asynchronous adapters settle on later cycles.
+            self._last_sync = 0
+            self._monitor_once()
 
     def _monitor_once(self) -> None:
         if not self._api:
             return
+        with self._lock:
+            self._validate_connected_mode()
+            try:
+                self.curve_entry.check()
+            except Exception as error:
+                self._connect_error = f"進場監控錯誤：{error}"
+                self.curve_entry.fail_pending(error)
         active_rows = self._active_orders()
         if not active_rows:
             return
@@ -625,6 +667,8 @@ class TradingService:
             "last_quote_at": None if latest is None else latest["at"].isoformat(sep=" "),
             "quote_age_seconds": age,
             "auto_exit_enabled": self.auto_exit_enabled(),
+            "auto_entry_enabled": self.auto_entry_enabled(),
+            "curve_entry": self.curve_entry.snapshot(),
             "error": error,
             "orders": self.orders(),
         }
@@ -703,6 +747,9 @@ class TradingService:
             minutes = db.load_minute_bars(conn, code)
         if minutes.empty:
             raise RuntimeError("尚無可用行情，不能計算停損停利")
+        minutes = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= pd.Timestamp(self._now())]
+        if minutes.empty:
+            raise RuntimeError("尚無已收盤行情，不能計算停損停利")
         hourly = sb.minute_bars_to_hourly(minutes)
         atr_series = snr.pine_atr(hourly, snr.DEFAULT_ATR_LENGTH)
         raw = atr_series.iloc[-1]
@@ -732,6 +779,7 @@ class TradingService:
             if curve is None:
                 raise ValueError("選用的停利曲線不存在或已刪除")
         api = self.ensure_connected()
+        self._validate_connected_mode()
         contract = self._find_contract(contract_code)
         canonical_code = str(contract.code)
         tick = float(_value(contract, "tick", 1) or 1)
@@ -874,7 +922,8 @@ class TradingService:
 
     def orders(self) -> list[dict]:
         with db.session(self.db_path) as conn:
-            rows = conn.execute("SELECT * FROM managed_orders ORDER BY created_at DESC LIMIT 30").fetchall()
+            rows = conn.execute("SELECT * FROM managed_orders WHERE code = ? AND simulation = ? ORDER BY created_at DESC LIMIT 30",
+                                (self.code, int(self.simulation))).fetchall()
         result = []
         for row in rows:
             item = self._public_order(dict(row))

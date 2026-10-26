@@ -489,8 +489,7 @@ async function saveDrawing() {
 }
 
 async function deleteTrendline(id) {
-  const accepted = window.MockReplay?.enabled
-    ? await window.MockReplay.confirm('刪除 #' + id + '？') : confirm('刪除 #' + id + '？');
+  const accepted = await window.TradingUI.confirm('刪除 #' + id + '？');
   if (!accepted) return;
   const response = await fetch('/api/trendlines/' + id, { method: 'DELETE' });
   if (!response.ok && response.status !== 404) {

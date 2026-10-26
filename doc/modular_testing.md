@@ -10,12 +10,13 @@
 |---|---|---|
 | `place_order` | OrderRequest + OrderContext + BrokerPort → OrderResult | 純驗證、跳動單位與一次送單；不使用 DB、ATR、Dashboard 或 Shioaji |
 | `shioaji_order_adapter` | 已連線 API、合約與中立委託 → 券商委託結果 | 建立 SDK 委託並轉換回報；不登入、不監控 |
-| `trading` | 使用者委託／持倉操作 → 持久化委託與狀態 | 協調連線、ATR、儲存與出場；注入 API、SDK、時鐘、模式與 worker 開關 |
+| `trading` | 使用者委託／持倉操作 → 持久化委託與狀態 | 全模式共用進出場週期、ATR、設定與執行；注入 API、SDK、時鐘、模式與 worker 開關 |
 | `curve_entry` | 已收盤 1m K、1h 曲線錨點、時間 → 是否突破 | 純訊號，不送單；相鄰已收盤 K 由下向上穿越，缺資料或休市間隔不觸發 |
+| `curve_entry_controller` | 確認啟用／取消／市場更新 → 一次進場狀態 | 全模式共用；SQLite 保存等待、檢查基準與送單資格；錯誤不重送 |
 | `mock_market_data` | 固定情境 → DataFrame | 產生可重現的長跌、V 型反彈與回檔，不存 DB |
 | `mock_broker` | 委託與報價 → 成交／等待／取消、帳戶狀態 | 純記憶體撮合，沒有 Shioaji、網路或憑證 |
-| `mock_runtime` | 推進／重設／啟用曲線 → 回放與進場狀態 | 組裝上述模組，隔離 DB、控制時間並防止未來資料洩漏 |
-| `mock_routes` | HTTP 請求 → 回放與進場結果 | 驗證請求並委派；僅在明確啟用 Mock 時提供操作 |
+| `mock_runtime` | 推進／重設 → 回放狀態 | 只組裝行情、撮合、隔離 DB 與時鐘；所有交易決策交給共用服務 |
+| `mock_routes` | HTTP 請求 → 回放結果 | 只保留 Mock 回放控制；舊進場路由為相容轉接，共用介面使用 trading 路由 |
 | `dashboard` | HTTP → 圖表／交易 API 回應 | 保持既有路由，委派功能模組，不自行定義撮合或訊號規則 |
 
 既有指標、K 棒彙整、箱體與型態模組繼續沿用。本次未全面拆分監控與資料存取。

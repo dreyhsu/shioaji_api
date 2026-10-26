@@ -1,4 +1,5 @@
 from unittest.mock import Mock, call
+import json
 
 import pandas as pd
 import pytest
@@ -12,7 +13,7 @@ from mock_runtime import MockRuntime
 
 @pytest.fixture
 def replay(tmp_path, monkeypatch):
-    runtime = MockRuntime(tmp_path / "mock.db", config=MockConfig())
+    runtime = MockRuntime(tmp_path / "mock.db", config=MockConfig(), settings_path=tmp_path / "trading.json")
     monkeypatch.setattr(dashboard.app.state, "mock_runtime", runtime, raising=False)
     monkeypatch.setitem(dashboard.CONFIG, "db_path", runtime.db_path)
     monkeypatch.setitem(dashboard.CONFIG, "code", runtime.code)
@@ -26,7 +27,7 @@ def replay(tmp_path, monkeypatch):
 
 @pytest.fixture
 def empty_replay(tmp_path, monkeypatch):
-    runtime = MockRuntime(tmp_path / "empty.db", config=MockConfig.model_validate({"replay": {"start_bar": 0}}))
+    runtime = MockRuntime(tmp_path / "empty.db", config=MockConfig.model_validate({"replay": {"start_bar": 0}}), settings_path=tmp_path / "trading.json")
     monkeypatch.setattr(dashboard.app.state, "mock_runtime", runtime, raising=False)
     monkeypatch.setitem(dashboard.CONFIG, "db_path", runtime.db_path)
     monkeypatch.setitem(dashboard.CONFIG, "code", runtime.code)
@@ -114,7 +115,7 @@ def save_curve(runtime, client, price, slope=0):
 
 
 def arm(client, curve_id):
-    result = client.post("/api/mock/curve-entry", json={"curve_id": curve_id, "contract_code": "TMF209912", "quantity": 1, "confirmed": True})
+    result = client.post("/api/trading/curve-entry", json={"curve_id": curve_id, "contract_code": "TMF209912", "quantity": 1, "simulation": True, "confirmed": True})
     assert result.status_code == 200, result.text
     return result.json()
 
@@ -146,16 +147,31 @@ def test_1_manual_fill_shows_two_atr_stop_and_target(replay, action, direction):
 
 
 @pytest.mark.parametrize("action,reason", [("Buy", "target"), ("Sell", "stop")])
-def test_fixed_exits_fill_and_flatten_position(replay, action, reason):
+def test_fixed_exits_fill_and_flatten_position(replay, action, reason, record_property):
     runtime, client = replay
     runtime.advance(60)
     order = manual_order(client, action)
-    runtime.advance(90)
+    direction = 1 if action == "Buy" else -1
+    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + direction * 2 * order["atr"])
+    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - direction * 2 * order["atr"])
+    runtime.advance(1)
+    assert runtime.service._active_order(order["id"])["trigger_reason"] is None
+    runtime.advance(89)
     row = runtime.service._active_order(order["id"])
     assert row["trigger_reason"] == reason
     assert row["exit_status"] == "Filled" and row["active"] == 0
     assert runtime.broker.position == 0
     assert len(runtime.broker.trades) == 2
+    exit_price = runtime.broker.trades[-1].status.average_price
+    if reason == "target":
+        assert direction * (exit_price - order["target_price"]) >= 0
+        assert direction * (exit_price - order["avg_fill_price"]) > 0
+    record_property("result", json.dumps({
+        "entry_price": order["avg_fill_price"], "atr": order["atr"],
+        "target_price": order["target_price"], "stop_price": order["stop_price"],
+        "exit_price": exit_price, "profit_points": direction * (exit_price - order["avg_fill_price"]),
+        "trigger_reason": row["trigger_reason"], "position": runtime.broker.position,
+    }))
 
 
 def test_2_manually_saved_curve_replaces_target_and_triggers_trailing_exit(replay):
@@ -176,21 +192,115 @@ def test_2_manually_saved_curve_replaces_target_and_triggers_trailing_exit(repla
     assert runtime.broker.position == 0
 
 
-def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay):
+def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_property):
     runtime, client = replay
-    curve_id = save_curve(runtime, client, runtime.broker.price - 20)
+    curve_price = runtime.broker.price - 20
+    curve_id = save_curve(runtime, client, curve_price)
     arm(client, curve_id)
     assert not runtime.broker.trades  # No historical crossing or immediate buy on arming.
-    runtime.advance(90)
+    runtime.advance(60)
+    assert runtime.broker.price < curve_price
+    assert client.get("/api/mock").json()["entry"]["state"] == "armed"
+    assert not runtime.broker.trades
+    runtime.advance(30)
     entry = client.get("/api/mock").json()["entry"]
     assert entry["state"] == "triggered"
     row = runtime.service._active_order(entry["order_id"])
     assert row["action"] == "Buy" and row["filled_quantity"] == 1
+    assert row["entry_status"] == "Filled" and row["avg_fill_price"] > curve_price
     assert row["curve_id"] is None  # Entry curve does not implicitly become an exit curve.
     assert row["stop_price"] == pytest.approx(row["avg_fill_price"] - 2 * row["atr"])
     assert row["target_price"] == pytest.approx(row["avg_fill_price"] + 2 * row["atr"])
     runtime.advance(5)
     assert len(runtime.broker.trades) == 1
+    assert runtime.broker.position == 1
+    assert len(client.get("/api/trading/orders").json()) == 1
+    record_property("result", json.dumps({
+        "entry_price": row["avg_fill_price"], "atr": row["atr"], "curve_price": curve_price,
+        "stop_price": row["stop_price"], "target_price": row["target_price"],
+        "entry_count": len(runtime.broker.trades), "position": runtime.broker.position,
+        "entry_state": entry["state"], "triggered_at": entry["triggered_at"],
+    }))
+
+
+def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, record_property):
+    # A short rebound reverses before +2 ATR, then falls through the fixed stop.
+    # Prices still come from the scenario generator and use normal Mock API routes.
+    config = MockConfig.model_validate({"market": {"rebound_minutes": 30}})
+    runtime = MockRuntime(tmp_path / "breakout-stop.db", config=config, settings_path=tmp_path / "trading.json")
+    monkeypatch.setattr(dashboard.app.state, "mock_runtime", runtime, raising=False)
+    monkeypatch.setitem(dashboard.CONFIG, "db_path", runtime.db_path)
+    monkeypatch.setitem(dashboard.CONFIG, "code", runtime.code)
+    dashboard._LOAD_CACHE.clear()
+    try:
+        with TestClient(dashboard.app) as client:
+            curve_price = runtime.broker.price - 20
+            curve_id = save_curve(runtime, client, curve_price)
+            arm(client, curve_id)
+            response = client.post("/api/mock/control", json={"action": "step", "steps": 60})
+            assert response.status_code == 200, response.text
+            assert runtime.broker.price < curve_price
+            assert response.json()["entry"]["state"] == "armed" and not runtime.broker.trades
+            for _ in range(config.market.rebound_minutes):
+                response = client.post("/api/mock/control", json={"action": "step", "steps": 1})
+                assert response.status_code == 200, response.text
+                if response.json()["entry"]["state"] == "triggered":
+                    break
+            entry = client.get("/api/mock").json()["entry"]
+            assert entry["state"] == "triggered"
+            orders = client.get("/api/trading/orders").json()
+            assert len(orders) == 1
+            order = orders[0]
+            assert order["id"] == entry["order_id"]
+            assert order["action"] == "Buy" and order["entry_status"] == "Filled"
+            assert order["filled_quantity"] == runtime.broker.position == 1
+            assert len(runtime.broker.trades) == 1
+            assert runtime.bars.iloc[runtime.cursor - 2]["close"] <= curve_price < order["avg_fill_price"]
+            assert order["curve_id"] is None
+            entry_price, atr = order["avg_fill_price"], order["atr"]
+            stop, target = order["stop_price"], order["target_price"]
+            assert stop == pytest.approx(entry_price - 2 * atr)
+            assert target == pytest.approx(entry_price + 2 * atr)
+
+            for _ in range(len(runtime.bars) - runtime.cursor):
+                previous_price = runtime.broker.price
+                assert stop < previous_price < target
+                response = client.post("/api/mock/control", json={"action": "step", "steps": 1})
+                assert response.status_code == 200, response.text
+                orders = client.get("/api/trading/orders").json()
+                assert len(orders) == 1
+                closed = orders[0]
+                # Entry ATR defines these fixed levels even as new candles arrive.
+                assert closed["stop_price"] == stop and closed["target_price"] == target
+                if not closed["active"]:
+                    break
+                assert closed["trigger_reason"] is None and len(runtime.broker.trades) == 1
+
+            assert runtime.snapshot()["phase"] == "反彈後回檔"
+            assert closed["trigger_reason"] == "stop" and not closed["active"]
+            assert closed["exit_status"] == "Filled" and closed["exit_filled_quantity"] == 1
+            assert previous_price > stop >= runtime.broker.price
+            assert runtime.broker.position == 0 and len(runtime.broker.trades) == 2
+            exit_trade = runtime.broker.trades[-1]
+            assert exit_trade.order.action == "Sell" and exit_trade.order.octype == "Cover"
+            exit_price = exit_trade.status.average_price
+            assert exit_price == runtime.broker.price and exit_price <= stop
+            assert exit_price - entry_price <= -2 * atr
+            runtime.advance(5)
+            assert len(runtime.broker.trades) == 2 and runtime.broker.position == 0
+            assert len(client.get("/api/trading/orders").json()) == 1
+            record_property("result", json.dumps({
+                "entry_price": entry_price, "atr": atr, "curve_price": curve_price,
+                "stop_price": stop, "target_price": target, "exit_price": exit_price,
+                "profit_points": exit_price - entry_price, "trigger_reason": closed["trigger_reason"],
+                "position": runtime.broker.position, "entry_count": 1, "exit_count": 1,
+                "entry_state": entry["state"], "triggered_at": entry["triggered_at"],
+                "stop_preserved": closed["stop_price"] == stop,
+                "scenario": "30-minute rebound followed by 120-minute pullback",
+            }))
+    finally:
+        runtime.close()
+        dashboard._LOAD_CACHE.clear()
 
 
 def test_uncertain_breakout_submission_is_not_retried(replay, monkeypatch):
@@ -212,7 +322,7 @@ def test_deleted_or_cancelled_entry_curve_never_submits(replay):
     assert runtime.entry["state"] == "failed" and not runtime.broker.trades
     curve_id = save_curve(runtime, client, runtime.broker.price - 20)
     arm(client, curve_id)
-    client.delete("/api/mock/curve-entry")
+    client.delete("/api/trading/curve-entry")
     runtime.advance(90)
     assert runtime.entry["state"] == "cancelled" and not runtime.broker.trades
 
@@ -247,11 +357,11 @@ def test_runtime_rejects_existing_database(tmp_path):
     assert path.read_text() == "do not overwrite"
 
 
-def test_rebound_then_pullback_closes_long_at_a_profit_using_curve(tmp_path, monkeypatch):
+def test_rebound_then_pullback_closes_long_at_a_profit_using_curve(tmp_path, monkeypatch, record_property):
     config = MockConfig.model_validate({"replay": {
         "start_at": "before_pullback", "minutes_before_pullback": 60,
     }})
-    runtime = MockRuntime(tmp_path / "pullback.db", config=config)
+    runtime = MockRuntime(tmp_path / "pullback.db", config=config, settings_path=tmp_path / "trading.json")
     monkeypatch.setattr(dashboard.app.state, "mock_runtime", runtime, raising=False)
     monkeypatch.setitem(dashboard.CONFIG, "db_path", runtime.db_path)
     monkeypatch.setitem(dashboard.CONFIG, "code", runtime.code)
@@ -281,6 +391,14 @@ def test_rebound_then_pullback_closes_long_at_a_profit_using_curve(tmp_path, mon
             assert closed["exit_status"] == "Filled" and not closed["active"]
             assert runtime.broker.trades[-1].status.average_price > initial_price
             assert runtime.broker.position == 0 and len(runtime.broker.trades) == 2
+            record_property("result", json.dumps({
+                "entry_price": initial_price, "atr": order["atr"], "curve_price": 25040,
+                "exit_price": runtime.broker.trades[-1].status.average_price,
+                "profit_points": runtime.broker.trades[-1].status.average_price - initial_price,
+                "trigger_reason": closed["trigger_reason"], "position": runtime.broker.position,
+                "curve_id": curve_id, "fixed_target_disabled": changed.json()["target_price"] is None,
+                "stop_preserved": changed.json()["stop_price"] == order["stop_price"],
+            }))
             runtime.reset()
             assert runtime.cursor == 4020 and not runtime.playing
     finally:
@@ -300,7 +418,7 @@ def test_config_controls_replay_clock_phases_account_and_reset(tmp_path, monkeyp
                    "maintenance_margin_per_contract": 8000},
     }))
     monkeypatch.setattr(mock_config, "DEFAULT_CONFIG_PATH", path)
-    runtime = MockRuntime(tmp_path / "custom.db")
+    runtime = MockRuntime(tmp_path / "custom.db", settings_path=tmp_path / "trading.json")
     try:
         assert runtime.cursor == 1798
         with db.session(runtime.db_path) as conn:

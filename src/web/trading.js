@@ -9,9 +9,19 @@
   let lastMarginAt = 0;
   let lastStateAt = 0;
   let busy = false;
+  let entryBusy = false;
+  let entrySnapshot = null;
+  let entryEnabled = false;
 
   async function confirmOperation(text) {
-    return state.mock && window.MockReplay ? window.MockReplay.confirm(text) : window.confirm(text);
+    const dialog = $('trade-confirm');
+    if (dialog.open) return false;
+    $('trade-confirm-summary').textContent = text;
+    dialog.returnValue = '';
+    return new Promise((resolve) => {
+      dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
+      dialog.showModal();
+    });
   }
 
   function message(text, bad = false) {
@@ -27,6 +37,9 @@
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
+    entryEnabled = Boolean(info.auto_entry_enabled);
+    entrySnapshot = info.curve_entry || null;
+    renderEntry();
     const badge = $('trade-mode');
     badge.textContent = info.mode || (state.simulation ? '模擬環境' : '正式環境');
     badge.className = 'trade-badge ' + (state.simulation ? 'simulation' : 'production');
@@ -75,6 +88,11 @@
       select.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
     }
     if (lines.some((line) => String(line.id) === previous)) select.value = previous;
+    const entrySelect = $('entry-curve');
+    const entryPrevious = entrySelect.value;
+    entrySelect.replaceChildren(new Option('選擇手動保存的 1h 曲線', ''));
+    for (const line of lines) entrySelect.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+    if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
     renderPreview();
     renderOrders();
   }
@@ -142,7 +160,7 @@
     if (order.trigger_reason && !order.exit_trade_id) return '已觸發 · 自動出場停用';
     if (order.exit_trade_id && Number(order.exit_filled_quantity) > 0 && !order.active) return '已平倉';
     if (Number(order.filled_quantity) > Number(order.exit_filled_quantity)) {
-      if (order.entry_status === 'Filled') return '模擬持倉監控中';
+      if (order.entry_status === 'Filled') return '持倉監控中';
       if (order.entry_status === 'Cancelled') return `部分成交 ${order.filled_quantity} 口 · 餘量已取消`;
       return `部分成交 ${order.filled_quantity}/${order.quantity} 口`;
     }
@@ -309,6 +327,52 @@
       $('trade-connection').className = 'trade-connection bad';
     }
     renderPreview();
+    renderEntry();
+  }
+
+  function renderEntry() {
+    const entry = entrySnapshot;
+    const labels = { armed: '等待向上突破', submitting: '送單中，請勿重複送單', triggered: '已觸發買入', failed: '已停止，請核對委託狀態', cancelled: '已取消' };
+    $('entry-state').textContent = entry
+      ? `曲線 #${entry.curve_id}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
+      : entryEnabled ? '尚未啟用曲線買入' : '自動進場：停用，請檢查 config/trading.json';
+    $('entry-arm').disabled = entryBusy || !state.connected || !entryEnabled || !selectedContract()
+      || !(Number(state.atr) > 0) || ['armed', 'submitting'].includes(entry?.state);
+    $('entry-cancel').disabled = entryBusy || entry?.state !== 'armed';
+  }
+
+  async function controlEntry(cancel = false) {
+    if (entryBusy) return;
+    const curveId = Number($('entry-curve').value);
+    const quantity = Number($('entry-quantity').value);
+    const contract = selectedContract();
+    const simulation = state.simulation;
+    if (!cancel) {
+      if (!curveId || !contract || !Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
+        $('entry-message').textContent = '請先保存曲線、選擇合約，並輸入 1 到 100 的整數口數。';
+        return;
+      }
+      const mode = state.mock ? '離線 Mock' : simulation ? '券商 Simulation' : '正式交易';
+      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n啟用曲線 #${curveId} 向上突破後市價買入 ${quantity} 口？\n僅觸發一次，成交後設定 ±2 ATR。`)) return;
+    }
+    entryBusy = true;
+    renderEntry();
+    try {
+      const response = await fetch('/api/trading/curve-entry', {
+        method: cancel ? 'DELETE' : 'POST', headers: { 'Content-Type': 'application/json' },
+        ...(cancel ? {} : { body: JSON.stringify({ curve_id: curveId, contract_code: contract.code,
+          quantity, simulation, confirmed: true }) }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '請檢查輸入欄位');
+      $('entry-message').textContent = cancel ? '已取消等待買入。' : '已啟用一次突破買入。';
+      await refreshTrading();
+    } catch (error) {
+      $('entry-message').textContent = error.message;
+    } finally {
+      entryBusy = false;
+      renderEntry();
+    }
   }
 
   async function subscribeSelectedContract() {
@@ -328,6 +392,7 @@
 
   async function submitOrder() {
     if (busy) return;
+    const simulation = state.simulation;
     const contract = selectedContract();
     const action = currentAction();
     const quantity = Number($('trade-quantity').value);
@@ -344,7 +409,7 @@
     const side = action === 'Buy' ? '多單' : '空單';
     const stop = entry && atr ? entry - (action === 'Buy' ? 1 : -1) * 2 * atr : null;
     const target = entry && atr ? entry + (action === 'Buy' ? 1 : -1) * 2 * atr : null;
-    const summary = `環境：${state.simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? '1h 曲線，1m K 收盤穿越觸發' : number(target)}\n\n確認送單？`;
+    const summary = `環境：${simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? '1h 曲線，1m K 收盤穿越觸發' : number(target)}\n\n確認送單？`;
     if (!await confirmOperation(summary)) return;
     busy = true;
     $('trade-submit').disabled = true;
@@ -354,7 +419,7 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contract_code: contract.code, action, quantity, price, price_type: priceType,
-          order_type: orderType, curve_id: curveId, simulation: state.simulation, confirmed: true,
+          order_type: orderType, curve_id: curveId, simulation, confirmed: true,
         }),
       });
       const result = await response.json();
@@ -381,8 +446,10 @@
   }));
   $('trade-submit').addEventListener('click', submitOrder);
   $('margin-refresh').addEventListener('click', loadAccountMargin);
+  $('entry-arm').addEventListener('click', () => controlEntry());
+  $('entry-cancel').addEventListener('click', () => controlEntry(true));
 
-  window.TradingUI = { message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves };
+  window.TradingUI = { message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves, confirm: confirmOperation };
   document.addEventListener('trendlines-changed', () => loadCurves().catch((error) => message(error.message, true)));
   fetch('/api/state').then((response) => response.json()).then((data) => {
     state.atr = data.hourly_atr;

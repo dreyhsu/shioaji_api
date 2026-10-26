@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=mock-3">
+  <link rel="stylesheet" href="/static/style.css?v=shared-trading-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -34,22 +34,26 @@
       <button id="mock-reset" type="button">重設情境</button>
       <span id="mock-progress"></span>
     </div>
-    <div class="mock-controls">
-      <label>突破買入曲線 <select id="mock-entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select></label>
-      <label>口數 <input id="mock-entry-quantity" type="number" min="1" max="100" step="1" value="1"></label>
-      <button id="mock-entry-arm" type="button">啟用一次突破買入</button>
-      <button id="mock-entry-cancel" type="button">取消等待買入</button>
-    </div>
-    <p>測試 1：手動下單，點選成交部位查看 ±2 ATR。測試 2：在 1h 圖畫曲線，再從部位選擇曲線並「套用停利」。測試 3：選曲線啟用突破買入，再推進反彈行情。</p>
-    <p>突破買入採已收盤 1 分 K 由曲線下方向上穿越；只買入一次。曲線停利採多單收盤向下穿越，保留原停損。</p>
-    <div id="mock-entry-state" role="status"></div>
     <div id="mock-message" class="trade-message" role="status"></div>
   </section>
 
-  <dialog id="mock-confirm" aria-labelledby="mock-confirm-title">
+  <section class="mock-panel" aria-label="曲線突破自動進場">
+    <h2>曲線突破自動進場</h2>
+    <p>使用下單區選定的月份合約。已收盤 1 分 K 由曲線下方向上突破後，市價買入一次；成交後依進場 ATR 設定 ±2 ATR。進場曲線不會自動套用為出場曲線。</p>
+    <div class="mock-controls">
+      <label>突破買入曲線 <select id="entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select></label>
+      <label>口數 <input id="entry-quantity" type="number" min="1" max="100" step="1" value="1"></label>
+      <button id="entry-arm" type="button" disabled>啟用一次突破買入</button>
+      <button id="entry-cancel" type="button" disabled>取消等待買入</button>
+    </div>
+    <div id="entry-state" role="status">尚未啟用曲線買入</div>
+    <div id="entry-message" class="trade-message" role="status"></div>
+  </section>
+
+  <dialog id="trade-confirm" aria-labelledby="trade-confirm-title">
     <form method="dialog">
-      <h2 id="mock-confirm-title">離線 Mock 操作確認</h2>
-      <pre id="mock-confirm-summary"></pre>
+      <h2 id="trade-confirm-title">交易操作確認</h2>
+      <pre id="trade-confirm-summary"></pre>
       <div class="mock-controls">
         <button value="cancel">取消</button><button value="confirm">確認</button>
       </div>
@@ -172,8 +176,8 @@
 
   <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
-  <script src="/static/lwc_app.js?v=mock-6"></script>
-  <script src="/static/trading.js?v=mock-6"></script>
-  <script src="/static/mock_replay.js?v=mock-6"></script>
+  <script src="/static/lwc_app.js?v=shared-trading-1"></script>
+  <script src="/static/trading.js?v=shared-trading-1"></script>
+  <script src="/static/mock_replay.js?v=shared-trading-1"></script>
 </body>
 </html>
