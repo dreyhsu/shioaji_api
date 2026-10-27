@@ -45,6 +45,8 @@ let framed = false;
 const indicators = new Map(); // name -> { series, spec }
 let lastBars = [];
 let tradeOrder = null;
+let pnlPrimitive = null;
+let tradePnlHovered = false;
 let tradeLevelScaleKey = null;
 const tradePriceLines = { entry: null, stop: null, target: null };
 const tradeLevelDrag = { part: null, startY: 0, startPrice: 0, levels: null, moved: false, autoScale: true };
@@ -156,6 +158,8 @@ function initChart() {
 
   boxes = new BoxesPrimitive({ showLabels: true });
   candles.attachPrimitive(boxes);
+  pnlPrimitive = new PnlPrimitive();
+  candles.attachPrimitive(pnlPrimitive);
 
   chart.subscribeCrosshairMove(onCrosshairMove);
   listenForBoxEdits(document.getElementById('chart'));
@@ -565,6 +569,7 @@ function listenForBoxEdits(el) {
     'pointerdown',
     (event) => {
       if (event.button !== 0) return;
+      if (tradeLineHit(el, event)) return;
       const hit = boxHitAt(el, event);
       if (!hit) return;
       event.stopPropagation();
@@ -700,6 +705,7 @@ function setTradeOrder(order) {
   const scaleChanged = scaleKey !== tradeLevelScaleKey;
   if (changed) clearTradePriceLines();
   tradeOrder = next;
+  tradePnlHovered = pnlPrimitive?.setOrder(next) ?? false;
   if (candles && scaleChanged) {
     candles.applyOptions({ autoscaleInfoProvider: tradeLevelAutoscaleInfo });
     tradeLevelScaleKey = scaleKey;
@@ -707,7 +713,7 @@ function setTradeOrder(order) {
   if (!tradeOrder) {
     const range = document.getElementById('trade-chart-range');
     if (range) {
-      range.textContent = '選取右側委託／部位，在圖表查看進場、停損與停利價位。';
+      range.textContent = order ? `${order.contract_code} · ${order.risk_status || '此單無可顯示的持倉或限價預覽'}` : '選取右側委託／部位，在圖表查看進場、停損與停利價位。';
       range.classList.remove('held', 'pending');
     }
     return;
@@ -730,14 +736,14 @@ function setTradeOrder(order) {
     },
     stop: { price: stop, color: '#ef5350', title: '停損' },
     target: {
-      price: Number(tradeOrder.curve_id) ? Number(tradeOrder.curve_price) : target,
+      price: Number(tradeOrder.curve_id) ? (tradeOrder.curve_price == null ? null : Number(tradeOrder.curve_price)) : target,
       color: '#26a69a', title: Number(tradeOrder.curve_id) ? '移動停利' : '停利',
     },
   };
   const filled = Number(tradeOrder.filled_quantity) > 0;
   const range = document.getElementById('trade-chart-range');
   if (range) {
-    const basis = filled ? `模擬持倉 ${tradeOrder.filled_quantity - Number(tradeOrder.exit_filled_quantity || 0)}/${tradeOrder.quantity} 口 · 成交均價` : '限價委託預覽 · 尚未成交';
+    const basis = filled ? `持倉 ${tradeOrder.filled_quantity - Number(tradeOrder.exit_filled_quantity || 0)}/${tradeOrder.quantity} 口 · 成交均價` : '限價委託預覽 · 尚未成交';
     const curvePrice = tradeOrder.curve_price;
     const targetText = Number(tradeOrder.curve_id)
       ? `1h 曲線停利 ${curvePrice === null || curvePrice === undefined ? '—' : Number(curvePrice).toLocaleString('en-US')}（1m 收盤穿越）`
@@ -756,21 +762,33 @@ function setTradeOrder(order) {
     if (!tradePriceLines[key]) {
       tradePriceLines[key] = candles.createPriceLine({
         price: spec.price, color: spec.color, lineWidth: 2, lineStyle: spec.lineStyle ?? 2,
-        axisLabelVisible: true, title: spec.title,
+        lineVisible: tradePnlHovered, axisLabelVisible: tradePnlHovered, title: '',
       });
     } else {
-      tradePriceLines[key].applyOptions({ price: spec.price, title: spec.title, lineStyle: spec.lineStyle ?? 2 });
+      tradePriceLines[key].applyOptions({ price: spec.price, title: '', lineStyle: spec.lineStyle ?? 2,
+        lineVisible: tradePnlHovered, axisLabelVisible: tradePnlHovered });
     }
   }
 }
 
+function setTradeHoverVisibility(hovered) {
+  if (hovered === tradePnlHovered) return;
+  tradePnlHovered = hovered;
+  for (const line of Object.values(tradePriceLines)) {
+    line?.applyOptions({ lineVisible: hovered, axisLabelVisible: hovered });
+  }
+}
+
 function tradeLineHit(el, event) {
-  if (!tradeOrder || draw.kind || boxDrag.hit) return null;
+  if (!tradeOrder?.risk_editable || draw.kind || boxDrag.hit) return null;
   const rect = el.getBoundingClientRect();
   const y = event.clientY - rect.top;
   if (y < 0 || y > chart.panes()[PANE_PRICE].getHeight()) return null;
   if (event.clientX - rect.left > chart.timeScale().width()) return null;
+  const x = event.clientX - rect.left;
+  if (x < chart.timeScale().width() * 0.65 || x > chart.timeScale().width() - 6) return null;
   for (const key of ['stop', 'target']) {
+    if (key === 'target' && tradeOrder.curve_id) continue;
     const line = tradePriceLines[key];
     if (!line) continue;
     const coordinate = candles.priceToCoordinate(line.options().price);
@@ -788,6 +806,7 @@ function listenForTradeLevelEdits(el) {
     event.preventDefault();
     el.setPointerCapture(event.pointerId);
     tradeLevelDrag.part = part;
+    setTradeHoverVisibility(pnlPrimitive?.setDragging(true) ?? false);
     tradeLevelDrag.startY = event.clientY;
     tradeLevelDrag.startPrice = candles.priceToCoordinate(tradePriceLines[part].options().price) === null
       ? null
@@ -804,56 +823,44 @@ function listenForTradeLevelEdits(el) {
   }, true);
 
   el.addEventListener('pointermove', (event) => {
+    const rect = el.getBoundingClientRect();
+    setTradeHoverVisibility(pnlPrimitive?.setPointer({ x: event.clientX - rect.left, y: event.clientY - rect.top }) ?? false);
     if (!tradeLevelDrag.part) {
       if (event.buttons === 0) el.style.cursor = tradeLineHit(el, event) ? 'ns-resize' : '';
       return;
     }
     event.stopPropagation();
-    const rect = el.getBoundingClientRect();
     const price = candles.coordinateToPrice(event.clientY - rect.top);
     if (price === null) return;
-    const entry = Number(tradeOrder.avg_fill_price || tradeOrder.price);
-    const long = tradeOrder.action === 'Buy';
+    const tick = Number(tradeOrder.contract_tick) || 1;
     const part = tradeLevelDrag.part;
-    const bounded = part === 'stop'
-      ? (long ? Math.min(price, entry - 1) : Math.max(price, entry + 1))
-      : (long ? Math.max(price, entry + 1) : Math.min(price, entry - 1));
-    const value = Math.round(bounded);
+    const value = Math.max(tick, Math.round(price / tick) * tick);
     tradePriceLines[part].applyOptions({ price: value });
     tradeLevelDrag.levels[part] = value;
     if (Math.abs(event.clientY - tradeLevelDrag.startY) > 2) tradeLevelDrag.moved = true;
+    window.TradingUI?.updateRiskDraft(tradeOrder.id, { [part + '_price']: value });
   }, true);
 
-  const finish = async (event) => {
+  const finish = (event) => {
     if (!tradeLevelDrag.part) return;
     event.stopPropagation();
-    const part = tradeLevelDrag.part;
-    const levels = { ...tradeLevelDrag.levels };
-    const moved = tradeLevelDrag.moved;
     tradeLevelDrag.part = null;
+    if (event.pointerType === 'touch') pnlPrimitive?.setPointer(null);
+    setTradeHoverVisibility(pnlPrimitive?.setDragging(false) ?? false);
     el.style.cursor = '';
+    if (el.hasPointerCapture(event.pointerId)) el.releasePointerCapture(event.pointerId);
     candles.priceScale().applyOptions({ autoScale: tradeLevelDrag.autoScale });
-    if (!moved) return;
-    try {
-      const curveSelected = Number(tradeOrder.curve_id) > 0;
-      const endpoint = curveSelected ? '/curve' : '/levels';
-      const payload = curveSelected
-        ? { target_price: levels.target }
-        : { stop_price: levels.stop, target_price: levels.target };
-      const response = await fetch('/api/trading/orders/' + encodeURIComponent(tradeOrder.id) + endpoint, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) throw new Error((await response.json()).detail || '儲存出場價失敗');
-      if (curveSelected) await refreshChart();
-      window.TradingUI?.refreshOrders();
-    } catch (error) {
-      tradePriceLines[part]?.applyOptions({ price: tradeLevelDrag.startPrice });
-      window.TradingUI?.message(error.message, true);
-    }
   };
   el.addEventListener('pointerup', finish, true);
-  el.addEventListener('pointercancel', finish, true);
+  el.addEventListener('pointerleave', () => {
+    setTradeHoverVisibility(pnlPrimitive?.setPointer(null) ?? false);
+  });
+  el.addEventListener('pointercancel', (event) => {
+    if (tradeOrder && tradeLevelDrag.part) {
+      window.TradingUI?.updateRiskDraft(tradeOrder.id, { [tradeLevelDrag.part + '_price']: tradeLevelDrag.startPrice });
+    }
+    finish(event);
+  }, true);
 }
 
 window.SNRChart = { setTradeOrder, refresh: () => refresh() };

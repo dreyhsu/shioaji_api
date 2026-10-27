@@ -1,4 +1,4 @@
-"""Telegram alerts for the box and trendline rules in ``alert_rules``.
+"""Telegram formatting and transport for market alerts and entry fills.
 
 The transport follows ``src/telegram_sample.py``: POST to ``sendMessage`` with
 ``parse_mode=HTML`` and credentials from ``.env``.
@@ -7,14 +7,14 @@ Nothing here can fail loudly.  A notification problem must never take down the
 monitor that is collecting data, so a missing token or a dead network returns
 ``False`` and the caller records ``ok = 0`` against the alert row.
 
-Rate limiting lives in ``monitor.send_rule`` (cooldown and once-per-line, both
-read back from the alert rows in the database), so this module only formats and
-sends what it is handed.
+Market-alert rate limiting lives in ``monitor.send_rule``; entry-fill deduplication
+lives in ``entry_notify``. This module only formats and sends what it is handed.
 """
 
 from __future__ import annotations
 
 import argparse
+from html import escape
 import os
 import time
 from pathlib import Path
@@ -26,7 +26,6 @@ from dotenv import load_dotenv
 import market_clock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -42,6 +41,11 @@ SIDE_LABEL = {"support": "支撐箱", "resistance": "阻力箱"}
 
 
 def credentials_present() -> bool:
+    global BOT_TOKEN, CHAT_ID
+    if not BOT_TOKEN or not CHAT_ID:
+        load_dotenv(PROJECT_ROOT / ".env")
+        BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     return bool(BOT_TOKEN and CHAT_ID)
 
 
@@ -78,6 +82,28 @@ def _stamp(minute_start) -> str:
 
 
 FOOTER = "<i>僅為提示，未下單</i>"
+
+
+def format_entry_fill(row: dict) -> str:
+    """Format a broker-confirmed entry, including partial fills and risk levels."""
+    side = "買進做多" if row["action"] == "Buy" else "賣出做空"
+    mode = "模擬環境" if row["simulation"] else "正式環境"
+
+    def price(value):
+        return "待券商回報" if value is None else f"{value:,.2f}"
+
+    target = "曲線停利" if row.get("curve_id") is not None else price(row.get("target_price"))
+    return (
+        f"<b>{escape(str(row['contract_code']))} {side}進場成交</b>\n"
+        f"環境：{mode}\n"
+        f"時間：{escape(str(row['updated_at']))}\n\n"
+        f"累計成交：{row['filled_quantity']} / {row['quantity']} 口\n"
+        f"成交均價：<b>{price(row.get('avg_fill_price'))}</b>\n"
+        f"進場 ATR：{price(row.get('atr'))}\n"
+        f"停損：{price(row.get('stop_price'))}\n"
+        f"停利：{target}\n"
+        f"委託編號：{escape(str(row['entry_trade_id']))}"
+    )
 
 
 def format_zone_alert(

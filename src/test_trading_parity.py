@@ -109,13 +109,19 @@ def arm(driver, curve, action=None, quantity=1):
 
 @pytest.mark.parametrize("action", ["Buy", "Sell"])
 @pytest.mark.parametrize("exit_reason", ["stop", "target"])
-def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason):
+def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason, monkeypatch):
     driver = market()
+    messages = []
+    import telegram_notify as tg
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
+    driver.service.entry_notifier.dispatch = lambda task: task()
+    driver.service.entry_notifier.config.path = driver.settings.parent / "alerts.json"
     curve = save_curve(driver, driver.broker.price - 20)
     response = arm(driver, curve, action, quantity=3)
     assert response.status_code == 200, response.text
     assert response.json()["action"] == action and response.json()["quantity"] == 3
     assert not driver.broker.trades
+    assert not messages
     for _ in range(150):
         driver.step()
         if driver.broker.trades:
@@ -126,10 +132,15 @@ def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason
     sign = 1 if action == "Buy" else -1
     assert order["action"] == action and order["quantity"] == order["filled_quantity"] == 3
     assert driver.broker.position == sign * 3
+    assert len(messages) == (0 if driver.mode == "mock" else 1)
+    if messages:
+        assert ("買進做多" if action == "Buy" else "賣出做空") in messages[0]
+        assert ("模擬環境" if driver.simulation else "正式環境") in messages[0]
+        assert "3 / 3 口" in messages[0]
     assert order["price_type"] == "MKT" and order["order_type"] == "IOC"
     assert order["curve_id"] is None
-    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - sign * 2 * order["atr"])
-    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + sign * 2 * order["atr"])
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - sign * 2 * order["atr"]))
+    assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + sign * 2 * order["atr"]))
     for _ in range(3):
         driver.service.process_market_update()
     assert len(driver.broker.trades) == 1
@@ -138,6 +149,7 @@ def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason
     closed = driver.client.get("/api/trading/orders").json()[0]
     assert closed["trigger_reason"] == exit_reason and closed["exit_status"] == "Filled"
     assert driver.broker.position == 0 and len(driver.broker.trades) == 2
+    assert len(messages) == (0 if driver.mode == "mock" else 1)
 
 
 @pytest.mark.parametrize("changes", [{"action": "Short"}, {"action": None}, {"quantity": 0}, {"quantity": 101}, {"quantity": True}, {"quantity": 1.5}])
@@ -165,8 +177,8 @@ def buy(driver):
 def test_shared_fixed_atr_target(market):
     driver = market(start=3600)
     order = buy(driver)
-    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - 2 * order["atr"])
-    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + 2 * order["atr"])
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - 2 * order["atr"]))
+    assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + 2 * order["atr"]))
     driver.step(90)
     closed = driver.client.get("/api/trading/orders").json()[0]
     assert closed["trigger_reason"] == "target" and closed["exit_status"] == "Filled"
@@ -201,7 +213,7 @@ def test_shared_breakout_and_fixed_stop(market):
     assert entry["state"] == "triggered" and entry["simulation"] == driver.simulation
     order = driver.client.get("/api/trading/orders").json()[0]
     stop = order["stop_price"]
-    assert stop == pytest.approx(order["avg_fill_price"] - 2 * order["atr"])
+    assert stop == pytest.approx(round(order["avg_fill_price"] - 2 * order["atr"]))
     driver.step(90)
     closed = driver.client.get("/api/trading/orders").json()[0]
     assert closed["trigger_reason"] == "stop" and closed["exit_status"] == "Filled"

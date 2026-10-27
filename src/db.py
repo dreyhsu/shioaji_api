@@ -164,6 +164,11 @@ CREATE TABLE IF NOT EXISTS managed_orders (
   curve_armed INTEGER NOT NULL DEFAULT 0,
   curve_check_from TEXT,
   levels_customized INTEGER NOT NULL DEFAULT 0,
+  contract_tick REAL NOT NULL DEFAULT 1,
+  breakeven_enabled INTEGER NOT NULL DEFAULT 1,
+  breakeven_triggered_at TEXT,
+  breakeven_price REAL,
+  risk_revision INTEGER NOT NULL DEFAULT 0,
   auto_exit INTEGER NOT NULL DEFAULT 1,
   simulation INTEGER NOT NULL,
   entry_trade_id TEXT NOT NULL,
@@ -243,6 +248,11 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
     ("managed_orders", "curve_check_from", "ALTER TABLE managed_orders ADD COLUMN curve_check_from TEXT"),
+    ("managed_orders", "contract_tick", "ALTER TABLE managed_orders ADD COLUMN contract_tick REAL NOT NULL DEFAULT 1"),
+    ("managed_orders", "breakeven_enabled", "ALTER TABLE managed_orders ADD COLUMN breakeven_enabled INTEGER NOT NULL DEFAULT 1"),
+    ("managed_orders", "breakeven_triggered_at", "ALTER TABLE managed_orders ADD COLUMN breakeven_triggered_at TEXT"),
+    ("managed_orders", "breakeven_price", "ALTER TABLE managed_orders ADD COLUMN breakeven_price REAL"),
+    ("managed_orders", "risk_revision", "ALTER TABLE managed_orders ADD COLUMN risk_revision INTEGER NOT NULL DEFAULT 0"),
 )
 
 

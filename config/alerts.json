@@ -1,6 +1,6 @@
 {
   "_comment": "Monitor settings: the market time zone and the Telegram alert rules, checked on every 1-minute close. Edits are picked up on the next cycle, no restart needed. cooldown_minutes is global; any rule may set its own. The two trendline_break rules send only once per line.",
-  "_telegram_enabled_comment": "Master switch for all monitor Telegram notifications. false pauses alerts without consuming cooldowns or once-per-line notifications. --no-telegram always prevents sending.",
+  "_telegram_enabled_comment": "Master switch for monitor alerts and Dashboard entry-fill Telegram notifications. false pauses notifications without replaying skipped fills. monitor.py --no-telegram only disables that monitor process. Offline Mock never sends entry notifications.",
   "telegram_enabled": true,
   "cooldown_minutes": 10,
 

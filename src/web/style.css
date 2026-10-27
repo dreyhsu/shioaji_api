@@ -188,3 +188,13 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 0 20
 #trade-confirm { max-width: min(560px, 90vw); color: var(--text); background: var(--panel); border: 1px solid var(--support); border-radius: 10px; padding: 24px; }
 #trade-confirm::backdrop { background: #0009; }
 #trade-confirm pre { white-space: pre-wrap; font: inherit; line-height: 1.7; }
+
+.risk-editor { display: flex; align-items: end; flex-wrap: wrap; gap: 8px 12px; padding: 10px; margin: 4px 0 10px; border: 1px solid var(--line); border-radius: 7px; }
+.risk-editor[hidden] { display: none; }
+.risk-editor label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.risk-editor input[type="number"] { width: 115px; }
+.risk-editor input, .risk-editor select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px; }
+.risk-editor .risk-check { flex-direction: row; align-items: center; padding-bottom: 6px; }
+.risk-editor input:read-only { opacity: .65; }
+#risk-state { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+#risk-state.bad { color: #ef5350; }

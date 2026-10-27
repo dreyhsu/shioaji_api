@@ -485,7 +485,19 @@ def _invalidate_cache() -> None:
 def api_trendlines(code: str | None = None) -> list[dict]:
     code = code or CONFIG["code"]
     with db.session(CONFIG["db_path"]) as conn:
-        return db.load_trendlines(conn, code)
+        lines = db.load_trendlines(conn, code)
+        minutes = db.load_minute_bars(conn, code)
+    hourly = sb.minute_bars_to_hourly(minutes) if not minutes.empty else pd.DataFrame()
+    for line in lines:
+        line["curve_price"] = None
+        if line["kind"] == "curve" and not hourly.empty:
+            points = tl.anchor_indices(hourly, line["anchors"], "curve")
+            stamp = pd.Timestamp(minutes.iloc[-1]["minute_start"])
+            bucket = sb.hour_start_of(stamp)
+            fraction = 0 if bucket is None else (stamp - bucket).total_seconds() / 3600.0
+            if points:
+                line["curve_price"] = tl.value_at(points, len(hourly) - 1 + fraction, "curve")
+    return lines
 
 
 @app.post("/api/trendlines")
@@ -538,6 +550,15 @@ class TradeCurveIn(BaseModel):
 
 class TradeCurveSelectionIn(BaseModel):
     curve_id: int | None = None
+
+
+class TradeRiskSettingsIn(BaseModel):
+    curve_id: int | None = Field(default=None, ge=1)
+    stop_price: float = Field(gt=0, allow_inf_nan=False)
+    target_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    breakeven_enabled: StrictBool
+    risk_revision: int = Field(ge=0, strict=True)
+    confirmed: StrictBool = False
 
 
 class ContractSubscriptionIn(BaseModel):
@@ -662,6 +683,25 @@ def api_update_trade_levels(order_id: str, body: TradeLevelsIn) -> dict:
         return _trading_service().update_levels(order_id, body.stop_price, body.target_price)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except trading.RiskConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except trading.RiskConfirmation as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.put("/api/trading/orders/{order_id}/risk-settings")
+@_mock_locked
+def api_update_trade_risk(order_id: str, body: TradeRiskSettingsIn) -> dict:
+    try:
+        return _trading_service().update_risk_settings(order_id, **body.model_dump())
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except trading.RiskConfirmation as error:
+        raise HTTPException(status_code=409, detail={"code": "confirmation_required", "message": str(error)}) from error
+    except trading.RiskConflict as error:
+        raise HTTPException(status_code=409, detail={"code": "risk_conflict", "message": str(error)}) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -675,6 +715,8 @@ def api_update_trade_curve(order_id: str, body: TradeCurveIn) -> dict:
         return result
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except (trading.RiskConflict, trading.RiskConfirmation) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -688,6 +730,8 @@ def api_select_trade_curve(order_id: str, body: TradeCurveSelectionIn) -> dict:
         return result
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except (trading.RiskConflict, trading.RiskConfirmation) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 

@@ -6,6 +6,12 @@
     ? '—'
     : Number(value).toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits });
   const state = { simulation: true, connected: false, price: null, atr: null, contracts: [], orders: [], selectedId: null, curves: [], curveChoices: {} };
+  const riskDrafts = new Map();
+  const riskSaving = new Set();
+  const riskErrors = new Map();
+  let curvesListKey = null;
+  let curveOptionsKey = null;
+  let riskNotice = '';
   let lastMarginAt = 0;
   let lastStateAt = 0;
   let busy = false;
@@ -34,6 +40,7 @@
   }
 
   function setMode(info) {
+    $('risk-breakeven-label').textContent = `浮盈超過 ${info.breakeven_trigger_points ?? '—'} 點自動保本（保留 ${info.breakeven_offset_points ?? '—'} 點）`;
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
@@ -81,18 +88,22 @@
     if (!response.ok) return;
     const lines = (await response.json()).filter((line) => line.kind === 'curve');
     state.curves = lines;
-    const select = $('trade-curve');
-    const previous = select.value;
-    select.replaceChildren(new Option('固定 +2 ATR', ''));
-    for (const line of lines) {
-      select.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+    const listKey = lines.map((line) => `${line.id}:${line.label}`).join('|');
+    if (listKey !== curvesListKey) {
+      const select = $('trade-curve');
+      const previous = select.value;
+      select.replaceChildren(new Option('固定 +2 ATR', ''));
+      for (const line of lines) {
+        select.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+      }
+      if (lines.some((line) => String(line.id) === previous)) select.value = previous;
+      const entrySelect = $('entry-curve');
+      const entryPrevious = entrySelect.value;
+      entrySelect.replaceChildren(new Option('選擇手動保存的 1h 曲線', ''));
+      for (const line of lines) entrySelect.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+      if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
+      curvesListKey = listKey;
     }
-    if (lines.some((line) => String(line.id) === previous)) select.value = previous;
-    const entrySelect = $('entry-curve');
-    const entryPrevious = entrySelect.value;
-    entrySelect.replaceChildren(new Option('選擇手動保存的 1h 曲線', ''));
-    for (const line of lines) entrySelect.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
-    if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
     renderPreview();
     renderEntry();
     renderOrders();
@@ -176,38 +187,150 @@
   function canCancelEntry(order) {
     return Boolean(Number(order.active))
       && !['Filled', 'Cancelled', 'Failed', 'Rejected'].includes(order.entry_status)
-      && !order.triggered_at && !order.exit_trade_id;
+      && !order.triggered_at && !order.exit_trade_id && !order.exit_status;
   }
 
   function canManageCurve(order) {
     return Boolean(Number(order.active))
       && Number(order.filled_quantity) > Number(order.exit_filled_quantity)
-      && !order.triggered_at && !order.exit_trade_id;
+      && !order.triggered_at && !order.exit_trade_id && !order.exit_status;
   }
 
-  async function applyOrderCurve(order, button) {
-    const select = button.parentElement.querySelector('[data-order-curve]');
-    const curveId = select.value ? Number(select.value) : null;
-    const choice = curveId
-      ? `1 小時曲線 #${curveId}；多單在 1 分 K 收盤跌破曲線時停利，空單反向。原 -2 ATR 停損保留，固定 +2 ATR 停利停用。`
-      : '固定 +2 ATR 停利；原停損維持不變。';
-    if (!await confirmOperation(`變更 ${order.contract_code} 這筆持倉的停利方式？\n${choice}`)) return;
-    button.disabled = true;
+  function riskValues(order) {
+    return { curve_id: order.curve_id || null, stop_price: order.stop_price,
+      target_price: order.target_price, breakeven_enabled: Boolean(order.breakeven_enabled),
+      risk_revision: Number(order.risk_revision) };
+  }
+
+  function updateRiskDraft(id, patch) {
+    const order = state.orders.find((item) => item.id === id);
+    if (!order || !canManageCurve(order) || riskSaving.has(id)) return;
+    const draft = riskDrafts.get(id) || riskValues(order);
+    Object.assign(draft, patch);
+    riskDrafts.set(id, draft);
+    riskErrors.delete(id);
+    riskNotice = '';
+    if (state.selectedId === id) renderRiskEditor();
+  }
+
+  function curvePrice(id, order) {
+    if (!id) return null;
+    const curve = state.curves.find((item) => Number(item.id) === Number(id));
+    if (curve) return curve.curve_price ?? null;
+    return Number(order.curve_id) === Number(id) ? order.curve_price : null;
+  }
+
+  function effectiveRiskOrder(order) {
+    if (!order) return null;
+    const values = riskDrafts.get(order.id) || riskValues(order);
+    const stop = Number(values.stop_price);
+    const target = Number(values.target_price);
+    return { ...order, ...values, risk_status: orderStatus(order), risk_editable: canManageCurve(order) && !riskSaving.has(order.id),
+      stop_price: values.stop_price !== '' && Number.isFinite(stop) && stop > 0 ? stop : order.stop_price,
+      target_price: values.curve_id ? null : values.target_price !== '' && Number.isFinite(target) && target > 0 ? target : order.target_price,
+      curve_price: curvePrice(values.curve_id, order) };
+  }
+
+  function renderRiskEditor() {
+    const order = state.orders.find((item) => item.id === state.selectedId);
+    const editor = $('risk-editor');
+    const editable = Boolean(order && canManageCurve(order));
+    editor.hidden = !editable;
+    if (editable) {
+      const values = riskDrafts.get(order.id) || riskValues(order);
+      const mode = $('risk-mode');
+      const optionsKey = state.curves.map((item) => `${item.id}:${item.label}`).join('|') + '|' + values.curve_id;
+      if (curveOptionsKey !== optionsKey) {
+        mode.replaceChildren(new Option('固定 target／stop', ''));
+        for (const curve of state.curves) mode.add(new Option(curve.label || `曲線 #${curve.id}`, String(curve.id)));
+        if (values.curve_id && !state.curves.some((item) => Number(item.id) === Number(values.curve_id))) {
+          mode.add(new Option(`曲線 #${values.curve_id}（暫不可用）`, String(values.curve_id)));
+        }
+        curveOptionsKey = optionsKey;
+      }
+      mode.value = values.curve_id ? String(values.curve_id) : '';
+      const target = values.curve_id ? curvePrice(values.curve_id, order) : values.target_price;
+      const tick = Number(order.contract_tick) || 1;
+      for (const [key, value] of [['stop', values.stop_price], ['target', target]]) {
+        const input = $('risk-' + key);
+        input.step = tick;
+        if (document.activeElement !== input) input.value = value ?? '';
+      }
+      $('risk-target').readOnly = Boolean(values.curve_id);
+      $('risk-target').required = !values.curve_id;
+      $('risk-target').placeholder = values.curve_id && target == null ? '曲線暫不可用' : '';
+      $('risk-breakeven').checked = values.breakeven_enabled;
+      const stale = Number(values.risk_revision) !== Number(order.risk_revision);
+      let status = riskErrors.get(order.id) || riskNotice || (riskDrafts.has(order.id) ? '尚未儲存：系統仍沿用原出場設定。' : '已儲存；拖曳邊界或輸入價格後按儲存。');
+      if (stale) status = '出場設定或成交狀態已更新（可能已自動保本）。草稿已保留，請按還原重新核對。';
+      else if (order.breakeven_enabled && order.breakeven_triggered_at) status += ` 保本已觸發，保護價 ${number(order.breakeven_price, 2)}；stop 只能收緊。`;
+      if (values.curve_id) status += ' 曲線 target 僅供顯示，依 1m 收盤穿越出場。';
+      $('risk-state').textContent = status;
+      $('risk-state').classList.toggle('bad', stale || riskErrors.has(order.id));
+      for (const input of editor.querySelectorAll('input, select, button')) input.disabled = riskSaving.has(order.id);
+      $('risk-save').disabled = riskSaving.has(order.id) || !riskDrafts.has(order.id) || stale;
+    }
+    window.SNRChart?.setTradeOrder(effectiveRiskOrder(order));
+  }
+
+  function changeRiskMode(id, curveId) {
+    const order = state.orders.find((item) => item.id === id);
+    if (!order) return;
+    const draft = riskDrafts.get(id) || riskValues(order);
+    const cancelling = !curveId && Boolean(draft.curve_id);
+    const patch = { curve_id: curveId };
+    if (cancelling) {
+      const entry = Number(order.avg_fill_price);
+      const direction = order.action === 'Buy' ? 1 : -1;
+      const tick = Number(order.contract_tick) || 1;
+      patch.stop_price = order.default_stop_price ?? Math.round((entry - direction * 2 * Number(order.atr)) / tick) * tick;
+      patch.target_price = order.default_target_price ?? Math.round((entry + direction * 2 * Number(order.atr)) / tick) * tick;
+      if (order.breakeven_enabled && order.breakeven_triggered_at) {
+        patch.stop_price = direction > 0 ? Math.max(patch.stop_price, Number(order.stop_price)) : Math.min(patch.stop_price, Number(order.stop_price));
+      }
+    }
+    updateRiskDraft(id, patch);
+    if (cancelling && order.breakeven_enabled && order.breakeven_triggered_at) {
+      riskNotice = '已帶入 ±2 ATR 預設值，stop 保留已觸發的保本保護；儲存後才生效。';
+      renderRiskEditor();
+    }
+  }
+
+  async function saveRisk(event) {
+    event.preventDefault();
+    const id = state.selectedId;
+    const draft = riskDrafts.get(id);
+    if (!draft || riskSaving.has(id)) return;
+    const payload = { ...draft, stop_price: Number(draft.stop_price),
+      target_price: draft.curve_id ? null : Number(draft.target_price) };
+    riskSaving.add(id);
+    renderRiskEditor();
     try {
-      const response = await fetch(`/api/trading/orders/${encodeURIComponent(order.id)}/curve-selection`, {
-        method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ curve_id: curveId }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || '變更停利方式失敗');
-      delete state.curveChoices[order.id];
-      state.orders = state.orders.map((item) => item.id === result.id ? result : item);
-      renderOrders();
-      message(curveId ? '已啟用 1 小時曲線；停利將依 1 分 K 收盤穿越判斷。' : '已恢復固定 +2 ATR 停利。');
+      let result;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(`/api/trading/orders/${encodeURIComponent(id)}/risk-settings`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        result = await response.json();
+        if (response.status === 409 && result.detail?.code === 'confirmation_required' && !payload.confirmed) {
+          if (!await confirmOperation(result.detail.message)) return;
+          payload.confirmed = true;
+          continue;
+        }
+        if (!response.ok) throw new Error(result.detail?.message || (Array.isArray(result.detail) ? result.detail.map((item) => item.msg).join('；') : result.detail) || '儲存出場設定失敗');
+        riskDrafts.delete(id);
+        riskErrors.delete(id);
+        state.orders = state.orders.map((item) => item.id === id ? result : item);
+        message('出場設定已儲存，系統將使用新設定監控這筆單。');
+        break;
+      }
     } catch (error) {
+      riskErrors.set(id, error.message);
       message(error.message, true);
     } finally {
+      riskSaving.delete(id);
       await refreshOrders();
+      renderRiskEditor();
     }
   }
 
@@ -237,15 +360,13 @@
 
   function renderOrders() {
     const list = $('managed-orders');
-    // Polling must not close a dropdown or discard a user's pending selection.
-    if (list.contains(document.activeElement) && document.activeElement.matches('[data-order-curve]')) return;
     if (!state.orders.length) {
       list.innerHTML = '<div class="empty">尚無委託</div>';
-      window.SNRChart?.setTradeOrder(null);
+      renderRiskEditor();
       return;
     }
     const active = state.orders.filter((order) => Number(order.active));
-    if (!state.selectedId || !active.some((order) => order.id === state.selectedId)) {
+    if (!state.selectedId || !state.orders.some((order) => order.id === state.selectedId)) {
       state.selectedId = (active[0] || state.orders[0]).id;
     }
     list.innerHTML = state.orders.map((order) => {
@@ -256,11 +377,7 @@
       const entryLabel = filled > 0 ? '成交均價' : '委託價';
       const actions = [];
       if (canManageCurve(order)) {
-        const chosen = state.curveChoices[order.id] ?? (order.curve_id ? String(order.curve_id) : '');
-        const curveOptions = state.curves.map((line) =>
-          `<option value="${line.id}" ${chosen === String(line.id) ? 'selected' : ''}>${escapeHtml(line.label || `曲線 #${line.id}`)}</option>`
-        ).join('');
-        actions.push(`<select data-order-curve="${escapeHtml(order.id)}" aria-label="${escapeHtml(order.contract_code)} 停利方式"><option value="" ${chosen === '' ? 'selected' : ''}>固定 +2 ATR</option>${curveOptions}</select><button type="button" data-apply-curve="${escapeHtml(order.id)}">套用停利</button>`);
+        actions.push(`<button type="button" data-edit-risk="${escapeHtml(order.id)}">編輯出場</button>`);
       }
       if (canCancelEntry(order)) actions.push(`<button type="button" class="cancel-entry" data-cancel-order="${escapeHtml(order.id)}">${filled ? '取消未成交餘量' : '取消委託'}</button>`);
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
@@ -282,32 +399,35 @@
         if (order) cancelEntry(order, button);
       });
     });
-    list.querySelectorAll('[data-apply-curve]').forEach((button) => {
+    list.querySelectorAll('[data-edit-risk]').forEach((button) => {
       button.addEventListener('click', (event) => {
         event.stopPropagation();
-        const order = state.orders.find((item) => item.id === button.dataset.applyCurve);
-        if (order) applyOrderCurve(order, button);
+        selectOrder(button.dataset.editRisk);
+        $('risk-editor').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       });
     });
-    list.querySelectorAll('[data-order-curve]').forEach((select) => {
-      select.addEventListener('click', (event) => event.stopPropagation());
-      select.addEventListener('change', (event) => {
-        state.curveChoices[select.dataset.orderCurve] = select.value;
-        event.stopPropagation();
-      });
-    });
-    window.SNRChart?.setTradeOrder(state.orders.find((order) => order.id === state.selectedId) || null);
+    renderRiskEditor();
   }
 
   function selectOrder(id) {
     state.selectedId = id;
+    riskNotice = '';
     renderOrders();
+  }
+
+  function acceptOrders(orders) {
+    // A response begun before a save must not roll back its newer revision.
+    state.orders = orders.map((order) => {
+      const current = state.orders.find((item) => item.id === order.id);
+      return current && Number(current.risk_revision) > Number(order.risk_revision) ? current : order;
+    });
+    for (const id of riskDrafts.keys()) if (!orders.some((order) => order.id === id)) riskDrafts.delete(id);
   }
 
   async function refreshOrders() {
     const response = await fetch('/api/trading/orders');
     if (!response.ok) return;
-    state.orders = await response.json();
+    acceptOrders(await response.json());
     renderOrders();
   }
 
@@ -319,7 +439,8 @@
       ]);
       const info = await response.json();
       setMode(info);
-      if (info.orders) state.orders = info.orders;
+      if (info.orders) acceptOrders(info.orders);
+      await loadCurves();
       renderOrders();
       if (state.contracts.length === 0 && info.connected) await loadContracts();
       if ((state.mock || Date.now() - lastMarginAt > 30000) && info.connected) await loadAccountMargin();
@@ -495,7 +616,20 @@
   $('entry-arm').addEventListener('click', () => controlEntry());
   $('entry-cancel').addEventListener('click', () => controlEntry(true));
 
-  window.TradingUI = { message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves, confirm: confirmOperation };
+  $('risk-editor').addEventListener('submit', saveRisk);
+  $('risk-mode').addEventListener('change', (event) => changeRiskMode(state.selectedId, event.target.value ? Number(event.target.value) : null));
+  for (const key of ['stop', 'target']) {
+    $('risk-' + key).addEventListener('input', (event) => updateRiskDraft(state.selectedId, { [key + '_price']: event.target.value }));
+  }
+  $('risk-breakeven').addEventListener('change', (event) => updateRiskDraft(state.selectedId, { breakeven_enabled: event.target.checked }));
+  $('risk-reset').addEventListener('click', () => {
+    riskDrafts.delete(state.selectedId);
+    riskErrors.delete(state.selectedId);
+    riskNotice = '';
+    renderRiskEditor();
+  });
+
+  window.TradingUI = { updateRiskDraft, message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves, confirm: confirmOperation };
   document.addEventListener('trendlines-changed', () => loadCurves().catch((error) => message(error.message, true)));
   fetch('/api/state').then((response) => response.json()).then((data) => {
     state.atr = data.hourly_atr;

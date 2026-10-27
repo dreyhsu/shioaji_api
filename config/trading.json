@@ -1,4 +1,6 @@
 {
   "auto_entry_enabled": true,
-  "auto_exit_enabled": true
+  "auto_exit_enabled": true,
+  "breakeven_trigger_points": 100,
+  "breakeven_offset_points": 5
 }

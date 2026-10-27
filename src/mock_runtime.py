@@ -39,6 +39,7 @@ class MockRuntime:
         self.service = TradingService(
             self.db_path, self.code, api_factory=lambda simulation: self.broker,
             simulation=True, clock=self.now, start_worker=False, sdk=self.broker.sdk,
+            enable_telegram=False,
             **({"settings_path": self.settings_path} if self.settings_path is not None else {}),
         )
         with db.session(self.db_path) as conn:

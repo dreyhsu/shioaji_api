@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=curve-tabs-2">
+  <link rel="stylesheet" href="/static/style.css?v=risk-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -116,7 +116,7 @@
         <label class="trade-field">口數
           <input id="entry-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
         </label>
-        <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損、停利固定各 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。</div>
+        <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損、停利預設各 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。成交後可編輯出場，自動保本依交易設定。</div>
         <button id="entry-arm" class="trade-submit" type="button" disabled>啟用一次突破做多</button>
         <button id="entry-cancel" class="entry-cancel" type="button" disabled>取消等待進場</button>
         <div id="entry-message" class="trade-message" role="status"></div>
@@ -140,7 +140,7 @@
         <span id="auto-exit-state" class="trade-muted">自動出場設定讀取中</span>
       </div>
       <div id="managed-orders" class="managed-orders"><div class="empty">尚無委託</div></div>
-      <div class="trade-muted order-help">點選委託後，圖表會標出委託價／成交均價、停損與停利。未成交委託可取消；部分成交取消時只撤銷未成交口數。</div>
+      <div class="trade-muted order-help">點選委託後，圖表顯示該單損益區塊；持倉可編輯出場，按儲存才生效。未成交委託可取消；部分成交取消時只撤銷未成交口數。</div>
     </article>
   </section>
 
@@ -163,6 +163,15 @@
     </div>
     <div class="chart-note">支撐／阻力箱、趨勢線與 ATR 依 1h 計算；畫線請切換至 1h。</div>
     <div id="trade-chart-range" class="trade-chart-range" role="status">選取右側委託／部位，在圖表查看進場、停損與停利價位。</div>
+    <form id="risk-editor" class="risk-editor" hidden>
+      <label>停利方式 <select id="risk-mode" aria-label="停利方式"></select></label>
+      <label>Target <input id="risk-target" type="number" min="0" aria-label="Target 價格"></label>
+      <label>Stop <input id="risk-stop" required type="number" min="0" aria-label="Stop 價格"></label>
+      <label class="risk-check"><input id="risk-breakeven" type="checkbox"><span id="risk-breakeven-label">自動保本（讀取設定中）</span></label>
+      <button id="risk-save" type="submit">儲存</button>
+      <button id="risk-reset" type="button">還原</button>
+      <span id="risk-state" role="status" aria-live="polite"></span>
+    </form>
     <div id="legend-ohlc" class="legend-ohlc"></div>
     <div id="trendlines" class="trendline-list"></div>
     <div id="draw-hint" class="draw-hint" hidden></div>
@@ -190,8 +199,9 @@
 
   <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
-  <script src="/static/lwc_app.js?v=curve-tabs-2"></script>
-  <script src="/static/trading.js?v=curve-tabs-2"></script>
+  <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
+  <script src="/static/lwc_app.js?v=pnl-hover-2"></script>
+  <script src="/static/trading.js?v=breakeven-config-1"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

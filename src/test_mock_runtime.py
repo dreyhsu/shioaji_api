@@ -141,8 +141,8 @@ def test_1_manual_fill_shows_two_atr_stop_and_target(replay, action, direction):
     order = manual_order(client, action)
     assert order["entry_status"] == "Filled" and order["filled_quantity"] == 1
     assert order["avg_fill_price"] == runtime.broker.price
-    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - direction * 2 * order["atr"])
-    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + direction * 2 * order["atr"])
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 2 * order["atr"]))
+    assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + direction * 2 * order["atr"]))
     assert len(runtime.broker.trades) == 1
 
 
@@ -152,8 +152,8 @@ def test_fixed_exits_fill_and_flatten_position(replay, action, reason, record_pr
     runtime.advance(60)
     order = manual_order(client, action)
     direction = 1 if action == "Buy" else -1
-    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + direction * 2 * order["atr"])
-    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - direction * 2 * order["atr"])
+    assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + direction * 2 * order["atr"]))
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 2 * order["atr"]))
     runtime.advance(1)
     assert runtime.service._active_order(order["id"])["trigger_reason"] is None
     runtime.advance(89)
@@ -209,8 +209,8 @@ def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_pr
     assert row["action"] == "Buy" and row["filled_quantity"] == 1
     assert row["entry_status"] == "Filled" and row["avg_fill_price"] > curve_price
     assert row["curve_id"] is None  # Entry curve does not implicitly become an exit curve.
-    assert row["stop_price"] == pytest.approx(row["avg_fill_price"] - 2 * row["atr"])
-    assert row["target_price"] == pytest.approx(row["avg_fill_price"] + 2 * row["atr"])
+    assert row["stop_price"] == pytest.approx(round(row["avg_fill_price"] - 2 * row["atr"]))
+    assert row["target_price"] == pytest.approx(round(row["avg_fill_price"] + 2 * row["atr"]))
     runtime.advance(5)
     assert len(runtime.broker.trades) == 1
     assert runtime.broker.position == 1
@@ -259,8 +259,8 @@ def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, rec
             assert order["curve_id"] is None
             entry_price, atr = order["avg_fill_price"], order["atr"]
             stop, target = order["stop_price"], order["target_price"]
-            assert stop == pytest.approx(entry_price - 2 * atr)
-            assert target == pytest.approx(entry_price + 2 * atr)
+            assert stop == pytest.approx(round(entry_price - 2 * atr))
+            assert target == pytest.approx(round(entry_price + 2 * atr))
 
             for _ in range(len(runtime.bars) - runtime.cursor):
                 previous_price = runtime.broker.price

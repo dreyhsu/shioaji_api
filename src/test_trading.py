@@ -106,10 +106,49 @@ def fake_service(tmp_path, monkeypatch):
     service = trading.TradingService(
         db_path, "TMFR1", settings_path=tmp_path / "trading.json",
         api_factory=factory, start_worker=False,
+        alerts_path=tmp_path / "alerts.json",
     )
     service._risk_context = lambda code: (120.0, pd.DataFrame())
+    service.entry_notifier.dispatch = lambda task: task()
     yield service, api, factory_modes
     service.close()
+
+
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+def test_only_new_entry_fills_notify_and_paused_fills_are_not_replayed(fake_service, monkeypatch, action):
+    service, api, _ = fake_service
+    messages = []
+    import telegram_notify as tg
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
+    service.entry_notifier.config.path = service.settings_path.parent / "alerts.json"
+    result = service.place_order({
+        "confirmed": True, "simulation": True, "contract_code": "TMF202611",
+        "action": action, "quantity": 3, "price": 46270, "price_type": "LMT", "order_type": "ROD",
+    })
+    entry = api.trades[0]
+    service._persist_trade_state(result["id"], entry=entry)
+    assert not messages  # submission and a signal alone are not a confirmed position
+    entry.status.deal_quantity = 1
+    entry.status.deals = [SimpleNamespace(quantity=1, price=46280)]
+    service._persist_trade_state(result["id"], entry=entry)
+    assert len(messages) == 1 and "1 / 3 口" in messages[0]
+    assert ("買進做多" if action == "Buy" else "賣出做空") in messages[0]
+    assert "46,280.00" in messages[0]
+    service._persist_trade_state(result["id"], entry=entry)
+    service.entry_notifier.config.path.write_text('{"telegram_enabled": false}')
+    entry.status.deal_quantity = 2
+    entry.status.deals = [SimpleNamespace(quantity=2, price=46280)]
+    service._persist_trade_state(result["id"], entry=entry)
+    service.entry_notifier.config.path.write_text('{"telegram_enabled": true, "_comment": "resume"}')
+    service._persist_trade_state(result["id"], entry=entry)
+    assert len(messages) == 1
+    entry.status.deal_quantity = 3
+    entry.status.status = "Filled"
+    entry.status.deals = [SimpleNamespace(quantity=3, price=46280)]
+    service._persist_trade_state(result["id"], entry=entry)
+    assert len(messages) == 2 and "3 / 3 口" in messages[-1]
+    service._persist_trade_state(result["id"], exit_trade=entry)
+    assert len(messages) == 2
 
 
 def test_simulation_order_and_margin_are_exposed(fake_service):

@@ -11,6 +11,7 @@ import uuid
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
+from functools import wraps
 
 import pandas as pd
 import shioaji as sj
@@ -25,11 +26,35 @@ import trendline as tl
 from place_order import OrderRequest, OrderContext, validate_request, place_order
 from shioaji_order_adapter import ShioajiOrderAdapter
 from curve_entry_controller import CurveEntryController
+from entry_notify import EntryNotifier
+from alert_rules import DEFAULT_CONFIG_PATH as DEFAULT_ALERTS_PATH
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config" / "trading.json"
 TICK_STALE_SECONDS = 10
 MONITOR_INTERVAL_SECONDS = 0.5
+
+
+class RiskConflict(ValueError):
+    """The editor's snapshot is no longer current."""
+
+
+class RiskConfirmation(ValueError):
+    """Saving these settings can immediately trigger an exit."""
+
+
+def risk_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+def align_tick(price: float, tick: float, direction: int = 0) -> float:
+    units = price / tick
+    units = math.ceil(units - 1e-9) if direction > 0 else math.floor(units + 1e-9) if direction < 0 else round(units)
+    return round(units * tick, 10)
 
 
 def stop_target_prices(action: str, entry_price: float, atr: float) -> tuple[float, float]:
@@ -135,6 +160,8 @@ class TradingService:
         clock=None,
         start_worker: bool = True,
         sdk=None,
+        enable_telegram: bool = True,
+        alerts_path: Path | str = DEFAULT_ALERTS_PATH,
     ) -> None:
         self.db_path = Path(db_path)
         self.code = code
@@ -158,6 +185,7 @@ class TradingService:
         self._last_sync = 0.0
         self._connected_simulation = None
         self.curve_entry = CurveEntryController(self)
+        self.entry_notifier = EntryNotifier(db_path, enabled=enable_telegram, alerts_path=alerts_path)
 
     @property
     def simulation(self) -> bool:
@@ -178,6 +206,27 @@ class TradingService:
             return config.get(key, True) is True
         except (OSError, ValueError, AttributeError):
             return True
+
+    def breakeven_settings(self) -> dict[str, float]:
+        """Reload point settings like the existing trading switches; retain safe defaults."""
+        defaults = {"breakeven_trigger_points": 100.0, "breakeven_offset_points": 5.0}
+        try:
+            config = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return defaults
+        if not isinstance(config, dict):
+            return defaults
+        for key in defaults:
+            value = config.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                value = float(value)
+            except OverflowError:
+                continue
+            if math.isfinite(value) and value >= 0:
+                defaults[key] = value
+        return defaults
 
     def _open(self):
         if self._api is not None:
@@ -238,6 +287,12 @@ class TradingService:
         for row in self._active_orders():
             try:
                 contract = self._find_contract(row["contract_code"])
+                tick = float(_value(contract, "tick", 1) or 1)
+                if tick != float(row.get("contract_tick") or 1):
+                    with db.session(self.db_path) as conn:
+                        conn.execute("UPDATE managed_orders SET contract_tick = ?, risk_revision = risk_revision + 1 WHERE id = ?",
+                                     (tick, row["id"]))
+                        conn.commit()
                 self._subscribe(contract)
             except Exception as error:  # noqa: BLE001
                 self._connect_error = f"合約行情恢復失敗：{error}"
@@ -284,7 +339,14 @@ class TradingService:
             if not math.isfinite(price) or price <= 0:
                 return
             with self._lock:
+                previous = self._quotes.get(code)
+                if previous and stamp < previous["at"]:
+                    return
                 self._quotes[code] = {"price": price, "at": stamp}
+                if -5 <= (self._now() - stamp).total_seconds() <= TICK_STALE_SECONDS:
+                    for row in self._active_orders():
+                        if row["contract_code"] == code:
+                            self._apply_breakeven(row, price)
         except Exception:  # noqa: BLE001 - callback runs on Shioaji's quote thread
             return
 
@@ -302,13 +364,17 @@ class TradingService:
             self._connect_error = f"委託狀態同步失敗：{error}"
             return {}
 
+    @risk_locked
     def _persist_trade_state(self, row_id: str, *, entry=None, exit_trade=None) -> None:
+        original = self._active_order(row_id)
         now = self._now().isoformat(sep=" ")
+        new_fill = False
         updates: dict[str, Any] = {"updated_at": now}
         if entry is not None:
             filled, avg = _fill_summary(entry)
             status = _trade_status(entry)
             current = self._active_order(row_id)
+            new_fill = filled > int(current.get("filled_quantity", 0))
             updates.update(filled_quantity=filled, entry_status=status)
             terminal = status in {"Filled", "Cancelled", "Failed", "Rejected"}
             if terminal and current.get("exit_status") == "waiting_entry_cancel":
@@ -322,7 +388,17 @@ class TradingService:
                 updates["avg_fill_price"] = avg
                 if not int(current.get("levels_customized", 0)):
                     stop, target = stop_target_prices(current["action"], avg, current["atr"])
-                    updates.update(stop_price=stop, target_price=None if current.get("curve_id") else target)
+                    tick = float(current.get("contract_tick") or 1)
+                    updates.update(stop_price=align_tick(stop, tick), target_price=None if current.get("curve_id") else align_tick(target, tick))
+                if current.get("breakeven_enabled") and current.get("breakeven_triggered_at"):
+                    direction = 1 if current["action"] == "Buy" else -1
+                    offset = self.breakeven_settings()["breakeven_offset_points"]
+                    protection = align_tick(avg + direction * offset, float(current.get("contract_tick") or 1), direction)
+                    old_floor = current.get("breakeven_price")
+                    if old_floor is not None:
+                        protection = max(protection, old_floor) if direction > 0 else min(protection, old_floor)
+                    stop = updates.get("stop_price", current["stop_price"])
+                    updates.update(breakeven_price=protection, stop_price=max(stop, protection) if direction > 0 else min(stop, protection), levels_customized=1)
             if terminal and filled == 0 and status in {"Cancelled", "Failed", "Rejected"}:
                 updates.update(active=0, auto_exit=0)
         if exit_trade is not None:
@@ -335,6 +411,9 @@ class TradingService:
             elif status in {"Cancelled", "Failed", "Rejected"}:
                 # Do not retry an ambiguous exit automatically; it needs review.
                 updates["error"] = f"平倉委託狀態：{status}，請確認剩餘部位"
+        risk_keys = {"avg_fill_price", "filled_quantity", "exit_filled_quantity", "active", "stop_price", "target_price", "breakeven_price"}
+        if any(key in risk_keys and value != original.get(key) for key, value in updates.items()):
+            updates["risk_revision"] = int(original.get("risk_revision", 0)) + 1
         assignments = ", ".join(f"{key} = ?" for key in updates)
         with db.session(self.db_path) as conn:
             conn.execute(
@@ -342,6 +421,33 @@ class TradingService:
                 (*updates.values(), row_id),
             )
             conn.commit()
+
+        if new_fill:
+            self.entry_notifier.notify(self._active_order(row_id))
+
+    def _apply_breakeven(self, row: dict, price: float) -> dict:
+        """Called under the shared risk lock for every fresh tick and after fill sync."""
+        if (not row.get("active") or not row.get("breakeven_enabled") or row.get("triggered_at")
+                or row.get("exit_trade_id") or row.get("exit_status")
+                or int(row["filled_quantity"]) <= int(row["exit_filled_quantity"])):
+            return row
+        if row.get("breakeven_triggered_at"):
+            return row
+        entry = row.get("avg_fill_price")
+        direction = 1 if row["action"] == "Buy" else -1
+        settings = self.breakeven_settings()
+        if entry is None or direction * (price - entry) <= settings["breakeven_trigger_points"]:
+            return row
+        protection = align_tick(entry + direction * settings["breakeven_offset_points"], float(row.get("contract_tick") or 1), direction)
+        stop = row.get("stop_price")
+        stop = protection if stop is None else max(stop, protection) if direction > 0 else min(stop, protection)
+        now = self._now().isoformat(sep=" ")
+        with db.session(self.db_path) as conn:
+            conn.execute("UPDATE managed_orders SET stop_price = ?, breakeven_price = ?, breakeven_triggered_at = ?, "
+                         "levels_customized = 1, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ?",
+                         (stop, protection, now, now, row["id"]))
+            conn.commit()
+        return self._active_order(row["id"])
 
     def _active_order(self, row_id: str) -> dict:
         with db.session(self.db_path) as conn:
@@ -462,16 +568,22 @@ class TradingService:
             return None
         hourly = sb.minute_bars_to_hourly(minutes)
         points = tl.anchor_indices(hourly, json.loads(curve["anchors"]), "curve")
-        value = None if not points else tl.value_at(points, len(hourly) - 1, "curve")
+        # Match the fractional hour used by the 1m crossing evaluator.
+        stamp = pd.Timestamp(minutes.iloc[-1]["minute_start"])
+        bucket = sb.hour_start_of(stamp)
+        fraction = 0 if bucket is None else (stamp - bucket).total_seconds() / 3600.0
+        value = None if not points else tl.value_at(points, len(hourly) - 1 + fraction, "curve")
         result = None if value is None else float(value)
         self._curve_cache[cache_key] = (time.monotonic(), result)
         return result
 
+    @risk_locked
     def _try_auto_exit(self, row: dict, reason: str) -> None:
         with db.session(self.db_path) as conn:
             conn.execute(
                 "UPDATE managed_orders SET triggered_at = COALESCE(triggered_at, ?), "
-                "trigger_reason = COALESCE(trigger_reason, ?), updated_at = ? WHERE id = ?",
+                "trigger_reason = COALESCE(trigger_reason, ?), "
+                "risk_revision = risk_revision + CASE WHEN triggered_at IS NULL THEN 1 ELSE 0 END, updated_at = ? WHERE id = ?",
                 (self._now().isoformat(sep=" "), reason, self._now().isoformat(sep=" "), row["id"]),
             )
             conn.commit()
@@ -580,6 +692,7 @@ class TradingService:
             self._last_sync = 0
             self._monitor_once()
 
+    @risk_locked
     def _monitor_once(self) -> None:
         if not self._api:
             return
@@ -624,6 +737,7 @@ class TradingService:
                     (quote["price"], quote["at"].isoformat(sep=" "), self._now().isoformat(sep=" "), row["id"]),
                 )
                 conn.commit()
+            row = self._apply_breakeven(row, quote["price"])
             signal = self._exit_signal(row, quote["price"])
             if signal and signal != "curve_unavailable":
                 self._try_auto_exit(row, signal)
@@ -668,6 +782,7 @@ class TradingService:
             "quote_age_seconds": age,
             "auto_exit_enabled": self.auto_exit_enabled(),
             "auto_entry_enabled": self.auto_entry_enabled(),
+            **self.breakeven_settings(),
             "curve_entry": self.curve_entry.snapshot(),
             "error": error,
             "orders": self.orders(),
@@ -793,49 +908,127 @@ class TradingService:
             self._subscribe(contract)
         preview_price = price if price_type == "LMT" else None
         stop, target = (stop_target_prices(action, preview_price, atr) if preview_price else (None, None))
+        stop = None if stop is None else align_tick(stop, tick)
+        target = None if target is None or curve_id is not None else align_tick(target, tick)
         row_id = str(uuid.uuid4())
         now = self._now().isoformat(sep=" ")
         with db.session(self.db_path) as conn:
             conn.execute(
                 """INSERT INTO managed_orders (
                     id, code, contract_code, action, quantity, price, price_type, order_type,
-                    atr, stop_price, target_price, curve_id, curve_check_from, auto_exit, simulation,
+                    atr, stop_price, target_price, curve_id, curve_check_from, auto_exit, simulation, contract_tick,
                     entry_trade_id, entry_status, active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (row_id, self.code, canonical_code, action, quantity, price, price_type, order_type,
                  atr, stop, target, curve_id,
                  pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ") if curve_id is not None else None,
-                 int(self.auto_exit_enabled()), int(self.simulation),
+                 int(self.auto_exit_enabled()), int(self.simulation), tick,
                  trade_id, result.status, now, now),
             )
             conn.commit()
         self._start_worker()
         return self._public_order(self._active_order(row_id))
 
-    def update_levels(self, row_id: str, stop: float, target: float | None) -> dict:
+    def _editable_risk_order(self, row_id: str) -> dict:
         row = self._active_order(row_id)
         if not row or not row["active"]:
             raise KeyError("找不到有效的委託部位")
-        stop = float(stop)
-        target = None if target is None else float(target)
-        entry = row["avg_fill_price"] or row["price"]
-        if not math.isfinite(stop) or (target is not None and not math.isfinite(target)):
-            raise ValueError("停損停利價格必須是有效數字")
-        if row["action"] == "Buy" and (stop >= entry or (target is not None and target <= entry)):
-            raise ValueError("多單停損須低於進場價，停利須高於進場價")
-        if row["action"] == "Sell" and (stop <= entry or (target is not None and target >= entry)):
-            raise ValueError("空單停損須高於進場價，停利須低於進場價")
+        if int(row["filled_quantity"]) <= int(row["exit_filled_quantity"]):
+            raise ValueError("需有已成交且未平倉的部位，才能變更出場設定")
+        if row.get("triggered_at") or row.get("exit_trade_id") or row.get("exit_status"):
+            raise RiskConflict("此部位已進入出場流程，不能變更出場設定")
+        return row
+
+    def _fresh_risk_quote(self, row: dict) -> float | None:
+        quote = self._quotes.get(row["contract_code"])
+        if quote and -5 <= (self._now() - quote["at"]).total_seconds() <= TICK_STALE_SECONDS:
+            return float(quote["price"])
+        return None
+
+    @risk_locked
+    def update_risk_settings(self, row_id: str, *, curve_id: int | None, stop_price: float,
+                             target_price: float | None, breakeven_enabled: bool,
+                             risk_revision: int, confirmed: bool = False) -> dict:
+        row = self._editable_risk_order(row_id)
+        quote = self._fresh_risk_quote(row)
+        if quote is not None:
+            row = self._apply_breakeven(row, quote)
+        if risk_revision != int(row["risk_revision"]):
+            raise RiskConflict("此單的出場設定或成交狀態已更新，請還原並重新核對後儲存")
+        direction = 1 if row["action"] == "Buy" else -1
+        tick = float(row.get("contract_tick") or 1)
+        stop = float(stop_price)
+        target = None if curve_id is not None or target_price is None else float(target_price)
+        for value in (stop, target):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError("停損停利價格必須是有效正數")
+            if value is not None and not math.isclose(value, align_tick(value, tick), abs_tol=tick * 1e-7, rel_tol=0):
+                raise ValueError(f"價格必須符合最小跳動單位 {tick:g}")
+        stop = align_tick(stop, tick)
+        target = None if target is None else align_tick(target, tick)
+        if curve_id is None:
+            if target is None:
+                raise ValueError("固定停利模式必須提供 target")
+            if direction * (target - stop) <= 0:
+                raise ValueError("多單 stop 須低於 target；空單 stop 須高於 target")
+        else:
+            with db.session(self.db_path) as conn:
+                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                                     (curve_id, row["code"])).fetchone()
+            if curve is None:
+                raise ValueError("選用的 1 小時曲線不存在或已刪除")
+        # Disabling and loosening require separate saves. A stale editor can never
+        # silently remove protection that was installed by a tick callback.
+        if row.get("breakeven_enabled") and row.get("breakeven_triggered_at"):
+            floor = row["stop_price"]
+            if direction * (stop - floor) < -tick * 1e-7:
+                raise ValueError("保本已觸發，請先關閉保本並儲存，再放寬 stop")
+        triggered = row.get("breakeven_triggered_at") if breakeven_enabled else None
+        protection = row.get("breakeven_price") if breakeven_enabled else None
+        settings = self.breakeven_settings()
+        if (breakeven_enabled and not triggered and quote is not None
+                and direction * (quote - row["avg_fill_price"]) > settings["breakeven_trigger_points"]):
+            protection = align_tick(row["avg_fill_price"] + direction * settings["breakeven_offset_points"], tick, direction)
+            stop = max(stop, protection) if direction > 0 else min(stop, protection)
+            triggered = self._now().isoformat(sep=" ")
+        if curve_id is None and direction * (target - stop) <= 0:
+            raise ValueError("套用保本後 stop 與 target 次序不符，請調整 target")
+        if quote is not None:
+            reason = crossed_exit(row["action"], quote, stop, target)
+            if reason and not confirmed:
+                raise RiskConfirmation(f"最新行情 {quote:g} 已達新設定的{'停損' if reason == 'stop' else '停利'}價，儲存後可能立即出場。確認儲存？")
+        changed_curve = curve_id != row.get("curve_id")
+        baseline = (pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ")
+                    if curve_id is not None and changed_curve else row.get("curve_check_from") if curve_id is not None else None)
+        desired = dict(curve_id=curve_id, stop_price=stop, target_price=target, curve_check_from=baseline,
+                       breakeven_enabled=int(breakeven_enabled), breakeven_triggered_at=triggered,
+                       breakeven_price=protection, levels_customized=1)
+        if all(row.get(key) == value for key, value in desired.items()):
+            return self._public_order(row)
+        now = self._now().isoformat(sep=" ")
         with db.session(self.db_path) as conn:
-            conn.execute(
-                "UPDATE managed_orders SET stop_price = ?, target_price = ?, levels_customized = 1, updated_at = ? WHERE id = ?",
-                (stop, target, self._now().isoformat(sep=" "), row_id),
-            )
+            cursor = conn.execute(
+                "UPDATE managed_orders SET curve_id = ?, stop_price = ?, target_price = ?, curve_check_from = ?, "
+                "breakeven_enabled = ?, breakeven_triggered_at = ?, breakeven_price = ?, levels_customized = 1, "
+                "curve_armed = 0, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ? AND risk_revision = ?",
+                (curve_id, stop, target, baseline, int(breakeven_enabled), triggered, protection, now, row_id, risk_revision))
+            if not cursor.rowcount:
+                raise RiskConflict("出場設定已更新，請重新核對")
             conn.commit()
+        self._curve_break_cache.clear()
         return self._public_order(self._active_order(row_id))
 
+    @risk_locked
+    def update_levels(self, row_id: str, stop: float, target: float | None) -> dict:
+        row = self._editable_risk_order(row_id)
+        return self.update_risk_settings(row_id, curve_id=row.get("curve_id"), stop_price=stop,
+                                         target_price=target, breakeven_enabled=bool(row["breakeven_enabled"]),
+                                         risk_revision=row["risk_revision"])
+
+    @risk_locked
     def update_curve(self, row_id: str, target_price: float) -> dict:
-        row = self._active_order(row_id)
-        if not row or not row["active"] or row.get("curve_id") is None:
+        row = self._editable_risk_order(row_id)
+        if row.get("curve_id") is None:
             raise KeyError("這筆委託沒有啟用曲線停利")
         target_price = float(target_price)
         if not math.isfinite(target_price):
@@ -857,48 +1050,23 @@ class TradingService:
             if not db.update_trendline_anchors(conn, row["curve_id"], anchors):
                 raise ValueError("曲線更新失敗")
         self._curve_cache.pop((int(row["curve_id"]), row["code"]), None)
+        self._curve_break_cache.clear()
+        with db.session(self.db_path) as conn:
+            conn.execute("UPDATE managed_orders SET risk_revision = risk_revision + 1 WHERE curve_id = ?", (row["curve_id"],))
+            conn.commit()
         return self._public_order(self._active_order(row_id))
 
+    @risk_locked
     def set_order_curve(self, row_id: str, curve_id: int | None) -> dict:
-        """Switch a filled position between fixed +2 ATR and a saved 1h curve."""
-        row = self._active_order(row_id)
-        if not row or not int(row["active"]):
-            raise KeyError("找不到有效持倉")
-        if int(row["filled_quantity"]) <= int(row["exit_filled_quantity"]):
-            raise ValueError("需有已成交且未平倉的部位，才能變更停利方式")
-        if row.get("exit_trade_id") or row.get("triggered_at"):
-            raise ValueError("此部位已進入出場流程，不能變更停利方式")
+        """Legacy selection API retains the stop; the editor previews both ATR defaults."""
+        row = self._editable_risk_order(row_id)
         target = None
-        check_from = None
         if curve_id is None:
-            entry_price = row.get("avg_fill_price") or row.get("price")
-            if not entry_price or not row.get("atr"):
-                raise ValueError("尚無成交均價或 ATR，不能恢復固定停利")
-            _stop, target = stop_target_prices(row["action"], float(entry_price), float(row["atr"]))
-        else:
-            with db.session(self.db_path) as conn:
-                curve = conn.execute(
-                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
-                    (int(curve_id), row["code"]),
-                ).fetchone()
-            if curve is None:
-                raise ValueError("選用的 1 小時曲線不存在或已刪除")
-            check_from = pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ")
-        with db.session(self.db_path) as conn:
-            conn.execute(
-                "UPDATE managed_orders SET curve_id = ?, target_price = ?, curve_check_from = ?, "
-                "curve_armed = 0, updated_at = ? WHERE id = ?",
-                (curve_id, target, check_from, self._now().isoformat(sep=" "), row_id),
-            )
-            conn.commit()
-        if row.get("curve_id") is not None:
-            self._curve_break_cache.pop(
-                (str(row["id"]), int(row["curve_id"]), row["code"], str(row.get("curve_check_from") or "")),
-                None,
-            )
-        if curve_id is not None:
-            self._curve_cache.pop((int(curve_id), row["code"]), None)
-        return self._public_order(self._active_order(row_id))
+            _, target = stop_target_prices(row["action"], row["avg_fill_price"], row["atr"])
+            target = align_tick(target, float(row.get("contract_tick") or 1))
+        return self.update_risk_settings(row_id, curve_id=curve_id, stop_price=row["stop_price"],
+                                         target_price=target, breakeven_enabled=bool(row["breakeven_enabled"]),
+                                         risk_revision=row["risk_revision"])
 
     def cancel_entry(self, row_id: str) -> dict:
         """Cancel the unfilled remainder of a managed entry order."""
@@ -934,17 +1102,27 @@ class TradingService:
             result.append(item)
         return result
 
-    @staticmethod
-    def _public_order(row: dict) -> dict:
-        return {key: row.get(key) for key in (
+    def _public_order(self, row: dict) -> dict:
+        item = {key: row.get(key) for key in (
             "id", "code", "contract_code", "action", "quantity", "filled_quantity",
             "avg_fill_price", "price", "price_type", "order_type", "atr", "stop_price",
             "target_price", "curve_id", "auto_exit", "simulation", "entry_trade_id",
-            "curve_check_from",
+            "curve_check_from", "contract_tick", "breakeven_enabled", "breakeven_triggered_at", "breakeven_price", "risk_revision",
             "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity",
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}
+        item["curve_price"] = self._curve_value(row) if row.get("curve_id") is not None else None
+        entry = row.get("avg_fill_price") or row.get("price")
+        item["default_stop_price"] = item["default_target_price"] = None
+        if entry and row.get("atr"):
+            stop, target = stop_target_prices(row["action"], float(entry), float(row["atr"]))
+            tick = float(row.get("contract_tick") or 1)
+            item.update(default_stop_price=align_tick(stop, tick), default_target_price=align_tick(target, tick))
+        quote = self._fresh_risk_quote(row)
+        if quote is not None:
+            item["last_quote"] = quote
+        return item
 
     def close(self) -> None:
         self._stop.set()

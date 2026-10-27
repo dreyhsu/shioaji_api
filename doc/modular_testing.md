@@ -11,6 +11,7 @@
 | `place_order` | OrderRequest + OrderContext + BrokerPort → OrderResult | 純驗證、跳動單位與一次送單；不使用 DB、ATR、Dashboard 或 Shioaji |
 | `shioaji_order_adapter` | 已連線 API、合約與中立委託 → 券商委託結果 | 建立 SDK 委託並轉換回報；不登入、不監控 |
 | `trading` | 使用者委託／持倉操作 → 持久化委託與狀態 | 全模式共用進出場週期、ATR、設定與執行；注入 API、SDK、時鐘、模式與 worker 開關 |
+| `entry_notify` | 進場成交口數增加後的委託快照 → Telegram 通知紀錄 | 沿用通知總開關，SQLite 依委託及累計口數去重；背景傳送失敗不影響交易；可注入派送器作離線測試，Mock 停用 |
 | `curve_entry` | 已收盤 1m K、1h 曲線錨點、時間 → 是否突破 | 純訊號，不送單；相鄰已收盤 K 由下向上穿越，缺資料或休市間隔不觸發 |
 | `curve_entry_controller` | 確認啟用／取消／市場更新 → 一次進場狀態 | 全模式共用；SQLite 保存等待、檢查基準與送單資格；錯誤不重送 |
 | `mock_market_data` | 固定情境 → DataFrame | 產生可重現的長跌、V 型反彈與回檔，不存 DB |
