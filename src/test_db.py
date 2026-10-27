@@ -47,6 +47,19 @@ def test_schema_is_idempotent(tmp_path):
         connection.close()
 
 
+def test_curve_entry_direction_migrates_existing_rows(tmp_path):
+    connection = db.connect(tmp_path / "legacy.db")
+    legacy_schema = db.SCHEMA.replace("  action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell')),\n", "")
+    connection.executescript(legacy_schema)
+    connection.execute("INSERT INTO curve_entries (code, simulation, curve_id, contract_code, quantity, state, armed_at, check_from) VALUES ('TMFR1', 1, 1, 'TMF209912', 2, 'armed', '2026-10-05 11:00', '2026-10-05 11:00')")
+    db.init_schema(connection)
+    assert connection.execute("SELECT action FROM curve_entries").fetchone()["action"] == "Buy"
+    connection.execute("UPDATE curve_entries SET action = 'Sell'")
+    db.init_schema(connection)
+    assert connection.execute("SELECT action FROM curve_entries").fetchone()["action"] == "Sell"
+    connection.close()
+
+
 def test_migration_adds_the_source_column(conn):
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(box_visits)")}
     assert "source" in columns

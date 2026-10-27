@@ -8,6 +8,9 @@ claims an alert row only outside its cooldown.
 
 from __future__ import annotations
 
+import json
+import os
+
 import pandas as pd
 import pytest
 
@@ -279,6 +282,62 @@ def candidate(rule="support_bottom_third", key="support:1", once=False):
 
 def at(minute):
     return pd.Timestamp(f"2026-10-08 {minute}")
+
+
+@pytest.mark.parametrize("once", [False, True])
+def test_config_pause_does_not_consume_alert_history(conn, config, alerts, monkeypatch, once):
+    config.enable_telegram = True
+    messages = []
+    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    hit = candidate(
+        rule="trendline_break_below_up" if once else "support_bottom_third",
+        key="line:3" if once else "support:1",
+        once=once,
+    )
+    alerts.data["telegram_enabled"] = False
+    assert not monitor.send_rule(conn, config, alerts, hit, at("15:00"))
+    assert db.load_alerts(conn, config.code).empty
+    assert messages == []
+
+    alerts.data["telegram_enabled"] = True
+    assert monitor.send_rule(conn, config, alerts, hit, at("15:01"))
+    assert messages == ["m"]
+    assert len(db.load_alerts(conn, config.code)) == 1
+    assert not monitor.send_rule(conn, config, alerts, hit, at("15:02"))
+    assert messages == ["m"]
+
+
+def test_check_alerts_reloads_master_switch(conn, config, tmp_path, monkeypatch):
+    config.enable_telegram = True
+    path = tmp_path / "alerts.json"
+    path.write_text(json.dumps({"telegram_enabled": True}))
+    alerts = ar.AlertConfig(path)
+    messages = []
+    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    state = make_state(101, 103, 102)
+    db.replace_boxes(conn, config.code, state.boxes)
+
+    path.write_text(json.dumps({"telegram_enabled": False}))
+    os.utime(path, (1, 1))
+    assert monitor.check_alerts(conn, config, alerts, state) == 0
+    assert messages == []
+    assert db.load_alerts(conn, config.code).empty
+
+    path.write_text(json.dumps({"telegram_enabled": True}))
+    os.utime(path, (2, 2))
+    state = make_state(101, 103, 102, minute="2026-10-08 15:01")
+    assert monitor.check_alerts(conn, config, alerts, state) == 1
+    assert len(messages) == 1
+    assert list(db.load_alerts(conn, config.code)["hour_start"]) == ["2026-10-08 15:01:00"]
+
+
+def test_no_telegram_overrides_enabled_config(conn, alerts, monkeypatch):
+    config = monitor.parse_args(["--no-telegram"])
+    messages = []
+    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    assert alerts.telegram_enabled
+    assert not monitor.send_rule(conn, config, alerts, candidate(), at("15:00"))
+    assert messages == []
 
 
 def test_cooldown_suppresses_repeats_for_ten_minutes(conn, config, alerts):

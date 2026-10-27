@@ -154,6 +154,7 @@ def test_config_merges_over_defaults_and_reloads(tmp_path):
     path = tmp_path / "alerts.json"
     path.write_text(json.dumps({"cooldown_minutes": 5, "trendline_near": {"distance_points": 12}}))
     config = ar.AlertConfig(path)
+    assert config.telegram_enabled
     assert config.cooldown_minutes("box_in_out") == 5
     assert config.rule("trendline_near")["distance_points"] == 12
     assert config.rule("trendline_near")["kinds"] == ["curve", "line"]  # default kept
@@ -164,6 +165,31 @@ def test_config_merges_over_defaults_and_reloads(tmp_path):
     assert not config.enabled("box_in_out")
     assert config.cooldown_minutes("box_in_out") == 30
     assert config.cooldown_minutes("trendline_near") == 10
+
+
+def test_telegram_master_switch_reloads(tmp_path):
+    path = tmp_path / "alerts.json"
+    path.write_text(json.dumps({"telegram_enabled": False}))
+    config = ar.AlertConfig(path)
+    assert not config.telegram_enabled
+    assert all(config.enabled(name) for name in ar.RULES)
+
+    path.write_text(json.dumps({"telegram_enabled": True}))
+    os.utime(path, (1, 1))
+    assert config.reload()
+    assert config.telegram_enabled
+
+
+@pytest.mark.parametrize("value", ["false", "true", None, 0, 1, {}, []])
+def test_invalid_master_switch_keeps_last_good_config(tmp_path, value):
+    path = tmp_path / "alerts.json"
+    path.write_text(json.dumps({"telegram_enabled": False}))
+    config = ar.AlertConfig(path)
+    path.write_text(json.dumps({"telegram_enabled": value}))
+    os.utime(path, (1, 1))
+    assert not config.reload()
+    assert "telegram_enabled must be a JSON boolean" in config.last_error
+    assert not config.telegram_enabled
 
 
 def test_bad_json_keeps_the_last_good_config(tmp_path):
@@ -180,5 +206,6 @@ def test_bad_json_keeps_the_last_good_config(tmp_path):
 def test_shipped_config_parses():
     config = ar.AlertConfig(ar.DEFAULT_CONFIG_PATH)
     assert config.last_error is None
+    assert config.telegram_enabled
     assert all(config.enabled(name) for name in ar.RULES)
     assert config.cooldown_minutes("support_bottom_third") == 10

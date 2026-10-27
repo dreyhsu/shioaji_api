@@ -545,6 +545,7 @@ class ContractSubscriptionIn(BaseModel):
 
 
 class CurveEntryIn(BaseModel):
+    action: Literal["Buy", "Sell"] = "Buy"
     curve_id: int = Field(gt=0, strict=True)
     contract_code: str = Field(min_length=1, max_length=24)
     quantity: int = Field(default=1, ge=1, le=100, strict=True)

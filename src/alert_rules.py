@@ -53,6 +53,7 @@ RULES = (
 ONCE_RULES = ("trendline_break_below_up", "trendline_break_above_down")
 
 DEFAULTS: dict[str, Any] = {
+    "telegram_enabled": True,
     "cooldown_minutes": 10,
     "support_bottom_third": {"enabled": True, "zone_max": 1 / 3},
     "resistance_top_third": {"enabled": True, "zone_min": 2 / 3},
@@ -81,6 +82,8 @@ def merge_config(user: dict | None) -> dict:
             merged[key].update(value)
         else:
             merged[key] = value
+    if not isinstance(merged["telegram_enabled"], bool):
+        raise ValueError("telegram_enabled must be a JSON boolean (true or false)")
     return merged
 
 
@@ -118,6 +121,10 @@ class AlertConfig:
         except (OSError, ValueError) as error:
             self.last_error = f"{self.path}: {error}; keeping previous config"
             return False
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return self.data["telegram_enabled"]
 
     def rule(self, name: str) -> dict:
         return self.data.get(name) or {}

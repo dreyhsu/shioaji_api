@@ -11,7 +11,7 @@ import pandas as pd
 
 import db
 import trendline as tl
-from curve_entry import crossed_above_curve
+from curve_entry import crossed_curve
 from place_order import OrderRequest, validate_request
 
 
@@ -43,10 +43,10 @@ class CurveEntryController:
                          (*values.values(), entry_id))
             conn.commit()
 
-    def arm(self, curve_id, contract_code, quantity, *, simulation, confirmed):
+    def arm(self, curve_id, contract_code, quantity, *, simulation, confirmed, action="Buy"):
         service = self.service
         with service._lock:
-            validate_request(OrderRequest(contract_code, "Buy", quantity, price_type="MKT", order_type="IOC",
+            validate_request(OrderRequest(contract_code, action, quantity, price_type="MKT", order_type="IOC",
                                           simulation=simulation, confirmed=confirmed), service.simulation)
             if not service.auto_entry_enabled():
                 raise ValueError("自動進場已停用，請檢查 config/trading.json")
@@ -66,9 +66,9 @@ class CurveEntryController:
             try:
                 with db.session(service.db_path) as conn:
                     conn.execute(
-                        "INSERT INTO curve_entries (code, simulation, curve_id, contract_code, quantity, "
-                        "state, armed_at, check_from) VALUES (?, ?, ?, ?, ?, 'armed', ?, ?)",
-                        (service.code, int(simulation), curve_id, contract_code, quantity,
+                        "INSERT INTO curve_entries (code, simulation, curve_id, contract_code, quantity, action, "
+                        "state, armed_at, check_from) VALUES (?, ?, ?, ?, ?, ?, 'armed', ?, ?)",
+                        (service.code, int(simulation), curve_id, contract_code, quantity, action,
                          now.isoformat(sep=" "), now.ceil("min").isoformat(sep=" ")),
                     )
                     conn.commit()
@@ -124,7 +124,7 @@ class CurveEntryController:
         if not quote or not -5 <= (now - quote["at"]).total_seconds() <= 10:
             return
         self._update(entry["id"], last_checked_minute=latest.isoformat(sep=" "))
-        if not crossed_above_curve(closed, curve["anchors"], now):
+        if not crossed_curve(closed, curve["anchors"], now, entry["action"]):
             return
         with db.session(service.db_path) as conn:
             claimed = conn.execute("UPDATE curve_entries SET state = 'submitting' WHERE id = ? AND state = 'armed'",
@@ -134,7 +134,7 @@ class CurveEntryController:
             return
         try:
             result = service.place_order({
-                "contract_code": entry["contract_code"], "action": "Buy", "quantity": entry["quantity"],
+                "contract_code": entry["contract_code"], "action": entry["action"], "quantity": entry["quantity"],
                 "price_type": "MKT", "order_type": "IOC", "price": 0, "confirmed": True,
                 "simulation": entry["simulation"],
             })

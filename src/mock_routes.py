@@ -42,6 +42,7 @@ def control(body: ReplayControl, request: Request):
 
 
 class CurveEntryIn(BaseModel):
+    action: Literal["Buy", "Sell"] = "Buy"
     curve_id: int = Field(gt=0)
     contract_code: str = Field(min_length=1)
     quantity: int = Field(default=1, strict=True, ge=1, le=100)
@@ -52,9 +53,9 @@ class CurveEntryIn(BaseModel):
 def arm_curve(body: CurveEntryIn, request: Request):
     runtime = runtime_for(request)
     if not body.confirmed:
-        raise HTTPException(status_code=422, detail="啟用曲線自動買入前必須確認")
+        raise HTTPException(status_code=422, detail="啟用曲線自動進場前必須確認")
     try:
-        return runtime.arm_entry(body.curve_id, body.contract_code, body.quantity)
+        return runtime.arm_entry(body.curve_id, body.contract_code, body.quantity, action=body.action)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 

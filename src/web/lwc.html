@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=shared-trading-1">
+  <link rel="stylesheet" href="/static/style.css?v=curve-tabs-2">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -37,19 +37,6 @@
     <div id="mock-message" class="trade-message" role="status"></div>
   </section>
 
-  <section class="mock-panel" aria-label="曲線突破自動進場">
-    <h2>曲線突破自動進場</h2>
-    <p>使用下單區選定的月份合約。已收盤 1 分 K 由曲線下方向上突破後，市價買入一次；成交後依進場 ATR 設定 ±2 ATR。進場曲線不會自動套用為出場曲線。</p>
-    <div class="mock-controls">
-      <label>突破買入曲線 <select id="entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select></label>
-      <label>口數 <input id="entry-quantity" type="number" min="1" max="100" step="1" value="1"></label>
-      <button id="entry-arm" type="button" disabled>啟用一次突破買入</button>
-      <button id="entry-cancel" type="button" disabled>取消等待買入</button>
-    </div>
-    <div id="entry-state" role="status">尚未啟用曲線買入</div>
-    <div id="entry-message" class="trade-message" role="status"></div>
-  </section>
-
   <dialog id="trade-confirm" aria-labelledby="trade-confirm-title">
     <form method="dialog">
       <h2 id="trade-confirm-title">交易操作確認</h2>
@@ -70,43 +57,70 @@
       <label class="trade-field">商品月份
         <select id="trade-contract" disabled><option value="">載入合約中…</option></select>
       </label>
-      <div class="trade-field">
-        <span>方向</span>
-        <div class="trade-toggle">
-          <button type="button" data-action="Buy" class="active">買進 / 多單</button>
-          <button type="button" data-action="Sell">賣出 / 空單</button>
+      <div id="entry-state" class="trade-entry-state" role="status">尚未啟用曲線進場</div>
+      <div class="trade-tabs" role="tablist" aria-label="下單方式">
+        <button id="manual-tab" type="button" role="tab" aria-selected="true" aria-controls="manual-panel" tabindex="0">手動下單</button>
+        <button id="curve-tab" type="button" role="tab" aria-selected="false" aria-controls="curve-panel" tabindex="-1">曲線突破</button>
+      </div>
+      <div id="manual-panel" role="tabpanel" aria-labelledby="manual-tab">
+        <div class="trade-field">
+          <span>方向</span>
+          <div id="manual-direction" class="trade-toggle">
+            <button type="button" data-action="Buy" class="active">買進 / 多單</button>
+            <button type="button" data-action="Sell">賣出 / 空單</button>
+          </div>
         </div>
+        <div class="trade-row">
+          <label class="trade-field">價格類別
+            <select id="trade-price-type">
+              <option value="LMT">限價</option>
+              <option value="MKT">市價</option>
+              <option value="MKP">範圍市價</option>
+            </select>
+          </label>
+          <label class="trade-field">委託條件
+            <select id="trade-order-type">
+              <option value="ROD">ROD</option>
+              <option value="IOC">IOC</option>
+              <option value="FOK">FOK</option>
+            </select>
+          </label>
+        </div>
+        <div class="trade-row">
+          <label class="trade-field">限價
+            <input id="trade-price" type="number" min="0" step="1" inputmode="decimal" placeholder="輸入價格">
+          </label>
+          <label class="trade-field">口數
+            <input id="trade-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+          </label>
+        </div>
+        <div class="trade-field">停利方式
+          <select id="trade-curve"><option value="">固定 +2 ATR</option></select>
+        </div>
+        <div id="trade-preview" class="trade-preview">選擇商品並輸入價格以預覽停損停利</div>
+        <button type="button" id="trade-submit" class="trade-submit" disabled>確認下單</button>
+        <div id="trade-message" class="trade-message" role="status"></div>
       </div>
-      <div class="trade-row">
-        <label class="trade-field">價格類別
-          <select id="trade-price-type">
-            <option value="LMT">限價</option>
-            <option value="MKT">市價</option>
-            <option value="MKP">範圍市價</option>
-          </select>
+      <div id="curve-panel" role="tabpanel" aria-labelledby="curve-tab" hidden>
+        <p class="trade-muted entry-help">保存 1h 曲線後，等待相鄰已收盤 1 分 K 穿越曲線，僅進場一次。進場曲線不會自動套用為停利曲線。啟用後若要變更設定，請先取消再重新啟用。</p>
+        <label class="trade-field">進場曲線
+          <select id="entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select>
         </label>
-        <label class="trade-field">委託條件
-          <select id="trade-order-type">
-            <option value="ROD">ROD</option>
-            <option value="IOC">IOC</option>
-            <option value="FOK">FOK</option>
-          </select>
-        </label>
-      </div>
-      <div class="trade-row">
-        <label class="trade-field">限價
-          <input id="trade-price" type="number" min="0" step="1" inputmode="decimal" placeholder="輸入價格">
-        </label>
+        <div class="trade-field">
+          <span>突破方向</span>
+          <div id="entry-direction" class="trade-toggle">
+            <button type="button" data-action="Buy" class="active" aria-pressed="true">向上突破做多</button>
+            <button type="button" data-action="Sell" aria-pressed="false">向下突破做空</button>
+          </div>
+        </div>
         <label class="trade-field">口數
-          <input id="trade-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+          <input id="entry-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
         </label>
+        <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損、停利固定各 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。</div>
+        <button id="entry-arm" class="trade-submit" type="button" disabled>啟用一次突破做多</button>
+        <button id="entry-cancel" class="entry-cancel" type="button" disabled>取消等待進場</button>
+        <div id="entry-message" class="trade-message" role="status"></div>
       </div>
-      <div class="trade-field">停利方式
-        <select id="trade-curve"><option value="">固定 +2 ATR</option></select>
-      </div>
-      <div id="trade-preview" class="trade-preview">選擇商品並輸入價格以預覽停損停利</div>
-      <button type="button" id="trade-submit" class="trade-submit" disabled>確認下單</button>
-      <div id="trade-message" class="trade-message" role="status"></div>
     </article>
 
     <article class="trade-card trade-account">
@@ -176,8 +190,8 @@
 
   <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
-  <script src="/static/lwc_app.js?v=shared-trading-1"></script>
-  <script src="/static/trading.js?v=shared-trading-1"></script>
-  <script src="/static/mock_replay.js?v=shared-trading-1"></script>
+  <script src="/static/lwc_app.js?v=curve-tabs-2"></script>
+  <script src="/static/trading.js?v=curve-tabs-2"></script>
+  <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

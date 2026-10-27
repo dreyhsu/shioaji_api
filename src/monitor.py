@@ -253,7 +253,10 @@ def send_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar
 
     Both checks read the alert rows back, measured on the triggering minute
     rather than the wall clock, so a restart or a replay throttles the same way.
+    The config master switch pauses alerts without claiming their history.
     """
+    if not alerts.telegram_enabled:
+        return False
     last = db.last_alert_at(conn, config.code, candidate.key, candidate.rule)
     if last is not None:
         if candidate.once:
@@ -289,6 +292,8 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
         log(f"  alert config loaded from {alerts.path}")
     if alerts.last_error:
         log(f"  WARNING alert config: {alerts.last_error}")
+    if not alerts.telegram_enabled:
+        return 0
     minute = state.latest_minute
     if minute is None:
         return 0
@@ -576,7 +581,10 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
             "0 ends it the instant the bar clears the edge, which flaps"
         ),
     )
-    parser.add_argument("--no-telegram", action="store_true")
+    parser.add_argument(
+        "--no-telegram", action="store_true",
+        help="disable Telegram sending regardless of telegram_enabled in the alerts config",
+    )
     parser.add_argument("--no-orderbook", action="store_true")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument("--min-range-atr", type=float, default=pt.PatternConfig.min_range_atr)

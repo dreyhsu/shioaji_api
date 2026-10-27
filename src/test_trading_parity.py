@@ -99,11 +99,56 @@ def save_curve(driver, price):
     return response.json()["id"]
 
 
-def arm(driver, curve):
+def arm(driver, curve, action=None, quantity=1):
     return driver.client.post("/api/trading/curve-entry", json={
-        "curve_id": curve, "contract_code": driver.broker.contract.symbol, "quantity": 1,
+        "curve_id": curve, "contract_code": driver.broker.contract.symbol, "quantity": quantity,
         "confirmed": True, "simulation": driver.simulation,
+        **({"action": action} if action is not None else {}),
     })
+
+
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+@pytest.mark.parametrize("exit_reason", ["stop", "target"])
+def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason):
+    driver = market()
+    curve = save_curve(driver, driver.broker.price - 20)
+    response = arm(driver, curve, action, quantity=3)
+    assert response.status_code == 200, response.text
+    assert response.json()["action"] == action and response.json()["quantity"] == 3
+    assert not driver.broker.trades
+    for _ in range(150):
+        driver.step()
+        if driver.broker.trades:
+            break
+    entry = driver.client.get("/api/trading/curve-entry").json()["entry"]
+    assert entry["state"] == "triggered" and entry["action"] == action
+    order = driver.client.get("/api/trading/orders").json()[0]
+    sign = 1 if action == "Buy" else -1
+    assert order["action"] == action and order["quantity"] == order["filled_quantity"] == 3
+    assert driver.broker.position == sign * 3
+    assert order["price_type"] == "MKT" and order["order_type"] == "IOC"
+    assert order["curve_id"] is None
+    assert order["stop_price"] == pytest.approx(order["avg_fill_price"] - sign * 2 * order["atr"])
+    assert order["target_price"] == pytest.approx(order["avg_fill_price"] + sign * 2 * order["atr"])
+    for _ in range(3):
+        driver.service.process_market_update()
+    assert len(driver.broker.trades) == 1
+    driver.broker.publish(order["stop_price"] if exit_reason == "stop" else order["target_price"])
+    driver.service.process_market_update()
+    closed = driver.client.get("/api/trading/orders").json()[0]
+    assert closed["trigger_reason"] == exit_reason and closed["exit_status"] == "Filled"
+    assert driver.broker.position == 0 and len(driver.broker.trades) == 2
+
+
+@pytest.mark.parametrize("changes", [{"action": "Short"}, {"action": None}, {"quantity": 0}, {"quantity": 101}, {"quantity": True}, {"quantity": 1.5}])
+def test_curve_entry_api_rejects_invalid_direction_or_quantity(market, changes):
+    driver = market()
+    response = driver.client.post("/api/trading/curve-entry", json={
+        "curve_id": 1, "contract_code": driver.broker.contract.symbol,
+        "simulation": driver.simulation, "confirmed": True, **changes,
+    })
+    assert response.status_code == 422
+    assert driver.service.curve_entry.snapshot() is None and not driver.broker.trades
 
 
 def buy(driver):
@@ -195,10 +240,11 @@ def test_shared_exit_switch_is_not_overridden_by_mock(market):
     assert driver.broker.position == 0 and len(driver.broker.trades) == 2
 
 
-def test_uncertain_entry_and_restart_do_not_resubmit(market, monkeypatch):
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+def test_uncertain_entry_and_restart_do_not_resubmit(market, monkeypatch, action):
     driver = market()
     curve = save_curve(driver, driver.broker.price - 20)
-    assert arm(driver, curve).status_code == 200
+    assert arm(driver, curve, action).status_code == 200
     submit = Mock(side_effect=TimeoutError("uncertain"))
     monkeypatch.setattr(driver.service, "place_order", submit)
     driver.step(90)
@@ -215,13 +261,14 @@ def test_uncertain_entry_and_restart_do_not_resubmit(market, monkeypatch):
         other.close()
 
 
-def test_cancel_or_delete_prevents_entry(market):
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+def test_cancel_or_delete_prevents_entry(market, action):
     driver = market()
     curve = save_curve(driver, driver.broker.price - 20)
-    assert arm(driver, curve).status_code == 200
+    assert arm(driver, curve, action).status_code == 200
     response = driver.client.delete("/api/trading/curve-entry")
     assert response.json()["entry"]["state"] == "cancelled"
-    assert arm(driver, curve).status_code == 200
+    assert arm(driver, curve, action).status_code == 200
     assert driver.client.delete(f"/api/trendlines/{curve}").status_code == 200
     driver.step(90)
     assert driver.service.curve_entry.snapshot()["state"] == "failed"
@@ -271,10 +318,11 @@ def test_stale_quote_defers_a_valid_crossing_until_fresh_quote(market):
     assert len(driver.broker.trades) == driver.broker.position == 1
 
 
-def test_claim_survives_restart_and_two_monitors_cannot_submit_twice(market):
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+def test_claim_survives_restart_and_two_monitors_cannot_submit_twice(market, action):
     driver = market()
     curve = save_curve(driver, driver.broker.price - 20)
-    assert arm(driver, curve).status_code == 200
+    assert arm(driver, curve, action).status_code == 200
     entry_id = driver.service.curve_entry.snapshot()["id"]
     with db.session(driver.path) as conn:
         conn.execute("UPDATE curve_entries SET state = 'submitting' WHERE id = ?", (entry_id,))
@@ -283,6 +331,7 @@ def test_claim_survives_restart_and_two_monitors_cannot_submit_twice(market):
                            api_factory=lambda _: driver.broker, sdk=driver.broker.sdk, clock=driver.now, start_worker=False)
     try:
         other.ensure_connected()
+        assert other.curve_entry.snapshot()["action"] == action
         other.process_market_update()
         driver.step(90)
         other.process_market_update()

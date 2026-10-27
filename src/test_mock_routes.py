@@ -41,12 +41,21 @@ def test_pause_step_reset_contracts(endpoint):
     runtime.reset.assert_called_once()
 
 
-@pytest.mark.parametrize("changes", [{"confirmed": False}, {"confirmed": "true"}, {"quantity": 0}, {"quantity": True}, {"curve_id": 0}])
+@pytest.mark.parametrize("changes", [{"confirmed": False}, {"confirmed": "true"}, {"quantity": 0}, {"quantity": True}, {"curve_id": 0}, {"action": "Short"}])
 def test_invalid_arm_cannot_submit(endpoint, changes):
     runtime, client = endpoint
     body = {"curve_id": 1, "contract_code": "TMF209912", "quantity": 1, "confirmed": True} | changes
     assert client.post("/api/mock/curve-entry", json=body).status_code == 422
     runtime.arm_entry.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["Buy", "Sell"])
+def test_arm_delegates_direction_and_quantity(endpoint, action):
+    runtime, client = endpoint
+    assert client.post("/api/mock/curve-entry", json={
+        "curve_id": 1, "contract_code": "TMF209912", "quantity": 3, "confirmed": True, "action": action,
+    }).status_code == 200
+    runtime.arm_entry.assert_called_once_with(1, "TMF209912", 3, action=action)
 
 
 def test_arm_errors_are_reported_and_cancel_delegates(endpoint):

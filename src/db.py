@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS curve_entries (
   curve_id INTEGER NOT NULL,
   contract_code TEXT NOT NULL,
   quantity INTEGER NOT NULL,
+  action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell')),
   state TEXT NOT NULL,
   armed_at TEXT NOT NULL,
   check_from TEXT NOT NULL,
@@ -238,6 +239,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # Columns added after the first release.  sqlite has no "ADD COLUMN IF NOT
 # EXISTS", so each one is applied only when missing.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("curve_entries", "action", "ALTER TABLE curve_entries ADD COLUMN action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell'))"),
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
     ("managed_orders", "curve_check_from", "ALTER TABLE managed_orders ADD COLUMN curve_check_from TEXT"),

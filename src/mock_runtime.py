@@ -88,11 +88,11 @@ class MockRuntime:
                 self.playing = False
             return self.snapshot()
 
-    def arm_entry(self, curve_id, contract_code, quantity):
+    def arm_entry(self, curve_id, contract_code, quantity, *, action="Buy"):
         with self.lock:
             if self.cursor == len(self.bars):
                 raise ValueError("行情已播完，請重設情境")
-            return self.service.curve_entry.arm(curve_id, contract_code, quantity, simulation=True, confirmed=True)
+            return self.service.curve_entry.arm(curve_id, contract_code, quantity, simulation=True, confirmed=True, action=action)
 
     def cancel_entry(self):
         with self.lock:

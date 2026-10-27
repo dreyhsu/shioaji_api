@@ -94,6 +94,7 @@
     for (const line of lines) entrySelect.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
     if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
     renderPreview();
+    renderEntry();
     renderOrders();
   }
 
@@ -118,7 +119,11 @@
   }
 
   function currentAction() {
-    return document.querySelector('.trade-toggle button.active')?.dataset.action || 'Buy';
+    return $('manual-direction').querySelector('button.active')?.dataset.action || 'Buy';
+  }
+
+  function entryAction() {
+    return $('entry-direction').querySelector('button.active')?.dataset.action || 'Buy';
   }
 
   function renderPreview() {
@@ -332,11 +337,16 @@
 
   function renderEntry() {
     const entry = entrySnapshot;
-    const labels = { armed: '等待向上突破', submitting: '送單中，請勿重複送單', triggered: '已觸發買入', failed: '已停止，請核對委託狀態', cancelled: '已取消' };
+    const side = entry?.action === 'Sell' ? '向下突破做空' : '向上突破做多';
+    const labels = { armed: '等待' + side, submitting: '送單中，請勿重複送單', triggered: '已觸發' + (entry?.action === 'Sell' ? '做空' : '做多'), failed: '已停止，請核對委託狀態', cancelled: '已取消' };
     $('entry-state').textContent = entry
-      ? `曲線 #${entry.curve_id}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
-      : entryEnabled ? '尚未啟用曲線買入' : '自動進場：停用，請檢查 config/trading.json';
+      ? `${entry.contract_code} · 曲線 #${entry.curve_id} · ${entry.quantity} 口 · ${side}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
+      : entryEnabled ? '尚未啟用曲線進場' : '自動進場：停用，請檢查 config/trading.json';
+    const quantity = Number($('entry-quantity').value);
+    const validCurve = state.curves.some((curve) => String(curve.id) === $('entry-curve').value);
+    $('entry-arm').textContent = '啟用一次突破' + (entryAction() === 'Sell' ? '做空' : '做多');
     $('entry-arm').disabled = entryBusy || !state.connected || !entryEnabled || !selectedContract()
+      || !validCurve || !Number.isInteger(quantity) || quantity < 1 || quantity > 100
       || !(Number(state.atr) > 0) || ['armed', 'submitting'].includes(entry?.state);
     $('entry-cancel').disabled = entryBusy || entry?.state !== 'armed';
   }
@@ -347,13 +357,15 @@
     const quantity = Number($('entry-quantity').value);
     const contract = selectedContract();
     const simulation = state.simulation;
+    const action = entryAction();
     if (!cancel) {
       if (!curveId || !contract || !Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
         $('entry-message').textContent = '請先保存曲線、選擇合約，並輸入 1 到 100 的整數口數。';
         return;
       }
       const mode = state.mock ? '離線 Mock' : simulation ? '券商 Simulation' : '正式交易';
-      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n啟用曲線 #${curveId} 向上突破後市價買入 ${quantity} 口？\n僅觸發一次，成交後設定 ±2 ATR。`)) return;
+      const side = action === 'Sell' ? '向下突破做空（賣出）' : '向上突破做多（買進）';
+      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n曲線：#${curveId}\n方向：${side}\n口數：${quantity}\n委託：市價 MKT / IOC\n僅觸發一次，依成交均價設定停損、停利各 2 倍進場 1h ATR。\n確認啟用？`)) return;
     }
     entryBusy = true;
     renderEntry();
@@ -361,11 +373,11 @@
       const response = await fetch('/api/trading/curve-entry', {
         method: cancel ? 'DELETE' : 'POST', headers: { 'Content-Type': 'application/json' },
         ...(cancel ? {} : { body: JSON.stringify({ curve_id: curveId, contract_code: contract.code,
-          quantity, simulation, confirmed: true }) }),
+          action, quantity, simulation, confirmed: true }) }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '請檢查輸入欄位');
-      $('entry-message').textContent = cancel ? '已取消等待買入。' : '已啟用一次突破買入。';
+      $('entry-message').textContent = cancel ? '已取消等待進場。' : `已啟用一次突破${action === 'Sell' ? '做空' : '做多'}。`;
       await refreshTrading();
     } catch (error) {
       $('entry-message').textContent = error.message;
@@ -436,14 +448,48 @@
   }
 
   $('trade-price-type').addEventListener('change', renderPreview);
-  $('trade-contract').addEventListener('change', () => { subscribeSelectedContract(); renderPreview(); });
+  $('trade-contract').addEventListener('change', () => { subscribeSelectedContract(); renderPreview(); renderEntry(); });
   $('trade-price').addEventListener('input', renderPreview);
   $('trade-quantity').addEventListener('input', renderPreview);
   $('trade-curve').addEventListener('change', renderPreview);
-  document.querySelectorAll('[data-action]').forEach((button) => button.addEventListener('click', () => {
-    document.querySelectorAll('[data-action]').forEach((item) => item.classList.toggle('active', item === button));
-    renderPreview();
-  }));
+  for (const id of ['manual-direction', 'entry-direction']) {
+    const buttons = $(id).querySelectorAll('[data-action]');
+    buttons.forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.classList.contains('active')));
+      button.addEventListener('click', () => {
+        buttons.forEach((item) => {
+          item.classList.toggle('active', item === button);
+          item.setAttribute('aria-pressed', String(item === button));
+        });
+        id === 'manual-direction' ? renderPreview() : renderEntry();
+      });
+    });
+  }
+  const tabs = Array.from(document.querySelectorAll('.trade-tabs [role="tab"]'));
+  function selectTab(tab) {
+    tabs.forEach((item) => {
+      const selected = item === tab;
+      item.setAttribute('aria-selected', String(selected));
+      item.tabIndex = selected ? 0 : -1;
+      $(item.getAttribute('aria-controls')).hidden = !selected;
+    });
+  }
+  tabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', (event) => {
+      let next;
+      if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+      else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      selectTab(tabs[next]);
+      tabs[next].focus();
+    });
+  });
+  $('entry-curve').addEventListener('change', renderEntry);
+  $('entry-quantity').addEventListener('input', renderEntry);
   $('trade-submit').addEventListener('click', submitOrder);
   $('margin-refresh').addEventListener('click', loadAccountMargin);
   $('entry-arm').addEventListener('click', () => controlEntry());

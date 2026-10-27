@@ -80,6 +80,15 @@ body {
 .trade-field input, .trade-field select { width: 100%; min-width: 0; color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 14px; }
 .trade-field select:disabled, .trade-field input:disabled { opacity: .55; }
 .trade-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.trade-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
+.trade-tabs button, .entry-cancel { cursor: pointer; font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); border-radius: 6px; padding: 8px; }
+.trade-tabs button[aria-selected="true"] { color: var(--text); border-color: #d5ad3a; background: rgba(245,197,66,.12); }
+.trade-tabs button:focus-visible, .trade-toggle button:focus-visible { outline: 2px solid #f5c542; outline-offset: 2px; }
+.trade-entry [role="tabpanel"][hidden] { display: none; }
+.trade-entry-state { margin-top: 10px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; line-height: 1.6; }
+.entry-help { line-height: 1.6; }
+.entry-cancel { width: 100%; margin-top: 8px; }
+.entry-cancel:disabled { opacity: .45; cursor: default; }
 .trade-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .trade-toggle button, #margin-refresh { cursor: pointer; font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); border-radius: 6px; padding: 7px 9px; }
 .trade-toggle button.active[data-action="Buy"] { background: rgba(32,202,38,.16); color: var(--support); border-color: rgba(32,202,38,.45); }
