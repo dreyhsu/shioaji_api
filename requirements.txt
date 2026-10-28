@@ -1,0 +1,9 @@
+# Complete runtime baseline for a NEW tss environment on macOS or Windows.
+# This includes the broker SDK; use requirements-dashboard.txt to add only the UI stack.
+-r requirements-dashboard.txt
+shioaji==1.7.7
+numpy==2.2.6
+pandas==2.3.3
+plotly==6.5.2
+python-dotenv==1.2.1
+requests==2.32.5

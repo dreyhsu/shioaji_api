@@ -10,6 +10,8 @@ Telegram 通知，並偵測箱體內的小時 K 棒反轉型態。
 健康狀態的程序鎖依平台使用標準函式庫，不需安裝 `fcntl`。常駐服務的 Windows 工作排程器與
 macOS launchd 操作方式見[行情故障恢復操作手冊](doc/market_connection_recovery.md)。
 
+首次使用請先依[環境安裝說明](#環境)建立 `tss` 並安裝依賴；同名 conda 環境不代表套件已齊全。
+
 ## 離線 Mock API：V 型行情測試
 
 ```bash
@@ -516,7 +518,86 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 
 ## 環境
 
-conda env `tss`，Python 3.10。Mock、測試監看與 Git hook 不需安裝新套件（sqlite3 是 stdlib）。
+macOS 與 Windows 都使用 conda env `tss`，以 Python 3.10 驗證。先在專案根目錄確認實際執行環境：
+
+```sh
+conda run -n tss python --version
+conda run -n tss python -m pip --version
+```
+
+**Python 低於 3.10（例如 3.8.5）時，先升級或依下方 Windows 流程重建環境，不能直接安裝本專案的版本清單。**
+
+若 Python 已為 3.10 以上，而啟動 Dashboard 出現 `ModuleNotFoundError: No module named 'fastapi'`，在**既有** `tss` 補上 Dashboard 套件：
+
+```sh
+conda run -n tss python -m pip install -r requirements-dashboard.txt
+conda run -n tss python src/dashboard.py --help
+```
+
+清單包含已驗證版本的 FastAPI、Uvicorn 與 Pydantic 2；專案使用 `field_validator` 等 Pydantic 2 介面，不能只安裝舊版 Pydantic。這份補裝清單不指定或主動更換 Shioaji SDK。`--help` 可檢查匯入及啟動參數，不登入券商、不啟動伺服器。
+
+Python 需至少 3.10；若現有 `tss` 太舊，先安排環境升級。**全新環境**的完整安裝方式為：
+
+```sh
+conda create -n tss python=3.10 pip
+conda run -n tss python -m pip install -r requirements.txt
+conda run -n tss python src/dashboard.py --help
+```
+
+`requirements.txt` 包含行情、券商 SDK、圖表與 Dashboard 的完整直接依賴，版本以本機通過測試的 `tss` 為基準；它不是所有間接依賴的完整 lockfile。既有正式環境要採用這份完整基準時，也包含 SDK 版本變更，須另行完成相容性驗證。不要用未指定環境的 `pip`，以免套件被裝到其他 Python。
+
+### Windows：刪除 Python 3.8 的 tss，以 Miniforge 重建 Python 3.10
+
+`requirement_windows.txt` 是 Windows x86-64／Python 3.10 的完整執行依賴，包含券商 SDK 與 Dashboard；版本與專案已測試的基準一致，尚未在 Windows 原生主機完成正式驗收。
+
+先關閉使用舊 `tss` 的 monitor、Dashboard、watchdog、Python 終端及排程工作，再於**原本的 Conda／Anaconda Prompt**確認並刪除舊環境。下列刪除步驟會移除 `tss` 裡的 Python 與套件；不會刪除專案目錄中的 `.env` 或 `data`。
+
+```bat
+conda env list
+conda deactivate
+conda env remove -n tss -y
+conda env list
+```
+
+刪除前確認 `env list` 中的 `tss` 是要移除的 Python 3.8 環境。若還顯示 `(tss)`，先再次 `conda deactivate`，再進行刪除；移除失敗時先處理錯誤，不繼續混用新舊環境。
+
+從 [Miniforge 官方 Windows 安裝程式](https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe) 安裝 Miniforge3（已安裝可略過）。安裝完成後關閉舊終端，從開始功能表開啟 **Miniforge Prompt**；使用這個新視窗建立環境，避免繼續使用舊 Anaconda 的 `conda`。
+
+```bat
+conda info --base
+conda create -n tss --override-channels -c conda-forge python=3.10 pip -y
+conda activate tss
+python --version
+where python
+```
+
+`conda info --base` 應指向此次 Miniforge 安裝目錄；`python --version` 應顯示 `3.10.x`，`where python` 第一個結果應為新 `tss` 的 Python。若仍顯示 `3.8.5`，先修正視窗／環境選擇，不要繼續安裝套件。
+
+切換至專案目錄，安裝並驗證依賴：
+
+```bat
+cd /d C:\Users\Drey\Documents\Python_Scripts\shioaji_api
+python -m pip install -r requirement_windows.txt
+python -m pip check
+python src/dashboard.py --help
+```
+
+依賴與匯入檢查都成功後，再執行原本的正式啟動命令：
+
+```bat
+conda run --no-capture-output -n tss python src/dashboard.py --code TMFR1 --port 8765
+```
+
+若原先 Windows 工作排程器／IDE 指向舊環境的 Python 絕對路徑，也需依 `where python` 更新為新 Miniforge `tss` 的路徑。
+
+需要執行離線測試或測試監看時，額外安裝測試依賴：
+
+```sh
+conda run -n tss python -m pip install -r requirements-dev.txt
+conda run -n tss python -m pytest -q
+```
+
+`sqlite3`、Windows 的 `msvcrt` 與 macOS 的 `fcntl` 都是標準函式庫，不另用 pip 安裝。
 
 前端沒有 node／npm／打包步驟，JS 一律用 `<script>` 直接載入本地檔案：
 

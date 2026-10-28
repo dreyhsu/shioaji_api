@@ -1,0 +1,12 @@
+# Windows x86-64 / CPython 3.10 / fresh Miniforge environment named tss.
+# Complete runtime dependencies; versions match the tested project baseline.
+# Install: python -m pip install -r requirement_windows.txt
+fastapi==0.128.0
+uvicorn==0.40.0
+pydantic==2.12.5
+shioaji==1.7.7
+numpy==2.2.6
+pandas==2.3.3
+plotly==6.5.2
+python-dotenv==1.2.1
+requests==2.32.5
