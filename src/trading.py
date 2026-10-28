@@ -1079,8 +1079,12 @@ class TradingService:
             raise ValueError("進場委託已結束；若已有成交部位，請使用平倉功能")
 
         api = self.ensure_connected()
-        trades = self._trades_by_id()
-        trade = trades.get(str(row["entry_trade_id"]))
+        # Use the SDK's existing trade object first. A synchronous status query
+        # can wait up to 30 seconds before the cancellation is even submitted.
+        trade = next((item for item in api.list_trades()
+                      if str(_trade_id(item)) == str(row["entry_trade_id"])), None)
+        if trade is None:
+            trade = self._trades_by_id().get(str(row["entry_trade_id"]))
         if trade is None:
             raise RuntimeError("無法取得券商委託狀態，為避免誤取消，請稍後重試")
         with self._lock:

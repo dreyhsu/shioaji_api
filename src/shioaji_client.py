@@ -62,6 +62,19 @@ class DataUnavailable(RuntimeError):
     """A fetch the caller depends on came back empty or failed outright."""
 
 
+def is_session_unavailable(error: BaseException) -> bool:
+    """Recognize session failures even when wrapped by DataUnavailable."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "sessionnotestablished" in message or "notready" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 # --------------------------------------------------------------------------------------
 # Session
 # --------------------------------------------------------------------------------------

@@ -221,6 +221,38 @@ def test_pending_entry_can_be_cancelled(fake_service):
     assert cancelled["active"] == 0
 
 
+def test_cancel_uses_cached_trade_without_waiting_for_status_query(fake_service, monkeypatch):
+    service, api, _ = fake_service
+    result = service.place_order({
+        "confirmed": True, "simulation": True, "contract_code": "TMF202611",
+        "action": "Buy", "quantity": 1, "price": 46270,
+        "price_type": "LMT", "order_type": "ROD",
+    })
+    monkeypatch.setattr(api, "update_status", lambda account: pytest.fail("cancel waited for status query"))
+    cancelled = service.cancel_entry(result["id"])
+    assert api.cancelled == [api.trades[0]]
+    assert cancelled["entry_status"] == "Cancelled"
+
+
+def test_fill_during_cancel_remains_an_active_position(fake_service, monkeypatch):
+    service, api, _ = fake_service
+    result = service.place_order({
+        "confirmed": True, "simulation": True, "contract_code": "TMF202611",
+        "action": "Buy", "quantity": 1, "price": 46270,
+        "price_type": "LMT", "order_type": "ROD",
+    })
+    def fill_before_cancel(trade):
+        trade.status.status = "Filled"
+        trade.status.deal_quantity = 1
+        trade.status.deals = [SimpleNamespace(quantity=1, price=46270)]
+        return trade
+    monkeypatch.setattr(api, "cancel_order", fill_before_cancel)
+    result = service.cancel_entry(result["id"])
+    assert result["entry_status"] == "Filled"
+    assert result["filled_quantity"] == 1
+    assert result["active"] == 1
+
+
 def test_filled_position_can_switch_between_fixed_and_curve_take_profit(fake_service):
     service, api, _modes = fake_service
     result = service.place_order({

@@ -338,7 +338,7 @@
     const filled = Number(order.filled_quantity || 0);
     const remaining = Math.max(0, Number(order.quantity) - filled);
     const action = order.action === 'Buy' ? '買進' : '賣出';
-    const text = `確定取消 ${order.contract_code} ${action}委託？\n已成交 ${filled} 口；將取消尚未成交的 ${remaining} 口。已成交部位會保留並繼續監控停損停利。`;
+    const text = `確定取消 ${order.contract_code} ${action}委託？\n已成交 ${filled} 口；將取消尚未成交的 ${remaining} 口。取消確認前仍可能成交；已成交部位會保留。`;
     if (!await confirmOperation(text)) return;
     button.disabled = true;
     message('正在向券商取消未成交委託…');
@@ -348,9 +348,12 @@
       if (!response.ok) throw new Error(result.detail || '取消委託失敗');
       state.orders = state.orders.map((item) => item.id === result.id ? result : item);
       renderOrders();
-      message(result.entry_status === 'Cancelled'
+      message(result.entry_status === 'Filled'
+        ? `取消未及完成，委託已成交 ${result.filled_quantity} 口；請確認持倉。`
+        : result.entry_status === 'Cancelled'
         ? (Number(result.filled_quantity) ? `未成交餘量已取消；保留 ${result.filled_quantity} 口成交部位。` : '委託已取消。')
         : `取消要求已送出，券商目前狀態：${result.entry_status}`);
+      void loadAccountMargin();
     } catch (error) {
       message(error.message, true);
     } finally {
@@ -416,12 +419,17 @@
   }
 
   function acceptOrders(orders) {
+    const cancellationConfirmed = orders.some((order) => {
+      const current = state.orders.find((item) => item.id === order.id);
+      return current && current.entry_status !== 'Cancelled' && order.entry_status === 'Cancelled';
+    });
     // A response begun before a save must not roll back its newer revision.
     state.orders = orders.map((order) => {
       const current = state.orders.find((item) => item.id === order.id);
       return current && Number(current.risk_revision) > Number(order.risk_revision) ? current : order;
     });
     for (const id of riskDrafts.keys()) if (!orders.some((order) => order.id === id)) riskDrafts.delete(id);
+    if (cancellationConfirmed) void loadAccountMargin();
   }
 
   async function refreshOrders() {
