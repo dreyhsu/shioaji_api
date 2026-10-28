@@ -20,6 +20,18 @@
   let entryBusy = false;
   let entrySnapshot = null;
   let entryEnabled = false;
+  let refreshing = false;
+  let lastTradeStatusAt = 0;
+
+  async function fetchRead(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      return await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   async function confirmOperation(text) {
     const dialog = $('trade-confirm');
@@ -46,6 +58,8 @@
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
+    state.entryReady = info.bars_ready !== false && info.broker_ready !== false;
+    lastTradeStatusAt = Date.now();
     entryEnabled = Boolean(info.auto_entry_enabled);
     entrySnapshot = info.curve_entry || null;
     renderEntry();
@@ -58,16 +72,20 @@
       ? (quoteReady ? `行情連線 · ${number(info.last_quote)} · ${info.last_quote_at || ''}` : '帳戶已連線，等待即時行情 tick')
       : (info.error || '尚未連線');
     connection.className = 'trade-connection ' + (info.connected && quoteReady ? 'ok' : 'bad');
-    $('auto-exit-state').textContent = info.auto_exit_enabled
-      ? (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick')
-      : '自動出場：停用（僅監控提醒）';
+    const protection = info.protection;
+    $('auto-exit-state').textContent = !info.auto_exit_enabled
+      ? '自動出場：停用（僅監控提醒）'
+      : protection
+        ? `固定出場：${protection.fixed_exit ? '監控中' : '受影響'} · 保本：${protection.breakeven ? '監控中' : '受影響'} · 曲線出場：${protection.curve_exit ? '監控中' : '暫停'} · 券商端保護：待核對`
+        : (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick');
+    if (info.reconciliation_error) connection.textContent = info.reconciliation_error;
     state.price = info.last_quote === null ? (state.mock ? null : state.price) : Number(info.last_quote);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
-    $('trade-submit').disabled = !info.connected || !selectedContract() || busy;
+    $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
   }
 
   async function loadContracts() {
-    const response = await fetch('/api/trading/contracts');
+    const response = await fetchRead('/api/trading/contracts');
     if (!response.ok) throw new Error((await response.json()).detail || '合約載入失敗');
     state.contracts = await response.json();
     const select = $('trade-contract');
@@ -81,12 +99,12 @@
     select.disabled = state.contracts.length === 0;
     if (state.contracts.some((item) => item.code === previous)) select.value = previous;
     else if (state.contracts.length) select.selectedIndex = 0;
-    $('trade-submit').disabled = !state.connected || !selectedContract() || busy;
+    $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
     if (selectedContract()) subscribeSelectedContract();
   }
 
   async function loadCurves() {
-    const response = await fetch('/api/trendlines');
+    const response = await fetchRead('/api/trendlines');
     if (!response.ok) return;
     const lines = (await response.json()).filter((line) => line.kind === 'curve');
     state.curves = lines;
@@ -115,7 +133,7 @@
     $('margin-status').textContent = '查詢中…';
     $('margin-status').classList.remove('bad', 'ok');
     try {
-      const response = await fetch('/api/trading/margin');
+      const response = await fetchRead('/api/trading/margin');
       if (!response.ok) throw new Error((await response.json()).detail || '查詢失敗');
       const result = await response.json();
       $('margin-risk').textContent = result.risk_indicator === null ? '—' : number(result.risk_indicator, 1);
@@ -160,7 +178,7 @@
     preview.innerHTML = `基準 ${priceType === 'LMT' ? '委託價' : '最新成交價'} ${number(entry)} · ATR(1h) ${number(atr, 1)}<br>`
       + `停損 <b>${number(stop)}</b> · `
       + (curve ? `移動停利：${escapeHtml($('trade-curve').selectedOptions[0]?.textContent || '已選曲線')}` : `停利 <b>${number(target)}</b>`);
-    $('trade-submit').disabled = !state.connected || !contract || busy;
+    $('trade-submit').disabled = !state.connected || !state.entryReady || !contract || busy;
   }
 
   function escapeHtml(text) {
@@ -172,6 +190,12 @@
   function orderStatus(order) {
     if (cancellingOrders.has(order.id)) return `取消處理中 · 券商狀態：${order.entry_status}`;
     if (order.error) return order.error;
+    if (order.entry_status === 'unknown' || order.entry_status === 'submitting') return '進場結果待核對，禁止自動重送';
+    if (order.active && Number(order.filled_quantity) > Number(order.exit_filled_quantity) && order.protection) {
+      if (!order.protection.broker_ready) return '券商委託／部位待核對 · 自動送單暫停';
+      if (!order.protection.tick_fresh) return '此合約 tick 過期 · 本機自動保護受影響';
+      if (order.curve_id && !order.protection.curve_exit) return '曲線停利暫停 · 固定停損依設定監控';
+    }
     if (order.entry_status === 'CancelRequested') return '取消送出中';
     if (order.exit_status === 'waiting_entry_cancel' || order.exit_status === 'cancelling_entry') return '取消進場餘量中';
     if (order.exit_status === 'submitting') return '出場委託送出中';
@@ -360,7 +384,7 @@
       message('取消要求已送出，正在等待券商確認…');
       for (let attempt = 0; attempt < 10 && !['Cancelled', 'Filled', 'Failed', 'Rejected'].includes(current.entry_status); attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        const statusResponse = await fetch('/api/trading/orders');
+        const statusResponse = await fetchRead('/api/trading/orders');
         if (!statusResponse.ok) throw new Error('取消後委託狀態查詢失敗，請核對券商端');
         acceptOrders(await statusResponse.json());
         current = state.orders.find((item) => item.id === id);
@@ -465,18 +489,21 @@
   }
 
   async function refreshOrders() {
-    const response = await fetch('/api/trading/orders');
+    const response = await fetchRead('/api/trading/orders');
     if (!response.ok) return;
     acceptOrders(await response.json());
     renderOrders();
   }
 
   async function refreshTrading() {
+    if (refreshing) return;
+    refreshing = true;
     try {
       const [response, stateResponse] = await Promise.all([
-        fetch('/api/trading/status'),
-        state.mock || Date.now() - lastStateAt > 30000 ? fetch('/api/state') : Promise.resolve(null),
+        fetchRead('/api/trading/status'),
+        state.mock || Date.now() - lastStateAt > 30000 ? fetchRead('/api/state') : Promise.resolve(null),
       ]);
+      if (!response.ok) throw new Error('無法確認交易服務健康狀態');
       const info = await response.json();
       setMode(info);
       if (info.orders) acceptOrders(info.orders);
@@ -489,8 +516,12 @@
         lastStateAt = Date.now();
       }
     } catch (error) {
+      state.connected = state.entryReady = false;
       $('trade-connection').textContent = '連線狀態查詢失敗：' + error.message;
       $('trade-connection').className = 'trade-connection bad';
+      $('auto-exit-state').textContent = '保護狀態無法確認，請檢查獨立告警與券商端';
+    } finally {
+      refreshing = false;
     }
     renderPreview();
     renderEntry();
@@ -503,6 +534,7 @@
     $('entry-state').textContent = entry
       ? `${entry.contract_code} · 曲線 #${entry.curve_id} · ${entry.quantity} 口 · ${side}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
       : entryEnabled ? '尚未啟用曲線進場' : '自動進場：停用，請檢查 config/trading.json';
+    if (entry?.state === 'armed' && !state.entryReady) $('entry-state').textContent += ' · 行情／券商未就緒，恢復後等待新訊號';
     const quantity = Number($('entry-quantity').value);
     const validCurve = state.curves.some((curve) => String(curve.id) === $('entry-curve').value);
     $('entry-arm').textContent = '啟用一次突破' + (entryAction() === 'Sell' ? '做空' : '做多');
@@ -671,11 +703,21 @@
 
   window.TradingUI = { updateRiskDraft, message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves, confirm: confirmOperation };
   document.addEventListener('trendlines-changed', () => loadCurves().catch((error) => message(error.message, true)));
-  fetch('/api/state').then((response) => response.json()).then((data) => {
+  fetchRead('/api/state').then((response) => response.json()).then((data) => {
     state.atr = data.hourly_atr;
     renderPreview();
   }).catch(() => {});
-  loadCurves();
+  loadCurves().catch((error) => message(error.message, true));
   refreshTrading();
-  setInterval(refreshTrading, 2500);
+  setInterval(() => {
+    if (lastTradeStatusAt && Date.now() - lastTradeStatusAt > 15000) {
+      state.connected = state.entryReady = false;
+      $('trade-connection').textContent = '交易狀態更新逾時';
+      $('trade-connection').className = 'trade-connection bad';
+      $('auto-exit-state').textContent = '保護狀態無法確認，請檢查獨立告警與券商端';
+      renderPreview();
+      renderEntry();
+    }
+    refreshTrading();
+  }, 2500);
 })();

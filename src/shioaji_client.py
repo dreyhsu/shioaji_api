@@ -36,6 +36,7 @@ import shioaji as sj
 from dotenv import load_dotenv
 
 import market_clock
+from connection_recovery import error_kind
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,15 +65,16 @@ class DataUnavailable(RuntimeError):
 
 def is_session_unavailable(error: BaseException) -> bool:
     """Recognize session failures even when wrapped by DataUnavailable."""
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        message = str(current).lower()
-        if "sessionnotestablished" in message or "notready" in message:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+    return error_kind(error) == "session"
+
+
+def bind_session_down(api, callback) -> bool:
+    """Callback only signals the owner; recovery must run outside SDK threads."""
+    register = getattr(api, "set_session_down_callback", None)
+    if register is None:
+        return False
+    register(callback)
+    return True
 
 
 # --------------------------------------------------------------------------------------
@@ -94,8 +96,8 @@ def connect(simulation: bool | None = None) -> Iterator[sj.Shioaji]:
         os.getenv("SHIOAJI_SIMULATION", "1") == "1" if simulation is None else simulation
     )
     api = sj.Shioaji(simulation=use_simulation)
-    api.login(api_key=api_key, secret_key=secret_key)
     try:
+        api.login(api_key=api_key, secret_key=secret_key)
         yield api
     finally:
         try:
@@ -128,7 +130,7 @@ class UsageGuard:
     reasons about the cumulative total, never about one request's cost.
     """
 
-    def __init__(self, api: sj.Shioaji, every: int = 10, warn_at: float = 0.8) -> None:
+    def __init__(self, api: sj.Shioaji, every: int = 10, warn_at: float = 0.8, *, timeout_ms=30000) -> None:
         self.api = api
         self.every = max(1, every)
         self.warn_at = warn_at
@@ -136,6 +138,7 @@ class UsageGuard:
         self.last_bytes = 0
         self.last_limit = 0
         self.last_fraction = 0.0
+        self.timeout_ms = timeout_ms
 
     def sample(self, force: bool = False) -> float:
         """Fraction of the daily quota consumed, refreshed every ``every`` calls."""
@@ -143,7 +146,7 @@ class UsageGuard:
         if not force and self.checks % self.every != 1:
             return self.last_fraction
         try:
-            usage = self.api.usage()
+            usage = self.api.usage(timeout=self.timeout_ms)
         except Exception:  # noqa: BLE001 - never let telemetry break the loop
             return self.last_fraction
         self.last_bytes = usage.bytes
@@ -166,23 +169,27 @@ class UsageGuard:
 
 def _with_retries(label: str, call):
     last: Exception | None = None
+    attempts = 0
     for attempt in range(1, FETCH_RETRIES + 1):
+        attempts = attempt
         try:
             return call()
         except Exception as error:  # noqa: BLE001 - retry any transport hiccup
             last = error
+            if error_kind(error) not in {"transport"}:
+                break
             if attempt < FETCH_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    raise DataUnavailable(f"{label} failed after {FETCH_RETRIES} attempts: {last}") from last
+    raise DataUnavailable(f"{label} failed after {attempts} attempts: {last}") from last
 
 
 # --------------------------------------------------------------------------------------
 # Minute bars
 # --------------------------------------------------------------------------------------
-def _kbars_frame(api: sj.Shioaji, contract, start: date, end: date) -> pd.DataFrame:
+def _kbars_frame(api: sj.Shioaji, contract, start: date, end: date, *, timeout_ms=30000) -> pd.DataFrame:
     kbars = _with_retries(
         f"kbars({contract.code}, {start}..{end})",
-        lambda: api.kbars(contract, start=start.isoformat(), end=end.isoformat()),
+        lambda: api.kbars(contract, start=start.isoformat(), end=end.isoformat(), timeout=timeout_ms),
     )
     frame = pd.DataFrame({**kbars})
     if frame.empty:
@@ -222,6 +229,7 @@ def fetch_minute_bars(
     *,
     chunk_days: int = KBARS_CHUNK_DAYS,
     verbose: bool = False,
+    timeout_ms: int = 30000,
 ) -> pd.DataFrame:
     """Session-tagged minute bars for the calendar range ``[start, end]``.
 
@@ -234,7 +242,7 @@ def fetch_minute_bars(
 
     pieces: list[pd.DataFrame] = []
     for chunk_start, chunk_end in _chunk_days(start, end, max(1, chunk_days)):
-        frame = _kbars_frame(api, contract, chunk_start, chunk_end)
+        frame = _kbars_frame(api, contract, chunk_start, chunk_end, timeout_ms=timeout_ms)
         if verbose:
             print(f"  kbars {chunk_start}..{chunk_end}: {len(frame)} raw minute bars", flush=True)
         if not frame.empty:
@@ -252,7 +260,7 @@ def fetch_minute_bars(
     return add_sessions(combined)
 
 
-def fetch_latest_minute_bars(api: sj.Shioaji, contract, *, verbose: bool = False) -> pd.DataFrame:
+def fetch_latest_minute_bars(api: sj.Shioaji, contract, *, verbose: bool = False, timeout_ms=30000) -> pd.DataFrame:
     """Today plus yesterday -- the smallest window that always covers the live bar.
 
     The night session starts at 15:00 on the previous calendar day, and ``kbars``
@@ -260,7 +268,7 @@ def fetch_latest_minute_bars(api: sj.Shioaji, contract, *, verbose: bool = False
     of a night session that is still running.
     """
     today = market_clock.today()
-    return fetch_minute_bars(api, contract, today - timedelta(days=1), today, verbose=verbose)
+    return fetch_minute_bars(api, contract, today - timedelta(days=1), today, verbose=verbose, timeout_ms=timeout_ms)
 
 
 # --------------------------------------------------------------------------------------

@@ -97,6 +97,8 @@ class CurveEntryController:
         entry = self.snapshot()
         if not entry or entry["state"] != "armed":
             return
+        if not service._entry_data_ready(entry):
+            return
         if not service.auto_entry_enabled():
             self._update(entry["id"], state="cancelled", error="自動進場開關已停用，請重新啟用等待")
             return
@@ -121,7 +123,7 @@ class CurveEntryController:
         # Wait for the matching adapter's fresh quote before submitting a market order.
         contract = service._find_contract(entry["contract_code"])
         quote = service._quotes.get(str(contract.code))
-        if not quote or not -5 <= (now - quote["at"]).total_seconds() <= 10:
+        if not quote or service._fresh_risk_quote({"contract_code": str(contract.code)}) is None:
             return
         self._update(entry["id"], last_checked_minute=latest.isoformat(sep=" "))
         if not crossed_curve(closed, curve["anchors"], now, entry["action"]):

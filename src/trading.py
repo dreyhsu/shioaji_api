@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 import db
 import market_clock
+import market_health as mh
+from connection_recovery import RecoveryGate, error_kind
 import session_bars as sb
 import snr_core as snr
 import shioaji_client as sc
@@ -162,6 +164,11 @@ class TradingService:
         sdk=None,
         enable_telegram: bool = True,
         alerts_path: Path | str = DEFAULT_ALERTS_PATH,
+        health_enabled: bool | None = None,
+        health_settings: mh.HealthSettings | None = None,
+        health_config: Path | str = mh.DEFAULT_CONFIG,
+        calendar: mh.SessionCalendar | None = None,
+        monotonic=None,
     ) -> None:
         self.db_path = Path(db_path)
         self.code = code
@@ -184,6 +191,27 @@ class TradingService:
         self._stop = threading.Event()
         self._last_sync = 0.0
         self._connected_simulation = None
+        self.health_settings = health_settings or mh.load_settings(health_config)
+        self._health_enabled = api_factory is None if health_enabled is None else health_enabled
+        self._calendar = calendar or mh.SessionCalendar.load(self.health_settings.calendar_path)
+        self._calendar_injected = calendar is not None
+        self._monotonic = monotonic or time.monotonic
+        self._recovery = RecoveryGate(self.health_settings.policy(), clock=self._monotonic)
+        self._health = None
+        self._generation = 0
+        self._session_down = threading.Event()
+        self._wanted: set[str] = set()
+        self._subscription_at: dict[str, float] = {}
+        self._resubscribe_at: dict[str, float] = {}
+        self._quote_received: dict[str, float] = {}
+        self._last_fresh_receipt: dict[str, float] = {}
+        self._last_order_sync_at = None
+        self._last_order_event_at = None
+        self._broker_ready = not self._health_enabled
+        self._reconcile_required = self._health_enabled
+        self._reconcile_error = None
+        self._sync_ok = False
+        self._entry_rebase = self._health_enabled
         self.curve_entry = CurveEntryController(self)
         self.entry_notifier = EntryNotifier(db_path, enabled=enable_telegram, alerts_path=alerts_path)
 
@@ -231,6 +259,15 @@ class TradingService:
     def _open(self):
         if self._api is not None:
             return self._api
+        self._generation += 1
+        generation = self._generation
+        try:
+            return self._open_generation(generation)
+        except Exception:
+            self._close_api()
+            raise
+
+    def _open_generation(self, generation):
         mode = self.simulation
         if self.api_factory is not None:
             self._api = self.api_factory(self.simulation)
@@ -249,14 +286,37 @@ class TradingService:
                     ca_passwd=os.environ["SHIOAJI_CA_PASSWD"],
                     person_id=os.environ["SHIOAJI_PERSON_ID"],
                 )
-        self._api.set_on_tick_fop_v1_callback(self._on_tick)
+        def on_tick(quote):
+            with self._lock:
+                if generation == self._generation:
+                    self._on_tick(quote)
+        self._api.set_on_tick_fop_v1_callback(on_tick)
+        sc.bind_session_down(self._api, lambda: self._session_down.set() if generation == self._generation else None)
+        if hasattr(self._api, "set_order_callback"):
+            def on_order(*_args):
+                if generation == self._generation:
+                    self._last_order_event_at = mh.iso(self._now())
+            self._api.set_order_callback(on_order)
         self._connected_simulation = mode
         self._connect_error = None
-        self._start_worker()
+        for key in sorted(self._wanted):
+            self._subscribe(self._find_contract(key))
         self._recover_subscriptions()
+        self._start_worker()
         return self._api
 
     def _close_api(self) -> None:
+        self._generation += 1
+        if self._health_enabled:
+            self._broker_ready = self._sync_ok = False
+            self._reconcile_required = True
+        self._subscribed.clear()
+        self._quotes.clear()
+        self._quote_received.clear()
+        self._last_fresh_receipt.clear()
+        self._quote_aliases.clear()
+        self._subscription_at.clear()
+        self._resubscribe_at.clear()
         if self._api_context is not None:
             try:
                 self._api_context.__exit__(None, None, None)
@@ -272,6 +332,8 @@ class TradingService:
         self._connected_simulation = None
 
     def _validate_connected_mode(self):
+        if self._health is not None and self._health.document["mode"] != ("simulation" if self.simulation else "production"):
+            raise ValueError("交易環境已改變，請重啟服務並重新確認")
         if self._api is not None and self._connected_simulation != self.simulation:
             raise ValueError("交易環境已改變，請重啟服務並重新確認")
 
@@ -285,6 +347,8 @@ class TradingService:
 
     def _recover_subscriptions(self) -> None:
         for row in self._active_orders():
+            self._wanted.add(str(row["contract_code"]))
+            self._subscription_at.setdefault(str(row["contract_code"]), self._monotonic())
             try:
                 contract = self._find_contract(row["contract_code"])
                 tick = float(_value(contract, "tick", 1) or 1)
@@ -298,6 +362,8 @@ class TradingService:
                 self._connect_error = f"合約行情恢復失敗：{error}"
         entry = self.curve_entry.snapshot()
         if entry and entry["state"] == "armed":
+            self._wanted.add(str(entry["contract_code"]))
+            self._subscription_at.setdefault(str(entry["contract_code"]), self._monotonic())
             try:
                 self._subscribe(self._find_contract(entry["contract_code"]))
             except Exception as error:
@@ -314,6 +380,7 @@ class TradingService:
 
     def _subscribe(self, contract) -> None:
         code = str(contract.code)
+        self._wanted.add(code)
         symbol = str(_value(contract, "symbol", code))
         for alias in (code, symbol, _value(contract, "target_code"), _value(contract, "full_code")):
             if not alias:
@@ -321,8 +388,11 @@ class TradingService:
             alias = str(alias)
             previous = self._quote_aliases.get(alias)
             self._quote_aliases[alias] = code if previous in {None, code} else ""
+            if alias != code and self._quote_aliases[alias] == code:
+                self._wanted.discard(alias)
         if code in self._subscribed:
             return
+        self._subscription_at[code] = self._monotonic()
         self._api.quote.subscribe(
             contract, quote_type=self._sdk.QuoteType.Tick, version=self._sdk.QuoteVersion.v1
         )
@@ -335,7 +405,7 @@ class TradingService:
             price = float(_value(quote, "close"))
             stamp = pd.Timestamp(_value(quote, "datetime", self._now()))
             if stamp.tzinfo is not None:
-                stamp = stamp.tz_convert(None)
+                stamp = stamp.tz_convert("Asia/Taipei").tz_localize(None)
             if not math.isfinite(price) or price <= 0:
                 return
             with self._lock:
@@ -343,7 +413,9 @@ class TradingService:
                 if previous and stamp < previous["at"]:
                     return
                 self._quotes[code] = {"price": price, "at": stamp}
-                if -5 <= (self._now() - stamp).total_seconds() <= TICK_STALE_SECONDS:
+                self._quote_received[code] = self._monotonic()
+                if -5 <= (self._now() - stamp).total_seconds() <= self.health_settings.tick_stale_seconds:
+                    self._last_fresh_receipt[code] = self._monotonic()
                     for row in self._active_orders():
                         if row["contract_code"] == code:
                             self._apply_breakeven(row, price)
@@ -354,15 +426,168 @@ class TradingService:
         if self._api is None:
             return {}
         try:
-            self._api.update_status(self._api.futopt_account)
-            return {
+            kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+            self._api.update_status(self._api.futopt_account, **kwargs)
+            trades = {
                 str(_trade_id(trade)): trade
                 for trade in self._api.list_trades()
                 if _trade_id(trade)
             }
+            self._sync_ok = True
+            self._last_order_sync_at = mh.iso(self._now())
+            if not self._reconcile_required:
+                self._broker_ready = True
+            return trades
         except Exception as error:  # noqa: BLE001
+            self._sync_ok = self._broker_ready = False
+            if self._health_enabled and error_kind(error) in {"session", "transport", "authentication"}:
+                self._recovery.fail(error_kind(error), immediate=error_kind(error) in {"session", "authentication"})
             self._connect_error = f"委託狀態同步失敗：{error}"
             return {}
+
+    def _reconcile_broker(self, trades):
+        """Never clear uncertain submission claims or infer that missing means flat."""
+        if not self._sync_ok:
+            return
+        rows = self._active_orders()
+        terminal = {"Filled", "Cancelled", "Failed", "Rejected"}
+        known_ids = {str(row[key]) for row in rows for key in ("entry_trade_id", "exit_trade_id") if row.get(key)}
+        if any(trade_id not in known_ids and _trade_status(trade) not in terminal for trade_id, trade in trades.items()):
+            self._reconcile_error = "券商有本機未管理的未結束委託；請核對後恢復"
+            return
+        for row in rows:
+            if (row["entry_status"] not in terminal and str(row["entry_trade_id"]) not in trades
+                    or row.get("exit_status") in {"unknown", "submitting", "cancelling_entry", "waiting_entry_cancel"}
+                    and not row.get("exit_trade_id")
+                    or row.get("exit_trade_id") and str(row["exit_trade_id"]) not in trades):
+                self._reconcile_error = "委託身分或送單結果待券商核對；不自動重送"
+                return
+        try:
+            kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+            positions = self._api.list_positions(self._api.futopt_account, **kwargs)
+            expected, actual = {}, {}
+            for row in rows:
+                quantity = int(row["filled_quantity"]) - int(row["exit_filled_quantity"])
+                key = (row["contract_code"], row["action"])
+                expected[key] = expected.get(key, 0) + quantity
+            for position in positions:
+                code = str(_value(position, "code", ""))
+                direction = _enum_text(_value(position, "direction", ""))
+                if direction not in {"Buy", "Sell"}:
+                    raise ValueError("unrecognized position direction")
+                key = (self._quote_aliases.get(code, code), direction)
+                actual[key] = actual.get(key, 0) + int(_value(position, "quantity", 0))
+            expected = {key: value for key, value in expected.items() if value}
+            actual = {key: value for key, value in actual.items() if value}
+            if expected != actual:
+                self._reconcile_error = "券商部位與本機管理部位不一致；請核對外部委託與部位"
+                return
+        except Exception as error:
+            self._reconcile_error = f"券商部位核對失敗：{type(error).__name__}"
+            return
+        self._reconcile_required = False
+        self._broker_ready = True
+        self._reconcile_error = None
+
+    def _curve_data_ready(self):
+        if not self._health_enabled:
+            return True
+        ready, document = mh.monitor_ready(self.db_path, self.code, self._now(), self.health_settings,
+                                           mode="simulation" if self.simulation else "production")
+        return ready
+
+    def _entry_data_ready(self, entry):
+        if not self._health_enabled:
+            return True
+        ready, document = mh.monitor_ready(self.db_path, self.code, self._now(), self.health_settings,
+                                           mode="simulation" if self.simulation else "production")
+        if not ready or not self._broker_ready or self._recovery.pending:
+            self._entry_rebase = True
+            return False
+        ready_since = pd.Timestamp(document.get("ready_since") or entry["check_from"]).ceil("min")
+        baseline = max(ready_since, pd.Timestamp(entry["check_from"]))
+        if self._entry_rebase:
+            baseline = max(baseline, pd.Timestamp(self._now()).ceil("min"))
+            self._entry_rebase = False
+        if baseline > pd.Timestamp(entry["check_from"]):
+            self.curve_entry._update(entry["id"], check_from=mh.iso(baseline), last_checked_minute=None)
+            return False
+        return True
+
+    def _quote_health(self):
+        now = pd.Timestamp(self._now())
+        result = {}
+        for code in sorted(self._wanted):
+            quote = self._quotes.get(code)
+            age = None if quote is None else (now - quote["at"]).total_seconds()
+            receipt_age = (None if code not in self._quote_received
+                           else self._monotonic() - self._quote_received[code])
+            fresh = (age is not None and receipt_age is not None and -5 <= age <= self.health_settings.tick_stale_seconds
+                     and receipt_age <= self.health_settings.tick_stale_seconds)
+            result[code] = {"fresh": fresh, "age_seconds": age, "receipt_age_seconds": receipt_age,
+                            "last_quote_at": None if quote is None else mh.iso(quote["at"])}
+        return result
+
+    def _publish_health(self, **changes):
+        if self._health is not None:
+            self._health.publish(generation=self._generation, recovery=self._recovery.snapshot(),
+                                 quotes=self._quote_health(), broker_ready=self._broker_ready,
+                                 reconciliation_error=self._reconcile_error,
+                                 last_order_sync_at=self._last_order_sync_at,
+                                 last_order_event_at=self._last_order_event_at, **changes)
+
+    def _maintain_connection(self):
+        if not self._health_enabled:
+            return
+        if not self._calendar_injected:
+            self._calendar = mh.SessionCalendar.load(self.health_settings.calendar_path)
+        if self._session_down.is_set():
+            self._session_down.clear()
+            self._broker_ready = False
+            self._reconcile_required = True
+            self._quotes.clear()
+            self._quote_received.clear()
+            self._last_fresh_receipt.clear()
+            self._recovery.fail("session_down", immediate=True)
+        active = self._calendar.active(self._now())
+        if self._api is not None and active and self._calendar.covered(self._now()):
+            for code, health in self._quote_health().items():
+                if health["fresh"]:
+                    self._resubscribe_at.pop(code, None)
+                    continue
+                since = self._last_fresh_receipt.get(code, self._subscription_at.get(code, self._monotonic()))
+                if self._monotonic() - since < self.health_settings.tick_recovery_seconds:
+                    continue
+                # Silence is not proof of a dead session. Try one subscription
+                # repair, with a separate grace period before replacing the API.
+                if code not in self._resubscribe_at:
+                    self._resubscribe_at[code] = self._monotonic()
+                    try:
+                        contract = self._find_contract(code)
+                        self._api.quote.unsubscribe(contract, quote_type=self._sdk.QuoteType.Tick,
+                                                    version=self._sdk.QuoteVersion.v1)
+                        self._subscribed.discard(code)
+                        self._subscribe(contract)
+                    except Exception as error:
+                        self._recovery.fail(error_kind(error), immediate=True)
+                elif self._monotonic() - self._resubscribe_at[code] >= self.health_settings.tick_recovery_seconds:
+                    self._recovery.fail("tick_stalled")
+        if self._recovery.due and self.health_settings.trading_reconnect_enabled:
+            self._publish_health(state="recovering", operation="reconnect", operation_started=mh.iso(self._now()))
+            self._recovery.attempted()
+            self._broker_ready = False
+            self._reconcile_required = self._entry_rebase = True
+            self._close_api()
+            try:
+                self._open()
+                self._recovery.pending = False  # wait for quotes and broker reconciliation
+            except Exception as error:
+                self._recovery.fail(error_kind(error), immediate=True)
+                self._connect_error = f"重新連線失敗：{type(error).__name__}"
+        if (self._api is not None and self._broker_ready and not self._reconcile_required
+                and all(row["fresh"] for row in self._quote_health().values())):
+            self._recovery.success()
+            self._connect_error = None
 
     @risk_locked
     def _persist_trade_state(self, row_id: str, *, entry=None, exit_trade=None) -> None:
@@ -469,6 +694,8 @@ class TradingService:
 
     def _curve_close_break(self, row: dict) -> str | None:
         """Evaluate completed 1m closes against the saved 1h curve."""
+        if not self._curve_data_ready():
+            return "curve_unavailable"
         cache_key = (
             str(row["id"]), int(row["curve_id"]), row["code"],
             str(row.get("curve_check_from") or ""),
@@ -538,6 +765,8 @@ class TradingService:
             if index == 0:
                 continue
             previous, current = minutes.iloc[index - 1], minutes.iloc[index]
+            if pd.Timestamp(current["minute_start"]) - pd.Timestamp(previous["minute_start"]) != pd.Timedelta(minutes=1):
+                continue
             previous_curve = value_at_minute(pd.Timestamp(previous["minute_start"]))
             current_curve = value_at_minute(pd.Timestamp(current["minute_start"]))
             if previous_curve is None or current_curve is None:
@@ -579,6 +808,8 @@ class TradingService:
 
     @risk_locked
     def _try_auto_exit(self, row: dict, reason: str) -> None:
+        if self._health_enabled and not self._broker_ready:
+            return  # unknown broker state must not produce a second closing order
         with db.session(self.db_path) as conn:
             conn.execute(
                 "UPDATE managed_orders SET triggered_at = COALESCE(triggered_at, ?), "
@@ -656,7 +887,8 @@ class TradingService:
                 octype=self._sdk.FuturesOCType.Cover,
                 account=self._api.futopt_account,
             )
-            trade = self._api.place_order(contract, order)
+            kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+            trade = self._api.place_order(contract, order, **kwargs)
             trade_id = _trade_id(trade)
             if not trade_id:
                 raise RuntimeError("Shioaji 沒有回傳平倉委託編號")
@@ -667,6 +899,9 @@ class TradingService:
                 )
                 conn.commit()
         except Exception as error:  # noqa: BLE001 - don't blindly retry an uncertain order
+            self._broker_ready = False
+            self._reconcile_required = True
+            self._reconcile_error = "出場送單結果待券商核對；不自動重送"
             with db.session(self.db_path) as conn:
                 conn.execute(
                     "UPDATE managed_orders SET exit_status = 'unknown', error = ?, updated_at = ? WHERE id = ?",
@@ -680,10 +915,14 @@ class TradingService:
                 self.process_market_update()
             except Exception as error:  # noqa: BLE001 - keep the watchdog alive
                 self._connect_error = f"交易監控錯誤：{error}"
+                self._publish_health(state="failed", operation=None, error={"kind": error_kind(error), "type": type(error).__name__})
 
     def process_market_update(self):
         """Run the same signal/fill/exit cycle for replay and wall-clock drivers."""
         with self._lock:
+            self._publish_health(state="checking", operation="market_update", operation_started=mh.iso(self._now()))
+            self._validate_connected_mode()
+            self._maintain_connection()
             self._last_sync = 0
             self._curve_break_cache.clear()
             self._curve_cache.clear()
@@ -691,6 +930,11 @@ class TradingService:
             # Reconcile synchronous fills; asynchronous adapters settle on later cycles.
             self._last_sync = 0
             self._monitor_once()
+            quotes = self._quote_health()
+            healthy = (self._api is not None and self._broker_ready and not self._recovery.pending
+                       and all(item["fresh"] for item in quotes.values()))
+            self._publish_health(state="healthy" if healthy else "degraded", operation=None,
+                                 cycle_completed_at=mh.iso(self._now()), error=self._connect_error)
 
     @risk_locked
     def _monitor_once(self) -> None:
@@ -704,7 +948,7 @@ class TradingService:
                 self._connect_error = f"進場監控錯誤：{error}"
                 self.curve_entry.fail_pending(error)
         active_rows = self._active_orders()
-        if not active_rows:
+        if not active_rows and not self._health_enabled:
             return
         now_mono = time.monotonic()
         if now_mono - self._last_sync >= 1.0:
@@ -715,6 +959,8 @@ class TradingService:
                 exit_trade = trades.get(str(row["exit_trade_id"])) if row.get("exit_trade_id") else None
                 if entry is not None or exit_trade is not None:
                     self._persist_trade_state(row["id"], entry=entry, exit_trade=exit_trade)
+            if self._health_enabled and self._reconcile_required:
+                self._reconcile_broker(trades)
         for row in active_rows:
             # A fill/status sync above may have changed the managed row (including
             # confirming a remainder cancellation), so make exit decisions from
@@ -728,8 +974,7 @@ class TradingService:
                 quote = self._quotes.get(row["contract_code"])
             if not quote:
                 continue
-            age = (self._now() - quote["at"]).total_seconds()
-            if age < -5 or age > TICK_STALE_SECONDS:
+            if self._fresh_risk_quote(row) is None:
                 continue
             with db.session(self.db_path) as conn:
                 conn.execute(
@@ -751,11 +996,28 @@ class TradingService:
 
     def ensure_connected(self):
         with self._lock:
-            if self._api is None:
+            self._validate_connected_mode()
+            if self._health_enabled and self._health is None:
+                self._health = mh.HealthPublisher(self.db_path, "trading", self.code,
+                                                 "simulation" if self.simulation else "production", clock=self._now)
                 try:
+                    self._health.acquire()
+                except Exception as error:
+                    self._health = None
+                    self._connect_error = str(error)
+                    raise
+            self._start_worker()
+            if self._api is None:
+                if self._health_enabled and self._recovery.pending:
+                    raise RuntimeError("連線故障，等待恢復或人工核對")
+                try:
+                    self._publish_health(state="connecting", operation="login", operation_started=mh.iso(self._now()))
                     return self._open()
                 except Exception as error:  # noqa: BLE001
                     self._connect_error = f"{type(error).__name__}: {error}"
+                    if self._health_enabled:
+                        self._recovery.fail(error_kind(error), immediate=True)
+                        self._publish_health(state="failed", operation=None, error={"kind": error_kind(error), "type": type(error).__name__})
                     raise
             return self._api
 
@@ -772,11 +1034,27 @@ class TradingService:
             if self._quotes:
                 latest = max(self._quotes.values(), key=lambda row: row["at"])
         age = None if latest is None else max(0.0, (self._now() - latest["at"]).total_seconds())
+        quotes = self._quote_health()
+        quotes_ready = bool(quotes) and all(row["fresh"] for row in quotes.values())
+        bars_ready = self._curve_data_ready()
+        broker_ready = self._broker_ready if self._health_enabled else connected
         return {
             "simulation": self.simulation,
             "mode": "模擬環境" if self.simulation else "正式環境",
-            "connected": connected,
-            "quote_connected": latest is not None and age is not None and age <= TICK_STALE_SECONDS,
+            "connected": connected and broker_ready,
+            "session_present": connected,
+            "quote_connected": quotes_ready,
+            "quote_contracts": quotes,
+            "bars_ready": bars_ready,
+            "broker_ready": broker_ready,
+            "recovery": self._recovery.snapshot(),
+            "reconnect_enabled": self.health_settings.trading_reconnect_enabled,
+            "protection": {"fixed_exit": quotes_ready and broker_ready and self.auto_exit_enabled(),
+                           "breakeven": quotes_ready,
+                           "curve_exit": quotes_ready and broker_ready and bars_ready and self.auto_exit_enabled(),
+                           "curve_entry": quotes_ready and broker_ready and bars_ready and self.auto_entry_enabled(),
+                           "broker_protection": "unverified"},
+            "reconciliation_error": self._reconcile_error,
             "last_quote": None if latest is None else latest["price"],
             "last_quote_at": None if latest is None else latest["at"].isoformat(sep=" "),
             "quote_age_seconds": age,
@@ -845,7 +1123,8 @@ class TradingService:
 
     def margin(self) -> dict:
         api = self.ensure_connected()
-        result = api.margin(api.futopt_account)
+        kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+        result = api.margin(api.futopt_account, **kwargs)
         status = _value(result, "status", "Fetched")
         return {
             "status": _enum_text(status),
@@ -872,11 +1151,17 @@ class TradingService:
             raise RuntimeError("1 小時 ATR 尚未就緒")
         return float(raw), hourly
 
+    @risk_locked
     def place_order(self, request: dict) -> dict:
         order_request = OrderRequest(**{
             key: value for key, value in request.items() if key in OrderRequest.__dataclass_fields__
         })
         validate_request(order_request, self.simulation)
+        if any(row["entry_status"] in {"submitting", "unknown"} or row.get("exit_status") in {"unknown", "submitting"}
+               for row in self._active_orders()):
+            raise ValueError("既有進場送單結果不明，請先核對券商端")
+        if self._health_enabled and (not self._curve_data_ready() or not self._broker_ready):
+            raise ValueError("行情回補或券商委託核對尚未完成，暫停新倉")
         action, quantity = order_request.action, order_request.quantity
         price_type, order_type = order_request.price_type, order_request.order_type
         price, contract_code = order_request.price, order_request.contract_code
@@ -899,13 +1184,14 @@ class TradingService:
         canonical_code = str(contract.code)
         tick = float(_value(contract, "tick", 1) or 1)
         with self._lock:
-            result = place_order(
-                order_request,
-                context=OrderContext(canonical_code, tick, self.simulation),
-                broker=ShioajiOrderAdapter(api, contract, sdk=self._sdk),
-            )
-            trade_id, price = result.trade_id, result.price
             self._subscribe(contract)
+            if self._health_enabled and (not self._broker_ready or self._recovery.pending):
+                raise ValueError("行情或券商狀態正在恢復，暫停新倉")
+        if not math.isfinite(tick) or tick <= 0:
+            raise ValueError("合約最小跳動單位無效")
+        price = round(round(price / tick) * tick, 8) if price_type == "LMT" else 0
+        if price_type == "LMT" and price <= 0:
+            raise ValueError("依最小跳動單位調整後限價必須大於 0")
         preview_price = price if price_type == "LMT" else None
         stop, target = (stop_target_prices(action, preview_price, atr) if preview_price else (None, None))
         stop = None if stop is None else align_tick(stop, tick)
@@ -923,9 +1209,30 @@ class TradingService:
                  atr, stop, target, curve_id,
                  pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ") if curve_id is not None else None,
                  int(self.auto_exit_enabled()), int(self.simulation), tick,
-                 trade_id, result.status, now, now),
+                 f"unresolved:{row_id}", "submitting", now, now),
             )
             conn.commit()
+        # Persist intent BEFORE broker I/O. A crash, timeout or failed DB update
+        # leaves this claim visible and blocks repeat entry across restarts.
+        try:
+            result = place_order(
+                order_request, context=OrderContext(canonical_code, tick, self.simulation),
+                broker=ShioajiOrderAdapter(api, contract, sdk=self._sdk,
+                                           timeout_ms=self.health_settings.api_timeout_ms if self.api_factory is None else None),
+            )
+            with db.session(self.db_path) as conn:
+                conn.execute("UPDATE managed_orders SET entry_trade_id = ?, entry_status = ?, price = ? WHERE id = ?",
+                             (result.trade_id, result.status, result.price, row_id))
+                conn.commit()
+        except Exception:
+            self._broker_ready = False
+            self._reconcile_required = True
+            self._reconcile_error = "進場送單結果待券商核對；不自動重送"
+            with db.session(self.db_path) as conn:
+                conn.execute("UPDATE managed_orders SET entry_status = 'unknown', error = ? WHERE id = ?",
+                             (self._reconcile_error, row_id))
+                conn.commit()
+            raise
         self._start_worker()
         return self._public_order(self._active_order(row_id))
 
@@ -941,7 +1248,10 @@ class TradingService:
 
     def _fresh_risk_quote(self, row: dict) -> float | None:
         quote = self._quotes.get(row["contract_code"])
-        if quote and -5 <= (self._now() - quote["at"]).total_seconds() <= TICK_STALE_SECONDS:
+        received = self._quote_received.get(row["contract_code"])
+        if (quote and -5 <= (self._now() - quote["at"]).total_seconds() <= self.health_settings.tick_stale_seconds
+                and (not self._health_enabled or received is not None
+                     and self._monotonic() - received <= self.health_settings.tick_stale_seconds)):
             return float(quote["price"])
         return None
 
@@ -1136,6 +1446,15 @@ class TradingService:
             tick = float(row.get("contract_tick") or 1)
             item.update(default_stop_price=align_tick(stop, tick), default_target_price=align_tick(target, tick))
         quote = self._fresh_risk_quote(row)
+        tick_ready = quote is not None
+        broker_ready = self._broker_ready if self._health_enabled else self._api is not None
+        bars_ready = self._curve_data_ready()
+        item["protection"] = {"tick_fresh": tick_ready, "broker_ready": broker_ready,
+                              "fixed_stop": tick_ready and broker_ready and self.auto_exit_enabled(),
+                              "fixed_target": tick_ready and broker_ready and self.auto_exit_enabled() and not row.get("curve_id"),
+                              "curve_exit": tick_ready and broker_ready and bars_ready and self.auto_exit_enabled() and bool(row.get("curve_id")),
+                              "breakeven": tick_ready and bool(row.get("breakeven_enabled")),
+                              "broker_protection": "unverified"}
         if quote is not None:
             item["last_quote"] = quote
         return item
@@ -1156,4 +1475,7 @@ class TradingService:
                         pass
                 self._close_api()
             self._subscribed.clear()
+            if self._health is not None:
+                self._health.close()
+                self._health = None
 

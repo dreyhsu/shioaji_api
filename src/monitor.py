@@ -19,9 +19,10 @@ One cycle per minute:
    not been sent within its cooldown.
 
 Everything that could repeat is idempotent at the database level, so a retried or
-restarted cycle cannot double-write books or double-send alerts.  A failing cycle
-is logged and skipped -- the loop is meant to survive a bad night, not to be
-correct about every single minute.
+restarted cycle cannot double-write books or double-send alerts. Session failures
+enter bounded recovery; data is backfilled and validated before live signals
+resume. Database and application failures are reported without replacing the
+broker session. Health files are supervised by a separate watchdog process.
 
 Run inside the ``tss`` conda env::
 
@@ -36,6 +37,7 @@ import signal
 import sys
 import time
 import traceback
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -53,6 +55,8 @@ import session_bars as sb
 import shioaji_client as sc
 import snr_core as snr
 import telegram_notify as tg
+import market_health as mh
+from connection_recovery import RecoveryGate, error_kind
 from box_watch import BoxWatcher, BoxWatchConfig
 
 SIDES = ("support", "resistance")
@@ -80,6 +84,8 @@ class MonitorConfig:
     idle_sleep_seconds: int = 300
     patterns: pt.PatternConfig = field(default_factory=pt.PatternConfig)
     alerts_config: Path = ar.DEFAULT_CONFIG_PATH
+    health_config: Path = mh.DEFAULT_CONFIG
+    api_timeout_ms: int = 30000
 
 
 def log(message: str) -> None:
@@ -475,11 +481,12 @@ def detect_reversals(
 
 def run_cycle(
     api, contract, conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder,
-    alerts: ar.AlertConfig,
+    alerts: ar.AlertConfig, *, fresh=None, allow_signals=True,
 ) -> MarketState:
     now = market_clock.now()
 
-    fresh = sc.fetch_latest_minute_bars(api, contract)
+    if fresh is None:
+        fresh = sc.fetch_latest_minute_bars(api, contract, timeout_ms=config.api_timeout_ms)
     stored = db.upsert_minute_bars(conn, config.code, fresh)
 
     state = build_state(conn, config, now)
@@ -501,10 +508,11 @@ def run_cycle(
         f"res={'none' if resistance is None else f'#{int(resistance.box_id)} {resistance.bottom:,.0f}-{resistance.top:,.0f}'}"
     )
 
-    for box_type in SIDES:
-        handle_side(conn, config, state, watchers[box_type], recorder)
-    detect_reversals(conn, config, state, watchers, recorder)
-    check_alerts(conn, config, alerts, state)
+    if allow_signals:
+        for box_type in SIDES:
+            handle_side(conn, config, state, watchers[box_type], recorder)
+        detect_reversals(conn, config, state, watchers, recorder)
+        check_alerts(conn, config, alerts, state)
     return state
 
 
@@ -521,7 +529,7 @@ def backfill(api, contract, conn, config: MonitorConfig) -> int:
         # Re-pull the last day to absorb revisions and the night-session overlap.
         start = last.date() - timedelta(days=1)
         log(f"resuming from {last} -> refetching from {start}")
-    bars = sc.fetch_minute_bars(api, contract, start, today, verbose=True)
+    bars = sc.fetch_minute_bars(api, contract, start, today, verbose=True, timeout_ms=config.api_timeout_ms)
     written = db.upsert_minute_bars(conn, config.code, bars)
     log(f"backfill upserted {written} minute bars")
     return written
@@ -556,6 +564,189 @@ def shutdown(conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder
     recorder.stop()
 
 
+class MonitorRuntime:
+    """Own connection replacement without closing visits or resetting DB state."""
+    def __init__(self, conn, config, *, settings=None, calendar=None, connect_factory=None,
+                 clock=market_clock.now, monotonic=time.monotonic, publisher=None):
+        self.conn, self.config = conn, config
+        self.settings = settings or mh.load_settings(config.health_config)
+        config.api_timeout_ms = self.settings.api_timeout_ms
+        self.calendar = calendar or mh.SessionCalendar.load(self.settings.calendar_path)
+        self._calendar_injected = calendar is not None
+        self.clock, self.monotonic = clock, monotonic
+        self.connect_factory = connect_factory or sc.connect
+        self.publisher = publisher or mh.HealthPublisher(config.db_path, "monitor", config.code, "unknown", clock=clock)
+        previous = mh.read_health(self.publisher.path)
+        self.gate = RecoveryGate(self.settings.policy(), clock=monotonic)
+        self.api = self.context = self.contract = self.guard = self.recorder = None
+        self.watchers = restore_watchers(conn, config)
+        self.alerts = ar.AlertConfig(config.alerts_config)
+        last = db.last_minute_start(conn, config.code)
+        self.since = (last - pd.Timedelta(minutes=1) if last is not None
+                      else pd.Timestamp(clock()).normalize() - pd.Timedelta(days=config.backfill_days))
+        if previous.get("validation_pending", previous.get("state") != "healthy") and previous.get("validation_since"):
+            try:
+                self.since = min(self.since, pd.Timestamp(previous["validation_since"]))
+            except ValueError:
+                pass
+        self.publisher.document["validation_since"] = mh.iso(self.since)
+        self.publisher.document["validation_pending"] = True
+        self.publisher.acquire()
+        self.baseline = last
+        self.verifying = True
+        self.needs_backfill = True
+        self.down = threading.Event()
+        self.generation = 0
+        self.last_fetch = float("-inf")
+        self.book_retry_at = 0
+        self.ready_since = None
+        self.fetch_interval = config.poll_seconds
+        self.fetch_error_until = 0
+
+    def _publish(self, **changes):
+        pending = changes.pop("validation_pending", self.verifying or self.needs_backfill)
+        self.publisher.publish(recovery=self.gate.snapshot(), validation_pending=pending, **changes)
+
+    def _disconnect(self):
+        self.generation += 1
+        if self.recorder is not None:
+            self.recorder.stop()
+        try:
+            if self.context is not None:
+                self.context.__exit__(None, None, None)
+        finally:
+            self.api = self.context = self.contract = self.guard = self.recorder = None
+
+    def _connect(self):
+        self._publish(state="recovering", operation="connect", operation_started=mh.iso(self.clock()))
+        self._disconnect()
+        self.down.clear()
+        self.context = self.connect_factory()
+        self.api = self.context.__enter__()
+        generation = self.generation
+        sc.bind_session_down(self.api, lambda: self.down.set() if generation == self.generation else None)
+        self.contract = sc.resolve_contract(self.api, self.config.code)
+        self.guard = sc.UsageGuard(self.api, timeout_ms=self.settings.api_timeout_ms)
+        self.recorder = BookRecorder(self.api, self.contract, self.config)
+        if self.recorder.live is not None:
+            self.recorder.live.stale_seconds = self.settings.book_stale_seconds
+        log(f"order book: {self.recorder.start()}")
+        self.baseline = db.last_minute_start(self.conn, self.config.code)
+        self.verifying = self.needs_backfill = True
+        self.gate.pending = False  # validate data before another connection replacement
+        import os
+        mode = "simulation" if os.getenv("SHIOAJI_SIMULATION", "1") == "1" else "production"
+        self._publish(state="backfilling", mode=mode, generation=self.generation,
+                      contract=str(self.contract.code), ready_since=None)
+
+    def step(self):
+        now = pd.Timestamp(self.clock())
+        if not self._calendar_injected:
+            self.calendar = mh.SessionCalendar.load(self.settings.calendar_path)
+        try:
+            if self.monotonic() < self.fetch_error_until:
+                self._publish(state="failed", operation=None)
+                return
+            if self.down.is_set():
+                self.down.clear()
+                self.verifying = True
+                self.gate.fail("session_down", immediate=True)
+            if self.gate.pending and not self.gate.due:
+                self._publish(state="retry_wait", operation=None)
+                return
+            if self.api is None or self.gate.due:
+                if self.gate.pending:
+                    self.gate.attempted()
+                self._connect()
+            if (not self.verifying and not self.needs_backfill
+                    and self.monotonic() - self.last_fetch < self.fetch_interval):
+                self._publish(operation=None)
+                return
+            if (not self.calendar.active(now) and not self.verifying and not self.needs_backfill
+                    and self.monotonic() - self.last_fetch < self.config.idle_sleep_seconds):
+                self._publish(operation=None)
+                return
+            self._publish(state="backfilling" if self.needs_backfill else "checking",
+                          operation="kbars", operation_started=mh.iso(now), validation_pending=True)
+            if self.needs_backfill:
+                fresh = sc.fetch_minute_bars(self.api, self.contract, self.since.date() - timedelta(days=1),
+                                             now.date(), timeout_ms=self.settings.api_timeout_ms)
+            else:
+                fresh = sc.fetch_latest_minute_bars(self.api, self.contract, timeout_ms=self.settings.api_timeout_ms)
+            self.last_fetch = self.monotonic()
+            now = pd.Timestamp(self.clock())
+            fresh = fresh[fresh["minute_start"] + pd.Timedelta(minutes=1) <= now]
+            db.upsert_minute_bars(self.conn, self.config.code, fresh)
+            bars = db.load_minute_bars(self.conn, self.config.code, since=mh.iso(self.since))
+            validation = mh.validate_bars(bars, now, self.calendar, since=self.since,
+                                           lag_seconds=self.settings.bar_lag_seconds)
+            latest = validation["last_minute_start"]
+            progressing = (not self.calendar.active(now) or self.baseline is None
+                           or latest is not None and pd.Timestamp(latest) > self.baseline)
+            ready = validation["ready"] and (not self.verifying or progressing)
+            self._publish(operation="derive", operation_started=mh.iso(self.clock()), bars=validation)
+            # Rebuild indicators while the health gate is CLOSED to trading readers.
+            state = run_cycle(self.api, self.contract, self.conn, self.config, self.watchers,
+                              self.recorder, self.alerts, fresh=fresh.iloc[:0],
+                              allow_signals=ready and not self.verifying)
+            self.needs_backfill = validation["missing_count"] > 0
+            if ready:
+                if self.verifying or self.ready_since is None:
+                    self.ready_since = mh.iso(self.clock())
+                self.verifying = False
+                self.gate.success()
+            else:
+                self.verifying = True
+                self.ready_since = None
+                # Interior gaps need refetching, not repeated logins.
+                if (validation["calendar_verified"] and validation["active_session"] and not validation["opening_grace"] and (
+                        latest is None or validation["lag_seconds"] is not None
+                        and validation["lag_seconds"] > self.settings.bar_lag_seconds)):
+                    self.gate.fail("bars_stalled")
+            live = self.recorder.live
+            if (live is not None and self.calendar.covered(now) and self.calendar.active(now)
+                    and not live.alive and self.monotonic() >= self.book_retry_at):
+                live.stop()
+                self.recorder.live = ob.LiveBook(self.api, self.contract, stale_seconds=self.settings.book_stale_seconds)
+                self.recorder.start()
+                self.book_retry_at = self.monotonic() + self.settings.recovery_maximum_seconds
+                live = self.recorder.live
+            status = "healthy" if ready else "waiting_market" if validation["opening_grace"] else "degraded"
+            self._publish(state=status, operation=None, error=None,
+                          ready_since=self.ready_since, bars=validation,
+                          book={"required": live is not None, "fresh": live.alive if live else None,
+                                "error": live.last_error if live else None},
+                          cycle_completed_at=mh.iso(self.clock()))
+            self.guard.sample()
+            self.fetch_interval = min(self.config.poll_seconds * (2 if self.guard.over_budget else 1), 120)
+            return state
+        except Exception as error:
+            self.conn.rollback()
+            kind = error_kind(error)
+            if kind == "quota":
+                self.fetch_error_until = self.monotonic() + self.settings.recovery_cooldown_seconds
+            if kind in {"session", "transport", "authentication"}:
+                self.gate.fail(kind, immediate=kind in {"session", "authentication"})
+            elif self.api is None:
+                self.gate.fail(kind, immediate=True)
+            self.verifying = True
+            self.ready_since = None
+            self._publish(state="failed", error={"kind": kind, "type": type(error).__name__}, operation=None,
+                          ready_since=None)
+            log(f"cycle failed: {kind}: {type(error).__name__}")
+            traceback.print_exc()
+
+    def close(self):
+        try:
+            if self.recorder is not None:
+                shutdown(self.conn, self.config, self.watchers, self.recorder)
+        finally:
+            try:
+                self._disconnect()
+            finally:
+                self.publisher.close()
+
+
 def parse_args(argv: list[str] | None = None) -> MonitorConfig:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--code", default="TMFR1")
@@ -587,6 +778,7 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
     )
     parser.add_argument("--no-orderbook", action="store_true")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
+    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
     parser.add_argument("--min-range-atr", type=float, default=pt.PatternConfig.min_range_atr)
     parser.add_argument("--wick-body-ratio", type=float, default=pt.PatternConfig.wick_body_ratio)
     parser.add_argument(
@@ -615,6 +807,7 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
             min_range_atr=args.min_range_atr, wick_body_ratio=args.wick_body_ratio
         ),
         alerts_config=args.alerts_config,
+        health_config=args.health_config,
     )
 
 
@@ -629,50 +822,22 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    with db.session(config.db_path) as conn, sc.connect() as api:
-        contract = sc.resolve_contract(api, config.code)
-        log(f"contract {contract.code} ({contract.name}) delivery {contract.delivery_month}")
-
-        guard = sc.UsageGuard(api)
-        guard.sample(force=True)
-        log(guard.describe())
-
-        backfill(api, contract, conn, config)
-        watchers = restore_watchers(conn, config)
-        recorder = BookRecorder(api, contract, config)
-        log(f"order book: {recorder.start()}")
-        alerts = ar.AlertConfig(config.alerts_config)
-        log(f"alert config: {alerts.path}" + (f" ({alerts.last_error})" if alerts.last_error else ""))
-
+    stop_event = threading.Event()
+    with db.session(config.db_path) as conn:
+        runtime = MonitorRuntime(conn, config)
         try:
             while True:
                 started = time.monotonic()
-                if not sb.is_trading_time():
-                    log(f"outside session hours; sleeping {config.idle_sleep_seconds}s")
-                    if config.once:
-                        break
-                    time.sleep(config.idle_sleep_seconds)
-                    if stopping["flag"]:
-                        break
-                    continue
-
-                try:
-                    run_cycle(api, contract, conn, config, watchers, recorder, alerts)
-                except Exception as error:  # noqa: BLE001 - a bad cycle must not end the run
-                    log(f"cycle failed: {type(error).__name__}: {error}")
-                    traceback.print_exc()
-
-                if guard.sample() and guard.over_budget:
-                    log(f"WARNING {guard.describe()} -- doubling poll interval")
-                    config.poll_seconds = min(config.poll_seconds * 2, 600)
-
+                runtime.step()
                 if config.once or stopping["flag"]:
                     break
                 elapsed = time.monotonic() - started
-                time.sleep(max(1.0, config.poll_seconds - elapsed))
+                # Short waits keep termination responsive even during backoff.
+                until = time.monotonic() + max(1, min(config.poll_seconds, 60) - elapsed)
+                while not stopping["flag"] and time.monotonic() < until:
+                    stop_event.wait(min(1, until - time.monotonic()))
         finally:
-            shutdown(conn, config, watchers, recorder)
-            log(guard.describe())
+            runtime.close()
 
     return 0
 

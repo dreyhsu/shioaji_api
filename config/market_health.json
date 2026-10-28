@@ -1,0 +1,19 @@
+{
+  "calendar_path": "market_calendar.json",
+  "bar_lag_seconds": 180,
+  "tick_stale_seconds": 10,
+  "tick_recovery_seconds": 60,
+  "book_stale_seconds": 60,
+  "heartbeat_seconds": 180,
+  "order_sync_seconds": 60,
+  "operation_timeout_seconds": 120,
+  "api_timeout_ms": 30000,
+  "recovery_failure_threshold": 2,
+  "recovery_initial_seconds": 5,
+  "recovery_maximum_seconds": 120,
+  "recovery_slow_after": 6,
+  "recovery_cooldown_seconds": 600,
+  "trading_reconnect_enabled": false,
+  "alert_repeat_seconds": 900,
+  "notification_retry_seconds": 60
+}

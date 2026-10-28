@@ -24,12 +24,14 @@ tell one-level data from five-level rather than silently mixing them.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 import shioaji as sj
+import market_clock
 
 # ~1200 updates is a few minutes of an active session: enough to hold the run-up
 # into a zone, bounded enough to never matter for memory.
@@ -123,19 +125,33 @@ def throttle(rows: list[dict], max_hz: float) -> list[dict]:
 class LiveBook:
     """Continuous ``BidAskFOPv1`` subscription feeding a :class:`BookBuffer`."""
 
-    def __init__(self, api: sj.Shioaji, contract, buffer: BookBuffer | None = None) -> None:
+    def __init__(self, api: sj.Shioaji, contract, buffer: BookBuffer | None = None, *, stale_seconds=60,
+                 clock=market_clock.now, monotonic=time.monotonic) -> None:
         self.api = api
         self.contract = contract
         self.buffer = buffer or BookBuffer()
         self.subscribed = False
         self.last_error: str | None = None
+        self.stale_seconds = stale_seconds
+        self.clock, self.monotonic = clock, monotonic
+        self.received_at = None
+        self._accepting = False
+        self._generation = 0
+        self._callback_lock = threading.RLock()
 
     # -- Rust callback thread: append only, nothing else ------------------------------
     def _on_bidask(self, quote) -> None:
+        if not self._accepting:
+            return
         try:
+            stamp = pd.Timestamp(quote.datetime)
+            if stamp.tzinfo is not None:
+                stamp = stamp.tz_convert("Asia/Taipei").tz_localize(None)
+            if pd.isna(stamp):
+                raise ValueError("missing book timestamp")
             self.buffer.append(
                 {
-                    "event_ts": pd.Timestamp(quote.datetime),
+                    "event_ts": stamp,
                     "source": "bidask_v1",
                     "levels": len(quote.bid_price or []),
                     "bid_price": _floats(quote.bid_price),
@@ -150,14 +166,24 @@ class LiveBook:
                     "simtrade": bool(quote.simtrade),
                 }
             )
+            self.received_at = self.monotonic()
         except Exception as error:  # noqa: BLE001 - a bad quote must not kill the stream
             self.last_error = f"{type(error).__name__}: {error}"
 
     def start(self) -> bool:
         if self.subscribed:
             return True
+        with self._callback_lock:
+            self._generation += 1
+            generation = self._generation
+            self._accepting = True
+            self.received_at = None
         try:
-            self.api.set_on_bidask_fop_v1_callback(self._on_bidask)
+            def callback(quote):
+                with self._callback_lock:
+                    if generation == self._generation:
+                        self._on_bidask(quote)
+            self.api.set_on_bidask_fop_v1_callback(callback)
             self.api.quote.subscribe(
                 self.contract, quote_type=sj.QuoteType.BidAsk, version=sj.QuoteVersion.v1
             )
@@ -165,9 +191,13 @@ class LiveBook:
         except Exception as error:  # noqa: BLE001
             self.last_error = f"{type(error).__name__}: {error}"
             self.subscribed = False
+            self._accepting = False
         return self.subscribed
 
     def stop(self) -> None:
+        with self._callback_lock:
+            self._accepting = False
+            self._generation += 1
         if not self.subscribed:
             return
         try:
@@ -182,7 +212,12 @@ class LiveBook:
     @property
     def alive(self) -> bool:
         """Subscribed *and* actually receiving -- a holiday satisfies only the first."""
-        return self.subscribed and self.buffer.received > 0
+        latest = self.buffer.latest()
+        if not self.subscribed or self.received_at is None or latest is None:
+            return False
+        age = (self.clock() - pd.Timestamp(latest["event_ts"])).total_seconds()
+        return (-5 <= age <= self.stale_seconds
+                and self.monotonic() - self.received_at <= self.stale_seconds)
 
 
 def snapshot_row(api: sj.Shioaji, contract) -> dict:

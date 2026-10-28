@@ -7,9 +7,9 @@ isolated database; no monitor process or broker credentials are needed.
 The page re-fetches once a minute, which matches how often the monitor has
 anything new.
 
-``/api/state`` carries a ``stale_minutes`` field: the page turns red when the data
-stops advancing, which is the only way to notice from the browser that the monitor
-has died.
+``/api/state`` includes independent market-health information and the legacy
+``stale_minutes`` field. ``health_watchdog`` supervises data and service progress
+without a browser; read-only ``/api/health`` never refreshes service heartbeats.
 
 ::
 
@@ -20,6 +20,7 @@ has died.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 import time
 from functools import wraps
@@ -38,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import db
 import market_clock
+import market_health as mh
 import session_bars as sb
 import snr_core as snr
 import trendline as tl
@@ -74,6 +76,11 @@ async def _lifespan(_app):
     runtime = getattr(_app.state, "mock_runtime", None)
     if runtime is not None:
         runtime.start()
+    else:
+        try:
+            await asyncio.to_thread(_trading_service().ensure_connected)
+        except Exception as error:
+            print(f"交易服務啟動未就緒：{type(error).__name__}；請檢查獨立健康監督", flush=True)
     try:
         yield
     finally:
@@ -85,6 +92,15 @@ async def _lifespan(_app):
 
 app = FastAPI(title="TMF S/R monitor", lifespan=_lifespan)
 app.include_router(mock_router)
+
+
+@app.get("/api/health")
+def api_health():
+    """Read-only; opening a health endpoint never logs in or renews a heartbeat."""
+    settings = mh.load_settings(CONFIG.get("health_config", mh.DEFAULT_CONFIG))
+    ready, monitor = mh.monitor_ready(CONFIG["db_path"], CONFIG["code"], _dashboard_now(), settings)
+    return {"bars_ready": ready, "monitor": monitor,
+            "trading": mh.read_health(mh.health_path(CONFIG["db_path"], "trading", CONFIG["code"]))}
 
 
 def _mock_runtime():
@@ -113,7 +129,8 @@ def _trading_service() -> trading.TradingService:
     if _TRADING_SERVICE is None or _TRADING_SERVICE.db_path != Path(CONFIG["db_path"]):
         if _TRADING_SERVICE is not None:
             _TRADING_SERVICE.close()
-        _TRADING_SERVICE = trading.TradingService(CONFIG["db_path"], CONFIG["code"])
+        _TRADING_SERVICE = trading.TradingService(CONFIG["db_path"], CONFIG["code"],
+                                                 health_config=CONFIG.get("health_config", mh.DEFAULT_CONFIG))
     return _TRADING_SERVICE
 
 
@@ -826,6 +843,7 @@ def api_state(code: str | None = None) -> dict:
         "last_minute_start": last_stamp.isoformat(sep=" "),
         "last_price": last_price,
         "stale_minutes": round(stale_minutes, 1),
+        "market_health": (None if _mock_runtime() is not None else api_health()),
         "in_session": sb.is_trading_time(_dashboard_now()),
         "hourly_bars": len(data["hourly"]),
         "minute_bars": len(minute_bars),
@@ -845,6 +863,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--code", default="TMFR1")
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--mock", action="store_true", help="離線 V 型行情與 Mock 券商，不讀取券商帳密")
+    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
     parser.add_argument("--days", type=int, default=30, help="how much history to chart")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -862,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
         db_path = args.db or Path(mkdtemp(prefix="shioaji-mock-")) / "mock.db"
         app.state.mock_runtime = MockRuntime(db_path, args.code)
         print(f"離線 Mock API · 獨立資料庫 {db_path} · 回放初始暫停", flush=True)
-    CONFIG.update({"code": args.code, "db_path": db_path, "days": args.days})
+    CONFIG.update({"code": args.code, "db_path": db_path, "days": args.days, "health_config": args.health_config})
     ensure_lwc_bundle()
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
     print(f"dashboard for {args.code} -> http://{args.host}:{args.port}", flush=True)

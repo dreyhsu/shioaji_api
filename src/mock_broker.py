@@ -94,6 +94,12 @@ class MockBroker:
     def list_trades(self):
         return list(self.trades)
 
+    def list_positions(self, account=None):
+        if not self.position:
+            return []
+        return [NS(code=self.contract.code, direction="Buy" if self.position > 0 else "Sell",
+                   quantity=abs(self.position))]
+
     def margin(self, account):
         initial = abs(self.position) * self.settings.initial_margin_per_contract
         return NS(status="Mock", risk_indicator=999.0,
