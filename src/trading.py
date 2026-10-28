@@ -1068,6 +1068,7 @@ class TradingService:
                                          target_price=target, breakeven_enabled=bool(row["breakeven_enabled"]),
                                          risk_revision=row["risk_revision"])
 
+    @risk_locked
     def cancel_entry(self, row_id: str) -> dict:
         """Cancel the unfilled remainder of a managed entry order."""
         row = self._active_order(row_id)
@@ -1079,6 +1080,7 @@ class TradingService:
             raise ValueError("進場委託已結束；若已有成交部位，請使用平倉功能")
 
         api = self.ensure_connected()
+        self._validate_connected_mode()
         # Use the SDK's existing trade object first. A synchronous status query
         # can wait up to 30 seconds before the cancellation is even submitted.
         trade = next((item for item in api.list_trades()
@@ -1087,9 +1089,19 @@ class TradingService:
             trade = self._trades_by_id().get(str(row["entry_trade_id"]))
         if trade is None:
             raise RuntimeError("無法取得券商委託狀態，為避免誤取消，請稍後重試")
-        with self._lock:
-            cancelled = api.cancel_order(trade)
+        self._persist_trade_state(row_id, entry=trade)
+        # A fill or external cancellation can arrive after the UI snapshot.
+        terminal = {"Filled", "Cancelled", "Failed", "Rejected"}
+        if _trade_status(trade) in terminal:
+            return self._public_order(self._active_order(row_id))
+        cancelled = api.cancel_order(trade)
         self._persist_trade_state(row_id, entry=cancelled or trade)
+        # Some SDK responses still say Submitted until a later report arrives.
+        # Query after sending the cancel, and only if confirmation is pending.
+        if _trade_status(cancelled or trade) not in terminal:
+            refreshed = self._trades_by_id().get(str(row["entry_trade_id"]))
+            if refreshed is not None:
+                self._persist_trade_state(row_id, entry=refreshed)
         return self._public_order(self._active_order(row_id))
 
     def orders(self) -> list[dict]:

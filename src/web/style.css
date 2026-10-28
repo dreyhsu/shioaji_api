@@ -114,6 +114,7 @@ body {
 .managed-order-actions button,
 .managed-order-actions select { border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; background: var(--panel); color: var(--text); cursor: pointer; font-size: 11px; }
 .managed-order-actions button.cancel-entry { border-color: #a94040; color: #ff8b8b; }
+.managed-order-actions .cancel-error { color: var(--resistance); font-size: 12px; overflow-wrap: anywhere; }
 .managed-order-actions button:disabled { opacity: .55; cursor: wait; }
 .order-help { display: block; margin-top: 8px; line-height: 1.6; }
 .trade-chart-range { color: var(--muted); font-size: 12px; padding: 0 2px 7px; min-height: 18px; }

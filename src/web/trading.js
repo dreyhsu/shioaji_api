@@ -9,6 +9,8 @@
   const riskDrafts = new Map();
   const riskSaving = new Set();
   const riskErrors = new Map();
+  const cancellingOrders = new Set();
+  const cancelErrors = new Map();
   let curvesListKey = null;
   let curveOptionsKey = null;
   let riskNotice = '';
@@ -168,6 +170,7 @@
   }
 
   function orderStatus(order) {
+    if (cancellingOrders.has(order.id)) return `取消處理中 · 券商狀態：${order.entry_status}`;
     if (order.error) return order.error;
     if (order.entry_status === 'CancelRequested') return '取消送出中';
     if (order.exit_status === 'waiting_entry_cancel' || order.exit_status === 'cancelling_entry') return '取消進場餘量中';
@@ -334,13 +337,18 @@
     }
   }
 
-  async function cancelEntry(order, button) {
+  async function cancelEntry(order) {
+    const id = order.id;
+    if (cancellingOrders.has(id) || !canCancelEntry(order)) return;
     const filled = Number(order.filled_quantity || 0);
     const remaining = Math.max(0, Number(order.quantity) - filled);
     const action = order.action === 'Buy' ? '買進' : '賣出';
     const text = `確定取消 ${order.contract_code} ${action}委託？\n已成交 ${filled} 口；將取消尚未成交的 ${remaining} 口。取消確認前仍可能成交；已成交部位會保留。`;
     if (!await confirmOperation(text)) return;
-    button.disabled = true;
+    if (cancellingOrders.has(id)) return;
+    cancellingOrders.add(id);
+    cancelErrors.delete(id);
+    renderOrders();
     message('正在向券商取消未成交委託…');
     try {
       const response = await fetch(`/api/trading/orders/${encodeURIComponent(order.id)}/cancel`, { method: 'POST' });
@@ -348,16 +356,35 @@
       if (!response.ok) throw new Error(result.detail || '取消委託失敗');
       state.orders = state.orders.map((item) => item.id === result.id ? result : item);
       renderOrders();
-      message(result.entry_status === 'Filled'
-        ? `取消未及完成，委託已成交 ${result.filled_quantity} 口；請確認持倉。`
-        : result.entry_status === 'Cancelled'
-        ? (Number(result.filled_quantity) ? `未成交餘量已取消；保留 ${result.filled_quantity} 口成交部位。` : '委託已取消。')
-        : `取消要求已送出，券商目前狀態：${result.entry_status}`);
-      void loadAccountMargin();
+      let current = result;
+      message('取消要求已送出，正在等待券商確認…');
+      for (let attempt = 0; attempt < 10 && !['Cancelled', 'Filled', 'Failed', 'Rejected'].includes(current.entry_status); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const statusResponse = await fetch('/api/trading/orders');
+        if (!statusResponse.ok) throw new Error('取消後委託狀態查詢失敗，請核對券商端');
+        acceptOrders(await statusResponse.json());
+        current = state.orders.find((item) => item.id === id);
+        if (!current) throw new Error('找不到取消後的委託狀態，請核對券商端');
+        renderOrders();
+      }
+      if (current.entry_status === 'Cancelled') {
+        message(Number(current.filled_quantity)
+          ? `未成交餘量已取消；保留 ${current.filled_quantity} 口成交部位。` : '券商已確認取消委託。');
+      } else if (current.entry_status === 'Filled') {
+        throw new Error(`取消未及完成，委託已全部成交 ${current.filled_quantity} 口；請確認持倉。`);
+      } else {
+        throw new Error(`取消尚未確認，券商狀態：${current.entry_status}。請核對券商端；系統會繼續更新委託狀態。`);
+      }
     } catch (error) {
+      cancelErrors.set(id, error.message);
       message(error.message, true);
     } finally {
-      await refreshOrders();
+      cancellingOrders.delete(id);
+      await Promise.all([
+        refreshOrders().catch((error) => cancelErrors.set(id, '委託更新失敗：' + error.message)),
+        loadAccountMargin(),
+      ]);
+      renderOrders();
     }
   }
 
@@ -382,7 +409,8 @@
       if (canManageCurve(order)) {
         actions.push(`<button type="button" data-edit-risk="${escapeHtml(order.id)}">編輯出場</button>`);
       }
-      if (canCancelEntry(order)) actions.push(`<button type="button" class="cancel-entry" data-cancel-order="${escapeHtml(order.id)}">${filled ? '取消未成交餘量' : '取消委託'}</button>`);
+      if (canCancelEntry(order)) actions.push(`<button type="button" class="cancel-entry" data-cancel-order="${escapeHtml(order.id)}" ${cancellingOrders.has(order.id) ? 'disabled' : ''}>${cancellingOrders.has(order.id) ? '等待取消確認…' : filled ? '取消未成交餘量' : '取消委託'}</button>`);
+      if (cancelErrors.has(order.id)) actions.push(`<span class="cancel-error" role="alert">${escapeHtml(cancelErrors.get(order.id))}</span>`);
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
       return `<div class="managed-order ${selected ? 'selected' : ''}" data-order-id="${escapeHtml(order.id)}" tabindex="0">
         <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${filled}/${order.quantity} 口</b><br>
@@ -392,14 +420,17 @@
     list.querySelectorAll('[data-order-id]').forEach((item) => {
       item.addEventListener('click', () => selectOrder(item.dataset.orderId));
       item.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') selectOrder(item.dataset.orderId);
+        if (event.target === item && (event.key === 'Enter' || event.key === ' ')) {
+          event.preventDefault();
+          selectOrder(item.dataset.orderId);
+        }
       });
     });
     list.querySelectorAll('[data-cancel-order]').forEach((button) => {
       button.addEventListener('click', (event) => {
         event.stopPropagation();
         const order = state.orders.find((item) => item.id === button.dataset.cancelOrder);
-        if (order) cancelEntry(order, button);
+        if (order) cancelEntry(order);
       });
     });
     list.querySelectorAll('[data-edit-risk]').forEach((button) => {
@@ -429,6 +460,7 @@
       return current && Number(current.risk_revision) > Number(order.risk_revision) ? current : order;
     });
     for (const id of riskDrafts.keys()) if (!orders.some((order) => order.id === id)) riskDrafts.delete(id);
+    for (const order of state.orders) if (order.entry_status === 'Cancelled') cancelErrors.delete(order.id);
     if (cancellationConfirmed) void loadAccountMargin();
   }
 
