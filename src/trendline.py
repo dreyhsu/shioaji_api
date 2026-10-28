@@ -1,4 +1,4 @@
-"""Hand-drawn trendlines on the 1h chart: their value at every bar.
+"""Hand-drawn trendlines: geometry in the source chart's bar-index space.
 
 A drawing is a list of anchors ``{"time": epoch, "price": float}`` clicked on
 the chart, plus a ``kind``:
@@ -33,12 +33,50 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+import session_bars as sb
+
 
 def _anchor_stamp(epoch) -> pd.Timestamp:
     return pd.to_datetime(int(epoch), unit="s")
 
 
 KINDS = ("line", "curve")
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "1h": 60}
+
+
+def source_bars(minutes: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
+    interval = TIMEFRAME_MINUTES[timeframe]
+    return (sb.minute_bars_to_hourly(minutes) if interval == 60
+            else sb.minute_bars_to_interval(minutes, interval))
+
+
+def _starts(bars: pd.DataFrame) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(bars["hour_start" if "hour_start" in bars else "timestamp"])
+
+
+def values_at_times(bars, anchors, stamps, kind="curve", timeframe="1h") -> pd.Series:
+    """Project source geometry onto timestamps without bridging missing buckets.
+
+    A minute close is compared at its minute-open timestamp, matching the chart.
+    Session breaks consume no source indices; incomplete source buckets are
+    usable geometry, while the signal itself still requires closed 1m candles.
+    """
+    stamps = pd.DatetimeIndex(stamps)
+    out = np.full(len(stamps), np.nan)
+    points = anchor_indices(bars, anchors, kind)
+    if not points:
+        return pd.Series(out)
+    starts = _starts(bars)
+    indices = starts.get_indexer(stamps, method="pad")
+    duration = pd.Timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
+    for position, (stamp, index) in enumerate(zip(stamps, indices)):
+        if index < 0:
+            continue
+        fraction = (stamp - starts[index]) / duration
+        if 0 <= fraction < 1:
+            value = value_at(points, index + fraction, kind)
+            out[position] = np.nan if value is None else value
+    return pd.Series(out)
 
 
 def anchor_indices(
@@ -55,7 +93,7 @@ def anchor_indices(
         return None
     if kind == "curve" and len(anchors) != 3:
         return None
-    starts = pd.to_datetime(hourly["hour_start"]).to_numpy()
+    starts = _starts(hourly).to_numpy()
     points = []
     for anchor in anchors:
         stamp = np.datetime64(_anchor_stamp(anchor["time"]))

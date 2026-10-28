@@ -276,12 +276,49 @@ def test_curve_round_trip(client):
     payload = client.get("/api/chart").json()
     assert payload["trendlines"][0]["kind"] == "curve"
     spec = next(s for s in payload["series"] if s["name"] == f"trendline_{line_id}")
-    assert spec["label"] == f"曲線 #{line_id}"
+    assert spec["label"] == f"[1h] 曲線 #{line_id}"
     values = [p.get("value") for p in spec["data"]]
     assert values[-30] == pytest.approx(20000)
     assert values[-20] == pytest.approx(20050)  # bent: chord would be 20100
     assert values[-10] == pytest.approx(20200)
     assert values[-9] == pytest.approx(20220)  # end tangent: +200 / 10 bars
+
+
+@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5)])
+def test_minute_curve_geometry_projects_to_every_chart_and_current_price(client, timeframe, step):
+    hourly = client.get("/api/chart?days=1").json()["bars"]
+    start = hourly[-3]["time"]
+    created = client.post("/api/trendlines", json={"kind": "curve", "timeframe": timeframe,
+        "anchors": [{"time": start + step * 60 * index, "price": price}
+                    for index, price in [(0, 20000), (2, 20000), (4, 20200)]]})
+    assert created.status_code == 200, created.text
+    line_id = created.json()["id"]
+    latest_value = None
+    for view in ("1m", "5m", "15m", "1h"):
+        payload = client.get(f"/api/chart?days=1&timeframe={view}").json()
+        assert payload["trendlines"][0]["timeframe"] == timeframe
+        series = next(s for s in payload["series"] if s["name"] == f"trendline_{line_id}")
+        assert series["label"] == f"[{timeframe}] 曲線 #{line_id}"
+        assert [p["time"] for p in series["data"]] == [bar["time"] for bar in payload["bars"]]
+        values = {point["time"]: point.get("value") for point in series["data"]}
+        assert values[start] == pytest.approx(20000)
+        # One hour later is on the end tangent in source-bar units.
+        assert values[start + 3600] == pytest.approx(20200 + 100 * (60 / step - 4))
+        if view == "1m":
+            assert values[start + step * 120] == pytest.approx(20050)
+            assert values[start + 60] == pytest.approx(20000 + 200 * (1 / step / 4) ** 2)
+            latest_value = series["data"][-1]["value"]
+    drawing = client.get("/api/trendlines").json()[0]
+    assert drawing["curve_price"] == pytest.approx(latest_value)
+    assert client.delete(f"/api/trendlines/{line_id}").status_code == 200
+    assert client.get("/api/trendlines").json() == []
+
+
+@pytest.mark.parametrize("kind,timeframe", [("curve", "15m"), ("curve", "2m"), ("line", "1m"), ("line", "5m")])
+def test_unsupported_drawing_timeframes_are_rejected(client, kind, timeframe):
+    response = client.post("/api/trendlines", json={"kind": kind, "timeframe": timeframe,
+        "anchors": [{"time": 100 + index * 60, "price": 20000} for index in range(3)]})
+    assert response.status_code == 422
 
 
 def test_box_override_round_trip(client):

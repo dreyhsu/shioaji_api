@@ -105,6 +105,12 @@ def test_line_value_and_slope_at_the_newest_bar():
     assert ar.line_now(HOURLY, line(1, (100, 110))) == (pytest.approx(130.0), pytest.approx(10.0))
 
 
+@pytest.mark.parametrize("timeframe", ["1m", "5m"])
+def test_hourly_alerts_ignore_minute_drawings_even_with_hourly_anchors(config, timeframe):
+    drawing = {**line(1, (100, 110)), "timeframe": timeframe}
+    assert run(config, 90, trendlines=[drawing]) == []
+
+
 def test_near_uses_points_or_atr(config):
     up = line(1, (100, 110))  # 130 at the newest bar
     assert rules(run(config, 155, trendlines=[up])) == ["trendline_near"]  # 25 <= 30

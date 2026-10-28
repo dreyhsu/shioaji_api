@@ -103,24 +103,32 @@
     if (selectedContract()) subscribeSelectedContract();
   }
 
+  function curveLabel(curve) {
+    return `[${curve.timeframe || '1h'}] ${curve.label || `曲線 #${curve.id}`}`;
+  }
+
+  function exitCurves() {
+    return state.curves.filter((curve) => (curve.timeframe || '1h') === '1h');
+  }
+
   async function loadCurves() {
     const response = await fetchRead('/api/trendlines');
     if (!response.ok) return;
     const lines = (await response.json()).filter((line) => line.kind === 'curve');
     state.curves = lines;
-    const listKey = lines.map((line) => `${line.id}:${line.label}`).join('|');
+    const listKey = lines.map((line) => `${line.id}:${line.timeframe}:${line.label}`).join('|');
     if (listKey !== curvesListKey) {
       const select = $('trade-curve');
       const previous = select.value;
       select.replaceChildren(new Option('固定 +2 ATR', ''));
-      for (const line of lines) {
-        select.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+      for (const line of exitCurves()) {
+        select.add(new Option(curveLabel(line), String(line.id)));
       }
-      if (lines.some((line) => String(line.id) === previous)) select.value = previous;
+      if (exitCurves().some((line) => String(line.id) === previous)) select.value = previous;
       const entrySelect = $('entry-curve');
       const entryPrevious = entrySelect.value;
-      entrySelect.replaceChildren(new Option('選擇手動保存的 1h 曲線', ''));
-      for (const line of lines) entrySelect.add(new Option(line.label || `曲線 #${line.id}`, String(line.id)));
+      entrySelect.replaceChildren(new Option('選擇手動保存的 1m／5m／1h 曲線', ''));
+      for (const line of lines) entrySelect.add(new Option(curveLabel(line), String(line.id)));
       if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
       curvesListKey = listKey;
     }
@@ -266,11 +274,11 @@
     if (editable) {
       const values = riskDrafts.get(order.id) || riskValues(order);
       const mode = $('risk-mode');
-      const optionsKey = state.curves.map((item) => `${item.id}:${item.label}`).join('|') + '|' + values.curve_id;
+      const optionsKey = exitCurves().map((item) => `${item.id}:${item.timeframe}:${item.label}`).join('|') + '|' + values.curve_id;
       if (curveOptionsKey !== optionsKey) {
         mode.replaceChildren(new Option('固定 target／stop', ''));
-        for (const curve of state.curves) mode.add(new Option(curve.label || `曲線 #${curve.id}`, String(curve.id)));
-        if (values.curve_id && !state.curves.some((item) => Number(item.id) === Number(values.curve_id))) {
+        for (const curve of exitCurves()) mode.add(new Option(curveLabel(curve), String(curve.id)));
+        if (values.curve_id && !exitCurves().some((item) => Number(item.id) === Number(values.curve_id))) {
           mode.add(new Option(`曲線 #${values.curve_id}（暫不可用）`, String(values.curve_id)));
         }
         curveOptionsKey = optionsKey;
@@ -532,7 +540,7 @@
     const side = entry?.action === 'Sell' ? '向下突破做空' : '向上突破做多';
     const labels = { armed: '等待' + side, submitting: '送單中，請勿重複送單', triggered: '已觸發' + (entry?.action === 'Sell' ? '做空' : '做多'), failed: '已停止，請核對委託狀態', cancelled: '已取消' };
     $('entry-state').textContent = entry
-      ? `${entry.contract_code} · 曲線 #${entry.curve_id} · ${entry.quantity} 口 · ${side}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
+      ? `${entry.contract_code} · [${entry.timeframe || '1h'}] 曲線 #${entry.curve_id} · ${entry.quantity} 口 · ${side}：${labels[entry.state] || entry.state}${entry.error ? ' · ' + entry.error : ''}`
       : entryEnabled ? '尚未啟用曲線進場' : '自動進場：停用，請檢查 config/trading.json';
     if (entry?.state === 'armed' && !state.entryReady) $('entry-state').textContent += ' · 行情／券商未就緒，恢復後等待新訊號';
     const quantity = Number($('entry-quantity').value);
@@ -558,7 +566,8 @@
       }
       const mode = state.mock ? '離線 Mock' : simulation ? '券商 Simulation' : '正式交易';
       const side = action === 'Sell' ? '向下突破做空（賣出）' : '向上突破做多（買進）';
-      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n曲線：#${curveId}\n方向：${side}\n口數：${quantity}\n委託：市價 MKT / IOC\n僅觸發一次，依成交均價設定停損、停利各 2 倍進場 1h ATR。\n確認啟用？`)) return;
+      const curve = state.curves.find((item) => Number(item.id) === curveId);
+      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n曲線：${curve ? curveLabel(curve) : '#' + curveId}\n訊號：相鄰已收盤 1 分 K 穿越\n方向：${side}\n口數：${quantity}\n委託：市價 MKT / IOC\n僅觸發一次，依成交均價設定停損、停利各 2 倍進場 1h ATR。\n確認啟用？`)) return;
     }
     entryBusy = true;
     renderEntry();

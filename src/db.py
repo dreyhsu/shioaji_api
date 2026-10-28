@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS trendlines (
   label TEXT, color TEXT,
   anchors TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'line',
+  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h')),
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
@@ -244,6 +245,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # Columns added after the first release.  sqlite has no "ADD COLUMN IF NOT
 # EXISTS", so each one is applied only when missing.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("trendlines", "timeframe", "ALTER TABLE trendlines ADD COLUMN timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h'))"),
     ("curve_entries", "action", "ALTER TABLE curve_entries ADD COLUMN action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell'))"),
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
@@ -813,6 +815,7 @@ def insert_trendline(
     label: str | None = None,
     color: str | None = None,
     kind: str = "line",
+    timeframe: str = "1h",
     created_at: Any = None,
 ) -> int:
     """Store a hand drawing; ``anchors`` is ``[{"time": epoch, "price": p}, ...]``.
@@ -825,14 +828,15 @@ def insert_trendline(
         key=lambda a: a["time"],
     )
     cursor = conn.execute(
-        "INSERT INTO trendlines (code, label, color, anchors, kind, enabled, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?)",
+        "INSERT INTO trendlines (code, label, color, anchors, kind, timeframe, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
         (
             code,
             label,
             color,
             json.dumps(ordered),
             kind,
+            timeframe,
             _text(market_clock.now() if created_at is None else created_at),
         ),
     )

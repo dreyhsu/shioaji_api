@@ -36,6 +36,25 @@ def save(service, order, **changes):
     return service.update_risk_settings(order["id"], **payload)
 
 
+@pytest.mark.parametrize("timeframe", ["1m", "5m"])
+def test_minute_curve_cannot_replace_hourly_profit_target(fake_service, timeframe):
+    service, api, _ = fake_service
+    order = filled(service, api)
+    with db.session(service.db_path) as conn:
+        curve_id = db.insert_trendline(conn, service.code,
+            [{"time": int(pd.Timestamp(stamp).timestamp()), "price": 46270}
+             for stamp in ("2026-10-05 08:45", "2026-10-05 09:45", "2026-10-05 10:45")],
+            kind="curve", timeframe=timeframe)
+    with pytest.raises(ValueError, match="1 小時曲線"):
+        save(service, order, curve_id=curve_id)
+    with pytest.raises(ValueError, match="停利曲線"):
+        service.place_order({"confirmed": True, "simulation": True, "contract_code": "TMF202611",
+            "action": "Buy", "quantity": 1, "price": 46270, "price_type": "LMT", "order_type": "ROD",
+            "curve_id": curve_id})
+    assert service._curve_value({**order, "curve_id": curve_id}) is None
+    assert service._active_order(order["id"])["curve_id"] is None
+
+
 @pytest.mark.parametrize("action,direction", [("Buy", 1), ("Sell", -1)])
 def test_every_tick_latches_breakeven_before_monitor_and_survives_restart(fake_service, action, direction):
     service, api, _ = fake_service

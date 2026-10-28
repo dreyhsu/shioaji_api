@@ -705,7 +705,7 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
                 (int(row["curve_id"]), row["code"]),
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
@@ -788,7 +788,7 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
                 cache_key,
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
@@ -1173,7 +1173,7 @@ class TradingService:
         if curve_id is not None:
             with db.session(self.db_path) as conn:
                 curve = conn.execute(
-                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
                     (int(curve_id), self.code),
                 ).fetchone()
             if curve is None:
@@ -1283,7 +1283,7 @@ class TradingService:
                 raise ValueError("多單 stop 須低於 target；空單 stop 須高於 target")
         else:
             with db.session(self.db_path) as conn:
-                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
                                      (curve_id, row["code"])).fetchone()
             if curve is None:
                 raise ValueError("選用的 1 小時曲線不存在或已刪除")
@@ -1348,7 +1348,7 @@ class TradingService:
             raise ValueError("選用曲線目前無法計算")
         with db.session(self.db_path) as conn:
             record = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
                 (row["curve_id"], row["code"]),
             ).fetchone()
             if record is None:

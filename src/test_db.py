@@ -65,6 +65,23 @@ def test_migration_adds_the_source_column(conn):
     assert "source" in columns
 
 
+def test_trendline_timeframe_migration_preserves_old_drawings(tmp_path):
+    connection = db.connect(tmp_path / "legacy-lines.db")
+    legacy_schema = db.SCHEMA.replace(
+        "  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h')),\n", "")
+    connection.executescript(legacy_schema)
+    connection.execute("INSERT INTO trendlines (code, anchors, kind, created_at) VALUES (?, ?, ?, ?)",
+                       ("TMFR1", '[]', "curve", "2026-10-28 08:45"))
+    db.init_schema(connection)
+    assert db.load_trendlines(connection, "TMFR1")[0]["timeframe"] == "1h"
+    anchors = [{"time": 1, "price": 100}, {"time": 2, "price": 101}, {"time": 3, "price": 102}]
+    for timeframe in ("1m", "5m"):
+        db.insert_trendline(connection, "TMFR1", anchors, kind="curve", timeframe=timeframe)
+    db.init_schema(connection)
+    assert [line["timeframe"] for line in db.load_trendlines(connection, "TMFR1")] == ["1h", "1m", "5m"]
+    connection.close()
+
+
 # --------------------------------------------------------------------------------------
 # Bars
 # --------------------------------------------------------------------------------------

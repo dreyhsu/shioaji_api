@@ -240,6 +240,8 @@ def line_now(hourly: pd.DataFrame, line: dict) -> tuple[float, float] | None:
 def _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config) -> list[Candidate]:
     out = []
     for line in trendlines or []:
+        if line.get("timeframe", "1h") != "1h":
+            continue
         kind = line.get("kind") or "line"
         now = line_now(hourly, line)
         if now is None:

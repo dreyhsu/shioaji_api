@@ -238,25 +238,14 @@ def _boxes_payload(data) -> list[dict]:
 
 
 def _drawing_values(data, line: dict) -> pd.Series:
-    """Sample an hourly drawing on the selected candle grid without changing it."""
-    hourly = data["hourly"]
-    anchors, kind = line["anchors"], line.get("kind") or "line"
-    if "chart_bars" not in data:
-        return tl.line_values(hourly, anchors, kind)
-    bars = data["chart_bars"]
-    points = tl.anchor_indices(hourly, anchors, kind)
-    if points is None:
-        return pd.Series(float("nan"), index=bars.index)
-    starts = pd.DatetimeIndex(hourly["timestamp"])
-    indices = starts.get_indexer(bars["timestamp"], method="pad")
-    values = []
-    for stamp, index in zip(bars["timestamp"], indices):
-        if index < 0:
-            values.append(None)
-            continue
-        fraction = min(float((stamp - starts[index]) / pd.Timedelta(hours=1)), 1.0)
-        values.append(tl.value_at(points, index + fraction, kind))
-    return pd.Series(values, index=bars.index, dtype=float)
+    """Sample each drawing in its source timeframe on the selected candle grid."""
+    timeframe = line.get("timeframe", "1h")
+    sources = data.setdefault("drawing_bars", {"1h": data["hourly"]})
+    if timeframe not in sources:
+        sources[timeframe] = tl.source_bars(data["minute_bars"], timeframe)
+    bars = data.get("chart_bars", data["hourly"])
+    return tl.values_at_times(sources[timeframe], line["anchors"], bars["timestamp"],
+                              line.get("kind") or "line", timeframe)
 
 
 def _series_payload(data) -> list[dict]:
@@ -291,7 +280,7 @@ def _series_payload(data) -> list[dict]:
         specs.append(
             {
                 "name": f"trendline_{line['id']}",
-                "label": line.get("label") or tl.default_label(line),
+                "label": f"[{line.get('timeframe', '1h')}] {line.get('label') or tl.default_label(line)}",
                 "pane": 0,
                 "type": "line",
                 "color": line.get("color") or TRENDLINE_COLOR,
@@ -491,6 +480,7 @@ class TrendlineIn(BaseModel):
     color: str | None = Field(default=None, max_length=20)
     anchors: list[Anchor] = Field(min_length=2, max_length=20)
     kind: Literal["line", "curve"] = "line"
+    timeframe: Literal["1m", "5m", "1h"] = "1h"
 
 
 def _invalidate_cache() -> None:
@@ -504,16 +494,16 @@ def api_trendlines(code: str | None = None) -> list[dict]:
     with db.session(CONFIG["db_path"]) as conn:
         lines = db.load_trendlines(conn, code)
         minutes = db.load_minute_bars(conn, code)
-    hourly = sb.minute_bars_to_hourly(minutes) if not minutes.empty else pd.DataFrame()
+    sources = {}
     for line in lines:
         line["curve_price"] = None
-        if line["kind"] == "curve" and not hourly.empty:
-            points = tl.anchor_indices(hourly, line["anchors"], "curve")
-            stamp = pd.Timestamp(minutes.iloc[-1]["minute_start"])
-            bucket = sb.hour_start_of(stamp)
-            fraction = 0 if bucket is None else (stamp - bucket).total_seconds() / 3600.0
-            if points:
-                line["curve_price"] = tl.value_at(points, len(hourly) - 1 + fraction, "curve")
+        if line["kind"] == "curve" and not minutes.empty:
+            timeframe = line["timeframe"]
+            if timeframe not in sources:
+                sources[timeframe] = tl.source_bars(minutes, timeframe)
+            value = tl.values_at_times(sources[timeframe], line["anchors"],
+                                      [minutes.iloc[-1]["minute_start"]], timeframe=timeframe).iloc[0]
+            line["curve_price"] = float(value) if pd.notna(value) else None
     return lines
 
 
@@ -526,9 +516,11 @@ def api_create_trendline(body: TrendlineIn) -> dict:
         raise HTTPException(status_code=422, detail="anchors must be on different bars")
     if body.kind == "curve" and len(anchors) != 3:
         raise HTTPException(status_code=422, detail="a curve takes exactly 3 anchors")
+    if body.kind == "line" and body.timeframe != "1h":
+        raise HTTPException(status_code=422, detail="straight lines require timeframe=1h")
     with db.session(CONFIG["db_path"]) as conn:
         line_id = db.insert_trendline(
-            conn, code, anchors, label=body.label, color=body.color, kind=body.kind
+            conn, code, anchors, label=body.label, color=body.color, kind=body.kind, timeframe=body.timeframe
         )
     _invalidate_cache()
     return {"id": line_id}

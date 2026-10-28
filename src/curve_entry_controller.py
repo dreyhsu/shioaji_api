@@ -23,7 +23,8 @@ class CurveEntryController:
         service = self.service
         with db.session(service.db_path) as conn:
             row = conn.execute(
-                "SELECT * FROM curve_entries WHERE code = ? AND simulation = ? ORDER BY id DESC LIMIT 1",
+                "SELECT e.*, t.timeframe FROM curve_entries e LEFT JOIN trendlines t ON t.id = e.curve_id "
+                "WHERE e.code = ? AND e.simulation = ? ORDER BY e.id DESC LIMIT 1",
                 (service.code, int(service.simulation)),
             ).fetchone()
         if row is None:
@@ -57,11 +58,15 @@ class CurveEntryController:
             if contract_code not in contracts:
                 raise ValueError("請選擇有效的月份合約")
             service._validate_connected_mode()
-            _atr, hourly = service._risk_context(service.code)
+            service._risk_context(service.code)
             curve = self._curve(curve_id)
-            if curve is None or not tl.anchor_indices(hourly, curve["anchors"], "curve"):
-                raise ValueError("請選擇已保存、有效的 1 小時曲線")
             now = pd.Timestamp(service._now())
+            with db.session(service.db_path) as conn:
+                minutes = db.load_minute_bars(conn, service.code)
+            closed = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now]
+            if (curve is None or curve["timeframe"] not in tl.TIMEFRAME_MINUTES
+                    or not tl.anchor_indices(tl.source_bars(closed, curve["timeframe"]), curve["anchors"], "curve")):
+                raise ValueError("請選擇已保存、有效的 1m／5m／1h 曲線")
             service.subscribe_contract(contract_code)
             try:
                 with db.session(service.db_path) as conn:
@@ -126,7 +131,7 @@ class CurveEntryController:
         if not quote or service._fresh_risk_quote({"contract_code": str(contract.code)}) is None:
             return
         self._update(entry["id"], last_checked_minute=latest.isoformat(sep=" "))
-        if not crossed_curve(closed, curve["anchors"], now, entry["action"]):
+        if not crossed_curve(closed, curve["anchors"], now, entry["action"], curve["timeframe"]):
             return
         with db.session(service.db_path) as conn:
             claimed = conn.execute("UPDATE curve_entries SET state = 'submitting' WHERE id = ? AND state = 'armed'",

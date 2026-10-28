@@ -102,9 +102,9 @@
         <div id="trade-message" class="trade-message" role="status"></div>
       </div>
       <div id="curve-panel" role="tabpanel" aria-labelledby="curve-tab" hidden>
-        <p class="trade-muted entry-help">保存 1h 曲線後，等待相鄰已收盤 1 分 K 穿越曲線，僅進場一次。進場曲線不會自動套用為停利曲線。啟用後若要變更設定，請先取消再重新啟用。</p>
+        <p class="trade-muted entry-help">保存 1m／5m／1h 曲線後，統一等待相鄰已收盤 1 分 K 穿越曲線，僅進場一次。成交後預設停損、停利各 2 倍 1h ATR；進場曲線不會自動套用為停利曲線。啟用後若要變更設定，請先取消再重新啟用。</p>
         <label class="trade-field">進場曲線
-          <select id="entry-curve"><option value="">先在 1h 圖手動畫曲線</option></select>
+          <select id="entry-curve"><option value="">先在 1m／5m／1h 圖手動畫曲線</option></select>
         </label>
         <div class="trade-field">
           <span>突破方向</span>
@@ -161,7 +161,7 @@
         <button type="button" id="fit">全部</button>
       </div>
     </div>
-    <div class="chart-note">支撐／阻力箱、趨勢線與 ATR 依 1h 計算；畫線請切換至 1h。</div>
+    <div class="chart-note">1m／5m／1h 可畫曲線，各週期曲線皆可選作進場條件；直線限 1h。支撐／阻力箱與 ATR 仍依 1h 計算。</div>
     <div id="trade-chart-range" class="trade-chart-range" role="status">選取右側委託／部位，在圖表查看進場、停損與停利價位。</div>
     <form id="risk-editor" class="risk-editor" hidden>
       <label>停利方式 <select id="risk-mode" aria-label="停利方式"></select></label>
@@ -200,8 +200,8 @@
   <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
-  <script src="/static/lwc_app.js?v=pnl-hover-2"></script>
-  <script src="/static/trading.js?v=breakeven-config-1"></script>
+  <script src="/static/lwc_app.js?v=multiframe-curves-1"></script>
+  <script src="/static/trading.js?v=multiframe-curves-1"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

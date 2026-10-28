@@ -299,7 +299,8 @@ const HINTS = {
 };
 
 function setDrawing(kind) {
-  if (kind && (timeframe !== '1h' || displayedTimeframe !== '1h')) return;
+  if (kind && (switchingTimeframe || displayedTimeframe !== timeframe
+    || !canDraw(kind, timeframe))) return;
   draw.kind = kind;
   draw.anchors = [];
   draw.hover = null;
@@ -476,7 +477,7 @@ function onDrawHover(param) {
 async function saveDrawing() {
   const enough = draw.kind === 'curve' ? draw.anchors.length === 3 : draw.anchors.length >= 2;
   if (!enough) return;
-  const body = { kind: draw.kind, anchors: draw.anchors };
+  const body = { kind: draw.kind, anchors: draw.anchors, timeframe: displayedTimeframe };
   if (CODE) body.code = CODE;
   const response = await fetch('/api/trendlines', {
     method: 'POST',
@@ -511,7 +512,7 @@ function renderTrendlineList(lines) {
       const noun = line.kind === 'curve' ? '曲線' : '趨勢線';
       return (
         '<span class="tl"><i style="background:' + (line.color || TRENDLINE_COLOR) + '"></i>' +
-        (line.label || noun + ' #' + line.id) +
+        '[' + (line.timeframe || '1h') + '] ' + (line.label || noun + ' #' + line.id) +
         (line.kind === 'curve' ? '' : ' <small>(' + line.anchors.length + ' 點)</small>') +
         '<button type="button" data-id="' + line.id + '" title="刪除">✕</button></span>'
       );
@@ -908,6 +909,10 @@ document.getElementById('recent').addEventListener('click', () => {
   frameInitialViewport(lastBars.length);
 });
 
+function canDraw(tool, frame) {
+  return frame === '1h' || (tool === 'curve' && ['1m', '5m'].includes(frame));
+}
+
 function updateTimeframeButtons(loading = false) {
   const group = document.getElementById('timeframes');
   group.setAttribute('aria-busy', String(loading));
@@ -919,8 +924,9 @@ function updateTimeframeButtons(loading = false) {
   }
   for (const tool of ['line', 'curve']) {
     const button = document.getElementById('draw-' + tool);
-    button.disabled = loading || timeframe !== '1h';
-    button.title = timeframe === '1h' ? '' : '切換至 1h 畫線';
+    button.disabled = loading || !canDraw(tool, timeframe);
+    button.title = canDraw(tool, timeframe) ? ''
+      : tool === 'curve' ? '切換至 1m、5m 或 1h 畫曲線' : '切換至 1h 畫線';
   }
 }
 
