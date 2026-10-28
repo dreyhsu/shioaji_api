@@ -16,6 +16,7 @@ import threading
 import pandas as pd
 import market_clock
 import market_health as mh
+from file_lease import FileLease
 
 
 def age_seconds(value, now):
@@ -115,7 +116,7 @@ class IncidentNotifier:
                 event = {"at": mh.iso(now), "channel": key, "active": active,
                          "reason": issues.get(key, "恢復"), "delivery": "pending" if self.send else "log_only"}
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.with_suffix(".events.jsonl").open("a") as stream:
+                with self.path.with_suffix(".events.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(event, ensure_ascii=False) + "\n")
                 print(json.dumps(event, ensure_ascii=False), flush=True)
             if active:
@@ -165,9 +166,7 @@ def main(argv=None):
     settings = mh.load_settings(args.health_config)
     directory = mh.health_path(args.db, "monitor", args.code).parent
     directory.mkdir(parents=True, exist_ok=True)
-    import fcntl
-    with (directory / f"watchdog-{args.code}.lock").open("a+") as lease:
-        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with FileLease(directory / f"watchdog-{args.code}.lock"):
         send = None
         if args.notify:
             import telegram_notify
@@ -176,6 +175,8 @@ def main(argv=None):
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, lambda *_: stop.set())
         while not stop.is_set():
             calendar = mh.SessionCalendar.load(settings.calendar_path)
             now = market_clock.now()

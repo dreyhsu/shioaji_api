@@ -6,6 +6,10 @@ Telegram 通知，並偵測箱體內的小時 K 棒反轉型態。
 
 包含行情監控、通知與手動期貨下單；可使用下方離線 Mock API 測試，不需券商帳密。
 
+支援 macOS 與 Windows，統一使用 conda 環境 `tss`；正式區為 Windows laptop。
+健康狀態的程序鎖依平台使用標準函式庫，不需安裝 `fcntl`。常駐服務的 Windows 工作排程器與
+macOS launchd 操作方式見[行情故障恢復操作手冊](doc/market_connection_recovery.md)。
+
 ## 離線 Mock API：V 型行情測試
 
 ```bash

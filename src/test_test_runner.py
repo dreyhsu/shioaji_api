@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 from unittest.mock import Mock
 import os
+import pytest
 
 import test_runner as runner
 
@@ -41,6 +42,7 @@ def test_mixed_changes_with_an_unmapped_module_run_everything(tmp_path):
     assert runner.related_tests([Path("src/signal.py"), Path("src/new_module.py")], root) is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell hook; native Python test runner is covered separately")
 def test_precommit_hook_uses_tss_and_propagates_test_failure(tmp_path):
     commands = tmp_path / "commands"
     commands.mkdir()
@@ -55,6 +57,7 @@ def test_precommit_hook_uses_tss_and_propagates_test_failure(tmp_path):
     assert log.read_text().splitlines() == ["run", "--no-capture-output", "-n", "tss", "python", "tools/test_runner.py", "--all"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell hook; native Python test runner is covered separately")
 def test_precommit_hook_reports_missing_conda(tmp_path):
     result = subprocess.run(["/bin/sh", str(runner.ROOT / ".githooks/pre-commit")],
                             env=dict(os.environ, PATH=str(tmp_path)), capture_output=True, text=True)
@@ -75,7 +78,7 @@ def test_runner_propagates_failure_and_uses_current_environment(monkeypatch, tmp
     process = Mock(return_value=subprocess.CompletedProcess([], 1))
     monkeypatch.setattr(runner.subprocess, "run", process)
     assert runner.run_tests([Path("src/test_signal.py")], tmp_path) == 1
-    assert process.call_args.args[0] == [runner.sys.executable, "-m", "pytest", "-q", "src/test_signal.py"]
+    assert process.call_args.args[0] == [runner.sys.executable, "-m", "pytest", "-q", str(Path("src/test_signal.py"))]
 
 
 def test_watch_merges_saves_and_rechecks_changes_during_tests(monkeypatch):

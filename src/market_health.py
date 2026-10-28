@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import timedelta
-import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -18,14 +17,17 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 import pandas as pd
 import market_clock
 from connection_recovery import RecoveryPolicy
+from file_lease import FileLease, LeaseUnavailable
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config" / "market_health.json"
+IS_WINDOWS = sys.platform == "win32"
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,7 @@ def load_settings(path=DEFAULT_CONFIG):
     path = Path(path)
     if not path.exists():
         return HealthSettings()
-    values = json.loads(path.read_text())
+    values = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(values, dict) or set(values) - {item.name for item in fields(HealthSettings)}:
         raise ValueError(f"invalid market health settings: {path}")
     if "calendar_path" in values:
@@ -122,7 +124,7 @@ class SessionCalendar:
     @classmethod
     def load(cls, path):
         try:
-            return cls(json.loads(Path(path).read_text()))
+            return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
         except (OSError, ValueError, KeyError, TypeError) as error:
             result = cls()
             result.error = f"calendar unavailable: {type(error).__name__}"
@@ -197,7 +199,7 @@ def health_path(db_path, role, code):
 
 def read_health(path):
     try:
-        result = json.loads(Path(path).read_text())
+        result = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         return result if isinstance(result, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -208,11 +210,21 @@ def atomic_json(path, document):
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
-        with os.fdopen(descriptor, "w") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(document, stream, ensure_ascii=False, allow_nan=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Windows readers/antivirus may briefly deny replacing an open file.
+        # Keep the old snapshot intact and retry briefly; permanent denial is
+        # still reported rather than deleting the destination or hiding I/O errors.
+        for attempt in range(4):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if not IS_WINDOWS or attempt == 3:
+                    raise
+                time.sleep(0.01 * 2 ** attempt)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -222,7 +234,7 @@ def fingerprint():
     sources = {}
     for name in ("monitor.py", "dashboard.py", "trading.py", "shioaji_client.py", "market_health.py", "connection_recovery.py",
                  "db.py", "orderbook.py", "session_bars.py", "market_clock.py", "curve_entry.py", "curve_entry_controller.py",
-                 "shioaji_order_adapter.py", "place_order.py"):
+                 "shioaji_order_adapter.py", "place_order.py", "file_lease.py"):
         sources[name] = hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, timeout=2).stdout.strip()
@@ -246,15 +258,19 @@ class HealthPublisher:
         if self.lock is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        stream = self.path.with_suffix(".lock").open("a+")
+        lease = FileLease(self.path.with_suffix(".lock"))
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            stream.close()
+            lease.acquire()
+        except LeaseUnavailable:
             raise RuntimeError(f"another {self.document['role']} owns {self.path}") from None
-        self.lock = stream
-        self.document.update(fingerprint())
-        self.publish()
+        self.lock = lease
+        try:
+            self.document.update(fingerprint())
+            self.publish()
+        except BaseException:
+            self.lock = None
+            lease.close()
+            raise
 
     def publish(self, **changes):
         if self.lock is None:

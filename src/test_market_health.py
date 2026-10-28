@@ -147,3 +147,49 @@ def test_live_book_checks_both_receipt_and_exchange_time_and_old_callbacks():
     now[0] += pd.Timedelta(seconds=11)
     callbacks[1](quote)
     assert not book.alive  # repeated delivery of old exchange timestamps is stale
+
+
+def test_health_and_notepad_calendar_use_explicit_utf8(tmp_path):
+    path = tmp_path / "health.json"
+    document = {"state": "行情恢復", "detail": "✅"}
+    mh.atomic_json(path, document)
+    assert json.loads(path.read_bytes().decode("utf-8")) == document
+    assert mh.read_health(path) == document
+    calendar = calendar_document()
+    calendar["source"] = "期交所公告核對 ✅"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(calendar, ensure_ascii=False).encode("utf-8"))
+    assert mh.SessionCalendar.load(path).source == calendar["source"]
+
+
+def test_windows_brief_sharing_conflict_retries_atomic_replace(monkeypatch, tmp_path):
+    monkeypatch.setattr(mh, "IS_WINDOWS", True)
+    sleeps, attempts = [], []
+    original = mh.os.replace
+    def replace(source, destination):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise PermissionError("snapshot briefly open in another process")
+        return original(source, destination)
+    monkeypatch.setattr(mh.os, "replace", replace)
+    monkeypatch.setattr(mh.time, "sleep", sleeps.append)
+    path = tmp_path / "state.json"
+    mh.atomic_json(path, {"state": "healthy"})
+    assert mh.read_health(path) == {"state": "healthy"}
+    assert sleeps == [0.01, 0.02] and len(attempts) == 3
+
+
+def test_windows_permanent_replace_denial_is_bounded_and_keeps_old_snapshot(monkeypatch, tmp_path):
+    path = tmp_path / "state.json"
+    mh.atomic_json(path, {"state": "old"})
+    attempts, sleeps = [], []
+    monkeypatch.setattr(mh, "IS_WINDOWS", True)
+    def denied(*_):
+        attempts.append(1)
+        raise PermissionError("permanently read-only")
+    monkeypatch.setattr(mh.os, "replace", denied)
+    monkeypatch.setattr(mh.time, "sleep", sleeps.append)
+    with pytest.raises(PermissionError):
+        mh.atomic_json(path, {"state": "new"})
+    assert len(attempts) == 4 and sleeps == [0.01, 0.02, 0.04]
+    assert mh.read_health(path) == {"state": "old"}
+    assert list(tmp_path.iterdir()) == [path]

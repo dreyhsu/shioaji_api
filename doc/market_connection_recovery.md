@@ -4,11 +4,14 @@
 
 2026-10-28 驗證：完整離線套件 610 項通過，包含本次新增 53 項故障與部署驗證；前端 JavaScript 語法檢查通過。仍有既有 `pytest_freezegun` 的 deprecation warnings。券商模擬帳號整合、正式程序角色、實際成交及跨程序登入／登出影響尚未核實，不在離線測試的證明範圍內。
 
+後續跨平台修正：macOS 的 `tss` 完整離線套件 622 項通過，五個程式入口的 `--help` 檢查通過。新增 Windows 鎖定／子程序控制分支模擬、UTF-8 BOM 與檔案分享衝突測試；尚未在 Windows 原生主機執行這批測試，不將模擬分支測試視為 Windows 正式驗收。
+
 ## 功能與責任
 
 | 模組 | 輸入 → 輸出 | 責任 |
 |---|---|---|
 | `connection_recovery` | 例外圖、可注入時鐘、策略 → 分類與下一次重試時間 | 辨識兩條例外鏈及循環；DB 錯誤優先，session 快速失敗；有上限退避、慢速斷路器；不做 I/O |
+| `file_lease` | 本機鎖定檔 → 程序獨占租約 | Windows 使用 `msvcrt`、macOS 使用 `fcntl`；非阻塞、關閉釋放、不刪除鎖定檔 |
 | `market_health` | 已核對時段、分鐘資料、時間 → 健康結果；健康快照 → 原子檔案 | 封閉分鐘、缺口與日曆驗證；程序租約與來源指紋；不靠行情 DB 寫入健康狀態 |
 | `monitor.MonitorRuntime` | API factory、DB、時鐘 → 回補、指標與健康狀態 | 重新解析合約、綁定 callback、重訂閱委託簿；保留 visits；完整驗證前關閉交易讀取閘門 |
 | `trading.TradingService` | 注入券商、逐合約 tick、健康資料 → 既有交易週期 | 不重送不明委託；重連後核對訂單與雙方向部位；tick 與 K 線獨立判斷 |
@@ -79,6 +82,8 @@ conda run -n tss python tools/market_services.py preflight --db data/tmf.db --co
 
 ## 常駐方式與獨立通知
 
+專案需同時支援 macOS 與 Windows；正式區是 Windows laptop。Dashboard、monitor、watchdog 與 supervisor 使用相同 Python 入口，程序鎖在 Windows 使用 `msvcrt`，macOS 使用 `fcntl`，不需額外安裝鎖定套件。鎖定檔不刪除，程序正常關閉或終止後由作業系統釋放；這些鎖適用於同一主機的本機資料庫目錄。
+
 以下是部署時的啟動命令，**不是本次已執行的動作**。三個服務要由作業系統分別管理，不要放在 Dashboard 內同一個執行緒。
 
 ```sh
@@ -94,6 +99,34 @@ conda run -n tss python tools/market_services.py render --db data/tmf.db --code 
 ```
 
 安裝前建立 `data/logs`、檢查產生的 Python 路徑確實屬於 `tss`、模式／DB／port 正確、沒有舊服務衝突，再依實際部署帳號用 launchd 載入。monitor／watchdog 設為獨立重啟；交易服務 `KeepAlive=false`，意外終止需核對後人工啟動，避免無人注意的交易程序循環重啟。重連開關為啟動時設定，不支援在不重啟下變更。
+
+### Windows 正式區
+
+`market_services.py render` 僅產生 macOS launchd 檔；Windows 仍可執行 `preflight`，並使用上方三個跨平台啟動命令。原本的 Dashboard 命令無需變更：
+
+```bat
+conda run --no-capture-output -n tss python src/dashboard.py --code TMFR1 --port 8765
+```
+
+需要常駐時，用 Windows 工作排程器建立 monitor、trading、watchdog 三個獨立工作。先取得 `tss` 的 Python 路徑：
+
+```bat
+conda run -n tss python -c "import sys; print(sys.executable)"
+```
+
+各工作的「程式」填入上一步實際輸出的 Python 完整路徑；「開始位置」填入正式區專案資料夾，例如 `C:\Users\Drey\Documents\Python_Scripts\shioaji_api`；引數分別為：
+
+```text
+-X utf8 -u tools\run_market_service.py --role monitor --db data\tmf.db --code TMFR1
+-X utf8 -u tools\run_market_service.py --role trading --db data\tmf.db --code TMFR1 --port 8765
+-X utf8 -u src\health_watchdog.py --db data\tmf.db --code TMFR1 --mode production --notify
+```
+
+以有權讀取專案設定及券商憑證的部署帳號執行，設定同一工作「不啟動新的執行個體」。monitor／watchdog 可設定失敗後重啟；trading 不設定自動重啟，先核對委託與部位。正式模式仍須確認 `.env` 的 `SHIOAJI_SIMULATION=0`。工作排程器的執行時間限制、電池供電及睡眠條件也應符合常駐需求。
+
+Windows supervisor 建立自己的子程序群組，先嘗試 `CTRL_BREAK`，逾時或無主控台時才透過自己持有的子程序 handle 停止它，不呼叫 Unix 的 `killpg`／`SIGKILL`。互動執行可用 Ctrl+C 正常關閉；若強制終止排程工作，另行核對健康檔中的子程序 PID，不能假定它已一併結束。共用程序鎖仍會阻擋另一份服務重複登入。
+
+健康 JSON 與事件檔固定 UTF-8 編碼，日曆／設定也接受 Windows Notepad 的 UTF-8 BOM。Windows 短暫檔案分享衝突會在有限次數內重試原子替換，持續失敗仍回報錯誤，保留舊快照。
 
 watchdog 每五秒唯讀檢查，預設只記錄事件；`--notify` 才會使用既有 Telegram 設定。故障去重、預設每 15 分鐘提醒仍未解除的故障，恢復通知一次；傳送失敗預設 60 秒後重試。多個異常合併成一次有限長度訊息，避免通知失敗拖住整個巡檢。事件、派送結果與待重試狀態存放於 `.health/<db>/incidents-<code>.json` 及 `.events.jsonl`。通知失敗也寫 stdout，供 OS／外部日誌告警。
 

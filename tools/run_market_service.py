@@ -7,7 +7,6 @@ the separate health_watchdog, and an external check for host/watchdog death.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 from pathlib import Path
 import signal
@@ -22,6 +21,15 @@ sys.path.insert(0, str(ROOT / "src"))
 import market_health as mh
 import market_clock
 from health_watchdog import age_seconds
+from file_lease import FileLease
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def child_process_options():
+    if IS_WINDOWS:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 def child_stalled(document, *, pid, now, started_at, settings):
@@ -40,6 +48,19 @@ def child_stalled(document, *, pid, now, started_at, settings):
 def stop_child(child, *, grace_seconds=10):
     """The Popen object is the ownership proof; no arbitrary PID argument."""
     if child.poll() is not None:
+        return
+    if IS_WINDOWS:
+        # CTRL_BREAK targets only the group created by this supervisor. A
+        # detached console may reject it; fall back to this owned child handle.
+        try:
+            child.send_signal(signal.CTRL_BREAK_EVENT)
+        except OSError:
+            child.terminate()
+        try:
+            child.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=grace_seconds)
         return
     try:
         os.killpg(child.pid, signal.SIGTERM)
@@ -70,12 +91,13 @@ def main(argv=None):
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
-    with path.with_suffix(".supervisor.lock").open("a+") as lease:
-        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda *_: stop.set())
+    with FileLease(path.with_suffix(".supervisor.lock")):
         attempts = 0
         while not stop.is_set():
             started_at = market_clock.now()
-            child = subprocess.Popen(command, cwd=ROOT, start_new_session=True)
+            child = subprocess.Popen(command, cwd=ROOT, **child_process_options())
             warned = False
             document = {}
             try:

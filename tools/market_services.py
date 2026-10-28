@@ -104,6 +104,8 @@ def main(argv=None):
         return 0 if result["configuration_ready"] and result["database_readable"] and result["unresolved_orders"] == 0 else 1
     if not args.output:
         parser.error("render requires --output")
+    if sys.platform != "darwin":
+        parser.error("render creates macOS launchd files only; on Windows run the documented service commands")
     if Path(sys.prefix).name != "tss":
         parser.error("render must run in conda env tss")
     specs = launchd_specs(ROOT, sys.executable, args.db, code=args.code, mode=args.mode,
