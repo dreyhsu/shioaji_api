@@ -19,6 +19,8 @@ def error_kind(error: BaseException) -> str:
         text = f"{type(current).__name__} {current}".lower()
         if isinstance(current, sqlite3.Error):
             kinds.add("database")
+        elif re.search(r"操作異常[，,\s]*請\s*1\s*分鐘後再重新登入|\b(ratelimitexceeded|too many requests|rate limit exceeded)\b|response\s*code\s*[:=]\s*429\b", text):
+            kinds.add("rate_limit")
         elif re.search(r"\b(unauthorized|authenticationfailed|invalidtoken|tokenexpired)\b|response\s*code\s*[:=]\s*401", text):
             kinds.add("authentication")
         elif re.search(r"\b(sessionnotestablished|notready|sessiondownerror)\b", text):
@@ -31,7 +33,7 @@ def error_kind(error: BaseException) -> str:
             pending.append(current.__cause__)
         if current.__context__ is not None:
             pending.append(current.__context__)
-    return next((kind for kind in ("database", "authentication", "session", "quota", "transport") if kind in kinds), "other")
+    return next((kind for kind in ("database", "rate_limit", "authentication", "session", "quota", "transport") if kind in kinds), "other")
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,12 @@ class RecoveryGate:
     def fail(self, reason: str, *, immediate=False):
         self.failures += 1
         self.reason = reason
+        if reason == "rate_limit":
+            # A backend ban requires a full quiet minute after the latest error,
+            # even when an ordinary retry was already pending. Never shorten backoff.
+            self.pending = True
+            self.next_attempt = max(self.next_attempt, self.clock() + 60)
+            return
         if not self.pending and (immediate or self.failures >= self.policy.failure_threshold):
             self.pending = True
             self.next_attempt = max(self.next_attempt, self.clock() + self.policy.initial_seconds)

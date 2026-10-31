@@ -1,0 +1,15 @@
+{
+  "timezone": "Asia/Taipei",
+  "calendar_path": "market_calendar.json",
+  "scheduled_login_times": ["08:44", "14:59"],
+  "scheduled_logout_times": ["13:46", "05:01"],
+  "tick_publish_seconds": 1,
+  "kbar_publish_seconds": 60,
+  "bar_close_delay_seconds": 2,
+  "tick_stale_seconds": 10,
+  "stream_recovery_seconds": 60,
+  "queue_capacity": 20000,
+  "api_timeout_ms": 30000,
+  "backfill_days": 2,
+  "history_repair_seconds": 300
+}

@@ -1,0 +1,1458 @@
+# Shioaji HTTP API Reference / Shioaji HTTP API 參考
+
+> **Shioaji is no longer Python-only.** The Shioaji CLI can start an HTTP API server,
+> enabling any language, tool, or platform to trade Taiwan markets through REST endpoints,
+> real-time SSE streaming, OpenAPI documentation, a built-in dashboard, and custom apps.
+
+> Endpoint inventory for the Shioaji HTTP server.
+> For exact schemas on an installed server, fetch `GET /openapi.json`.
+
+Use this file for endpoint routing, request examples, server behavior, OpenAPI discovery, dashboard, watchlist, and app-hosting details. For response decisions, use the matching functional reference; fetch `/openapi.json` from the running server when exact installed-server schemas are required.
+
+---
+
+## Table of Contents / 目錄
+
+1. [Overview / 概覽](#overview--概覽)
+2. [Authentication / 認證](#authentication--認證)
+3. [Server Configuration / 伺服器設定](#server-configuration--伺服器設定)
+4. [UDS Support / Unix Domain Socket 支援](#uds-support--unix-domain-socket-支援)
+5. [Complete Endpoint Table / 完整端點列表](#complete-endpoint-table--完整端點列表)
+   - [Health & Info / 健康檢查與資訊](#health--info--健康檢查與資訊)
+   - [Auth / 認證端點](#auth--認證端點)
+   - [Data / 行情資料](#data--行情資料)
+   - [Order / 委託](#order--委託)
+   - [Portfolio / 投資組合](#portfolio--投資組合)
+   - [Stream / 即時串流](#stream--即時串流)
+   - [Watchlist / 自選清單](#watchlist--自選清單)
+   - [Apps / 自訂應用](#apps--自訂應用)
+6. [Endpoint Details / 端點詳情](#endpoint-details--端點詳情)
+   - [Health & Info](#health--info)
+   - [Auth Endpoints](#auth-endpoints)
+   - [Data Endpoints](#data-endpoints)
+   - [Order Endpoints](#order-endpoints)
+   - [Portfolio Endpoints](#portfolio-endpoints)
+   - [Stream Endpoints (SSE)](#stream-endpoints-sse)
+   - [Watchlist Endpoints](#watchlist-endpoints)
+   - [Apps Endpoints](#apps-endpoints)
+7. [OpenAPI Documentation / OpenAPI 文件](#openapi-documentation--openapi-文件)
+8. [Dashboard / 儀表板](#dashboard--儀表板)
+9. [Custom App Embedding / 自訂應用嵌入](#custom-app-embedding--自訂應用嵌入)
+10. [Middleware Stack / 中介層堆疊](#middleware-stack--中介層堆疊)
+11. [Error Responses / 錯誤回應](#error-responses--錯誤回應)
+
+---
+
+## Overview / 概覽
+
+The Shioaji HTTP API is served by `shioaji server start` and provides:
+
+- RESTful JSON endpoints for all trading operations
+- Server-Sent Events (SSE) for real-time market data and order events
+- OpenAPI 3.0 specification with Scalar documentation UI
+- Built-in dashboard
+- Custom app hosting (upload your own web apps)
+- CORS support, gzip compression, request logging, panic recovery
+
+**Base URL**: `http://127.0.0.1:8080` (default)
+**API prefix**: `/api/v1/`
+
+---
+
+## Authentication / 認證
+
+Authentication uses **Bearer token** format with the SJ_API_KEY and SJ_SEC_KEY:
+
+```
+Authorization: Bearer <SJ_API_KEY>:<SJ_SEC_KEY>
+```
+
+### When is auth required? / 何時需要認證?
+
+- **Localhost** (`127.0.0.1`, `::1`, default): No API key is needed, but the server rejects cross-site browser requests with 403 so web pages you visit cannot drive it. A request is rejected when its `Host` is not a loopback name (DNS rebinding), when its `Origin` is not loopback / a Shioaji Pro (Tauri) origin / listed in `SJ_HTTP_ALLOWED_ORIGINS` or `SJ_HTTP_CORS_ORIGINS` (`Origin: null` is rejected), or when it carries `Sec-Fetch-Site: cross-site` without an allowed `Origin` (plain GET/HEAD link navigations still open). curl, the CLI, and SDK clients send no `Origin` and are unaffected.
+  localhost 預設不需 API key，但會以 403 拒絕跨站瀏覽器請求（非 loopback `Host`、非允許的 `Origin`、`Origin: null`、`Sec-Fetch-Site: cross-site`）。curl、CLI、SDK 不受影響。
+- **Force auth on localhost**: set `SJ_HTTP_AUTH=true` (or `shioaji server --auth`) to require the Bearer credential on any bind. The CLI sends `SJ_API_KEY:SJ_SEC_KEY` automatically to a local (UDS/loopback) daemon. Recommended on shared machines or when you upload apps from third parties.
+  在 localhost 也要求認證：設 `SJ_HTTP_AUTH=true` 或 `shioaji server --auth`。
+- **Non-localhost** (any other bind address): Authentication is **required** on all protected endpoints. The `/api/v1/health` and `/api/v1/info` endpoints remain public.
+
+Uploaded apps (`/apps/<name>/`) are served from the same origin as the API, so an app can place and cancel orders and read accounts. Only upload apps you trust. 上傳的 app 與 API 同源，可下單與讀取帳戶，只上傳信任的 app。
+
+API-key authentication identifies the HTTP caller; it is separate from
+mutation approval. When `/api/v1/info` reports `agent_harness.enabled=true`,
+the protected broker mutations also require a short-lived one-time capability,
+including over localhost and UDS. Before sending or troubleshooting one of
+those mutations, follow [AGENT_HARNESS.md](AGENT_HARNESS.md).
+
+### Constant-time comparison / 常數時間比對
+
+Credential validation uses `subtle::ConstantTimeEq` for timing-attack resistance. Both API key and secret key are validated together.
+
+### Example / 範例
+
+```bash
+# Localhost -- no auth needed
+curl http://127.0.0.1:8080/api/v1/auth/accounts
+
+# Remote -- auth required
+curl -H "Authorization: Bearer YOUR_API_KEY:YOUR_SECRET_KEY" \
+     http://192.168.1.100:8080/api/v1/auth/accounts
+```
+
+---
+
+## Server Configuration / 伺服器設定
+
+Configure the server via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SJ_API_KEY` | (required) | API key for Shioaji authentication |
+| `SJ_SEC_KEY` | (required) | Secret key for Shioaji authentication |
+| `SJ_PRODUCTION` | `false` | Enable production mode (default: simulation) |
+| `SJ_HTTP_ADDR` | `127.0.0.1:8080` | Server bind address (also: `SJ_BIND_ADDR`, `BIND_ADDR`) |
+| `SJ_RECEIVE_WINDOW` | `30000` | Token login receive window in ms: how far the local clock may be from the server's; raise it on `Sign data is timeout` (same as `--receive-window`, 1.7.9+) |
+| `SJ_HTTP_AUTH` | (unset) | `true`/`1`/`yes` requires the Bearer API key on any bind, including localhost (same as `--auth`); `false`/unset keeps auth only on non-localhost binds |
+| `SJ_HTTP_ALLOWED_ORIGINS` | (none) | Extra comma-separated exact browser origins allowed through the localhost cross-site guard (loopback and Shioaji Pro origins are always allowed) |
+| `SJ_HTTP_CORS` | `true` | Enable CORS |
+| `SJ_HTTP_CORS_ORIGINS` | Tauri production origins and localhost Vite dev origins | Comma-separated browser origins; use `*` only when unrestricted browser access is explicitly intended |
+| `SJ_HTTP_TIMEOUT` | `30` | HTTP request timeout in seconds |
+| `SJ_HTTP_LOG` | `true` | Enable HTTP request logging |
+| `SJ_HTTP_TLS_CERT` | (none) | PEM certificate path; set together with `SJ_HTTP_TLS_KEY` to enable static HTTPS with HTTP/2 |
+| `SJ_HTTP_TLS_KEY` | (none) | PEM private-key path; set together with `SJ_HTTP_TLS_CERT` |
+| `SJ_HTTP3` | `false` | Also enable HTTP/3 over QUIC; requires static TLS or ACME and UDP on the bind port |
+| `SJ_AGENT_HARNESS` | `off` | Mutation capability enforcement: `off`, `production`, or `all` |
+| `SJ_AGENT_HARNESS_BOOTSTRAP` | `environment` | `one_shot_ipc` selects trusted launcher stdin-pipe bootstrap; effective source is advertised in `agent_harness.bootstrap` |
+| `SJ_AGENT_HARNESS_SECRET` | (required for environment bootstrap) | Legacy development/simulation secret, at least 32 bytes; must be absent for `one_shot_ipc` |
+| `SJ_AGENT_HARNESS_INITIAL_ENABLED` | `true` | Initial runtime enforcement state for an installed verifier; trusted hosts may start paused and switch it without restarting |
+| `SJ_HTTP_ACME_DOMAINS` | (none) | Comma-separated public DNS names; enables ACME TLS-ALPN-01 |
+| `SJ_HTTP_ACME_CONTACTS` | (none) | Comma-separated contact emails or URIs for ACME |
+| `SJ_HTTP_ACME_CACHE` | (none) | Persistent owner-only ACME certificate-cache directory; required in ACME mode |
+| `SJ_HTTP_ACME_DIRECTORY_NAME` | (none) | Custom ACME directory cache namespace; set together with the directory URL |
+| `SJ_HTTP_ACME_DIRECTORY_URL` | (none) | Custom HTTPS ACME directory URL; set together with the directory name |
+| `SJ_PROXY` | (none) | HTTP proxy URL for upstream Shioaji connections |
+| `SJ_CA_PATH` | (none) | Path to CA certificate file |
+| `SJ_CA_PASSWD` | (none) | CA certificate password |
+| `SJ_HOME_PATH` | `~/.shioaji` | Custom home directory for token pool, contracts, cache |
+| `SJ_TIMEOUT` | `60000` | Solace request-reply timeout in milliseconds |
+
+### HTTPS, HTTP/2, HTTP/3, and ACME / HTTPS、HTTP/2、HTTP/3 與 ACME
+
+The default plaintext listener serves HTTP/1.1. HTTP/2 is enabled on the TLS
+listener and negotiated through ALPN; browsers do not use HTTP/2 over the
+default plaintext `http://` URL. Configure either static TLS or ACME, then use
+an `https://` URL. Do not configure static TLS and ACME together.
+
+預設明文 listener 使用 HTTP/1.1。HTTP/2 由 TLS listener 透過 ALPN 協商；
+瀏覽器不會在預設 `http://` URL 上直接使用 HTTP/2。要讓 Web App 直接走
+HTTP/2，請設定 static TLS 或 ACME，並把 REST、OpenAPI、SSE URL 全部改為
+`https://`。Static TLS 與 ACME 不可同時設定。
+
+#### Local trusted HTTPS with mkcert / 使用 mkcert 建立本機受信任 HTTPS
+
+Use static TLS for localhost. ACME rejects localhost, IP addresses, wildcards,
+and loopback binds.
+
+```bash
+# Install mkcert with the package manager for your OS, then trust its local CA.
+mkcert -install
+mkdir -p "$HOME/.shioaji/tls"
+mkcert \
+  -cert-file "$HOME/.shioaji/tls/localhost.pem" \
+  -key-file "$HOME/.shioaji/tls/localhost-key.pem" \
+  localhost 127.0.0.1 ::1
+
+export SJ_HTTP_ADDR=127.0.0.1:8080
+export SJ_HTTP_TLS_CERT="$HOME/.shioaji/tls/localhost.pem"
+export SJ_HTTP_TLS_KEY="$HOME/.shioaji/tls/localhost-key.pem"
+shioaji server start --no-open
+```
+
+Use `https://localhost:8080` from the browser so the certificate hostname
+matches. REST and the aggregate SSE stream can share the same HTTP/2
+connection; subscription changes remain ordinary REST requests.
+
+```bash
+curl --http2 -sS -o /dev/null \
+  -w 'HTTP %{http_version}\n' \
+  https://localhost:8080/api/v1/health
+
+curl -sS https://localhost:8080/openapi.json | jq '.openapi'
+curl -N https://localhost:8080/api/v1/stream/data
+```
+
+For the aggregate SSE subscription flow and named-event dispatch, see
+[STREAMING.md](STREAMING.md). Browser `EventSource` cannot attach a custom
+`Authorization` header: native `EventSource` is directly usable on the
+auth-disabled loopback server; a protected non-loopback deployment needs an
+SSE client based on authenticated `fetch`, a header-capable polyfill, or a
+trusted same-origin gateway.
+
+#### Enable HTTP/3 / 啟用 HTTP/3
+
+Set `SJ_HTTP3=true` in static-TLS or ACME mode. The server keeps HTTP/2 and
+HTTP/1.1 on TCP and adds QUIC on the same numeric UDP port. HTTPS responses
+advertise HTTP/3 through `Alt-Svc`; capable browsers normally upgrade
+automatically, so application URLs remain `https://...`.
+
+```bash
+export SJ_HTTP3=true
+shioaji server start --no-open
+
+# Requires a curl build with HTTP/3 support.
+curl --http3-only -sS -o /dev/null \
+  -w 'HTTP %{http_version}\n' \
+  https://localhost:8080/api/v1/health
+
+# Confirm discovery from the TCP HTTPS endpoint.
+curl --http2 -sSI https://localhost:8080/api/v1/health | grep -i '^alt-svc:'
+```
+
+Open both TCP and UDP on the configured bind port. `SJ_HTTP3=true` with a
+plaintext listener is rejected at startup. UDS remains plaintext even when the
+TCP/QUIC listener uses TLS.
+
+#### Public certificate with ACME TLS-ALPN-01 / 使用 ACME 公開憑證
+
+ACME mode requires a public DNS name, a non-loopback bind, at least one
+contact, persistent cache storage, and publicly reachable TCP 443. Prepare an
+existing cache directory as a real owner-only (`0700`) directory, not a
+symlink. If HTTP/3 is enabled, also expose UDP 443. On Unix, do not run the
+trading daemon as root just to bind port 443. Grant only the bind capability
+(for example, systemd `AmbientCapabilities=CAP_NET_BIND_SERVICE`) or use a
+trusted port-forwarding layer that exposes TCP 443 and, for HTTP/3, UDP 443.
+
+Test issuance against Let's Encrypt staging before production. The staging
+directory variables must be present before the first server start:
+
+```bash
+install -d -m 700 "$HOME/.shioaji/acme"
+
+export SJ_HTTP_ADDR=0.0.0.0:443
+export SJ_HTTP_ACME_DOMAINS=api.example.com
+export SJ_HTTP_ACME_CONTACTS=ops@example.com
+export SJ_HTTP_ACME_CACHE="$HOME/.shioaji/acme"
+export SJ_HTTP_ACME_DIRECTORY_NAME=lets_encrypt_staging
+export SJ_HTTP_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory
+export SJ_HTTP3=true
+shioaji server start --no-open
+```
+
+Certificate issuance and renewal run in the background, so HTTPS can be
+temporarily unavailable on the first startup. After staging issuance and
+HTTPS/HTTP3 verification succeed, stop that server. Remove both staging
+variables together and restart to use the default production directory:
+
+```bash
+unset SJ_HTTP_ACME_DIRECTORY_NAME SJ_HTTP_ACME_DIRECTORY_URL
+shioaji server start --no-open
+```
+
+The directory name and URL must be set together, and the URL must use HTTPS.
+
+### UDS-specific variables / UDS 專用變數
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SJ_UDS_PATH` | `~/.shioaji/sessions/server-{port}.sock` | Custom Unix domain socket path |
+| `SJ_UDS_DISABLE` | `false` | Disable UDS transport |
+
+---
+
+## UDS Support / Unix Domain Socket 支援
+
+On Unix systems, the server binds to both TCP and a Unix domain socket simultaneously.
+
+- **Default path**: `~/.shioaji/sessions/server-{port}.sock`
+- **Permissions**: `0600` (owner-only read/write)
+- **Stale detection**: Existing sockets are probed before removal; live sockets are left alone
+- **CLI preference**: The `DaemonClient` automatically uses UDS when available, falling back to TCP
+- **Disable**: Set `SJ_UDS_DISABLE=true`
+
+---
+
+## Complete Endpoint Table / 完整端點列表
+
+All paths are prefixed with `/api/v1/` unless otherwise noted.
+
+### Health & Info / 健康檢查與資訊
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/health` | No | Health check |
+| GET | `/api/v1/info` | No | API information (version, simulation mode) |
+
+### Auth / 認證端點
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/auth/usage` | Yes | Get API usage statistics |
+| GET | `/api/v1/auth/accounts` | Yes | List all trading accounts |
+| GET | `/api/v1/auth/ca_expiretime?person_id=<PID>` | Yes | Get CA certificate expiry time |
+| POST | `/api/v1/auth/subscribe_trade` | Yes | Subscribe per-account trade/deal events (required before `order_event` SSE) |
+| POST | `/api/v1/auth/unsubscribe_trade` | Yes | Unsubscribe per-account trade/deal events |
+
+### Data / 行情資料
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/data/snapshots` | Yes | Get market data snapshots |
+| POST | `/api/v1/data/ticks` | Yes | Get tick data |
+| POST | `/api/v1/data/kbars` | Yes | Get K-bar (OHLCV) data |
+| POST | `/api/v1/data/daily_quotes` | Yes | Get daily quotes |
+| POST | `/api/v1/data/credit_enquire` | Yes | Get credit enquiry data |
+| POST | `/api/v1/data/scanner` | Yes | Get scanner ranking data |
+| POST | `/api/v1/data/index_components` | Yes | Query authoritative full index-components state — [STREAMING_ENRICHED.md](STREAMING_ENRICHED.md) |
+| GET | `/api/v1/data/regulatory_punish` | Yes | Get regulatory punish data |
+| GET | `/api/v1/data/regulatory_notice` | Yes | Get regulatory notice data |
+| POST | `/api/v1/data/short_stock_sources` | Yes | Get short stock sources |
+| GET | `/api/v1/data/contracts?security_type=<TYPE>` | Yes | List Base contracts for one type; optional pagination |
+| GET | `/api/v1/data/contracts/{code}` | Yes | Look up one Base contract; `security_type` is optional |
+| GET | `/api/v1/data/contracts/{code}/info` | Yes | Get flat typed STK/IND/FUT/OPT info |
+| GET | `/api/v1/data/contracts/futures` | Yes | Query futures by root or underlying |
+| GET | `/api/v1/data/contracts/options?root=<ROOT>` | Yes | Query one option-root shard |
+| GET | `/api/v1/data/contracts/warrants?underlying_code=<CODE>` | Yes | Query one warrant-underlying shard |
+| GET | `/api/v1/data/contracts/futures/roots` | Yes | List futures roots |
+| GET | `/api/v1/data/contracts/options/roots` | Yes | List option roots |
+| GET | `/api/v1/data/contracts/warrants/underlyings` | Yes | List warrant underlying keys |
+| GET | `/api/v1/data/contracts/tick-bands/{rule}?security_type=FUT` | Yes | Get a FUT/OPT tick-band rule (`security_type` required) |
+| POST | `/api/v1/data/contracts/combo` | Yes | Build and validate one managed combo from two Base legs |
+| GET | `/api/v1/data/contracts/combo/futures?root=TXF` | Yes | Enumerate eligible managed futures combos |
+
+### Order / 委託
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/order/place_order` | Yes | Place a stock or futures order |
+| POST | `/api/v1/order/cancel_order` | Yes | Cancel an order by trade ID |
+| POST | `/api/v1/order/update_price` | Yes | Update an order's price |
+| POST | `/api/v1/order/update_qty` | Yes | Update an order's quantity |
+| POST | `/api/v1/order/trades` | Yes | Get trades; `refresh` defaults to `true`, `false` reads process-local cache only |
+| POST | `/api/v1/order/place_comboorder` | Yes | Place a combo (spread) order |
+| POST | `/api/v1/order/cancel_comboorder` | Yes | Cancel a combo order |
+| POST | `/api/v1/order/combotrades` | Yes | Get all combo trades |
+| POST | `/api/v1/order/stock_reserve_summary` | Yes | Get stock reserve summary |
+| POST | `/api/v1/order/stock_reserve_detail` | Yes | Get stock reserve detail |
+| POST | `/api/v1/order/reserve_stock` | Yes | Reserve stock |
+| POST | `/api/v1/order/earmarking_detail` | Yes | Get earmarking detail |
+| POST | `/api/v1/order/reserve_earmarking` | Yes | Reserve earmarking |
+| POST | `/api/v1/order/order_deal_records` | Yes | Get order/deal records |
+
+### Portfolio / 投資組合
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/portfolio/account_balance` | Yes | Get account balance |
+| POST | `/api/v1/portfolio/margin` | Yes | Get margin info |
+| POST | `/api/v1/portfolio/position_unit` | Yes | Get positions |
+| POST | `/api/v1/portfolio/position_detail` | Yes | Get position detail |
+| POST | `/api/v1/portfolio/settlements` | Yes | Get settlement list |
+| POST | `/api/v1/portfolio/settlement` | Yes | Get settlements (legacy format) |
+| POST | `/api/v1/portfolio/trading_limits` | Yes | Get trading limits |
+| POST | `/api/v1/portfolio/profit_loss` | Yes | Get profit and loss |
+| POST | `/api/v1/portfolio/profit_loss_detail` | Yes | Get profit and loss detail |
+| POST | `/api/v1/portfolio/profitloss_sum` | Yes | Get profit and loss summary |
+
+### Stream / 即時串流
+
+All stream data endpoints use Server-Sent Events (SSE). Connect with `Accept: text/event-stream`.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/v1/stream/subscribe` | Yes | Subscribe to market data (tick/bidask/quote) |
+| POST | `/api/v1/stream/unsubscribe` | Yes | Unsubscribe from market data |
+| POST | `/api/v1/stream/subscribe/kbars` | Yes | Subscribe realtime KBar, multi-stock body — [STREAMING.md](STREAMING.md) |
+| POST | `/api/v1/stream/unsubscribe/kbars` | Yes | Unsubscribe realtime KBar |
+| POST | `/api/v1/stream/subscribe/calculated_index` | Yes | Subscribe calculated index — [STREAMING_ENRICHED.md](STREAMING_ENRICHED.md) |
+| POST | `/api/v1/stream/unsubscribe/calculated_index` | Yes | Unsubscribe calculated index |
+| POST | `/api/v1/stream/subscribe/index_contribution` | Yes | Subscribe index contribution (body needs `ranking`) |
+| POST | `/api/v1/stream/unsubscribe/index_contribution` | Yes | Unsubscribe index contribution |
+| POST | `/api/v1/stream/subscribe/industry_contribution` | Yes | Subscribe industry contribution |
+| POST | `/api/v1/stream/unsubscribe/industry_contribution` | Yes | Unsubscribe industry contribution |
+| POST | `/api/v1/stream/subscribe/index_components` | Yes | Subscribe one index-components projection — [STREAMING_ENRICHED.md](STREAMING_ENRICHED.md) |
+| POST | `/api/v1/stream/unsubscribe/index_components` | Yes | Unsubscribe the same index/projection pair |
+| POST | `/api/v1/stream/subscribe/scanner` | Yes | Subscribe market signal — [STREAMING_SIGNALS.md](STREAMING_SIGNALS.md) |
+| POST | `/api/v1/stream/unsubscribe/scanner` | Yes | Unsubscribe market signal |
+| GET | `/api/v1/stream/receivers` | Yes | Get receiver info |
+| GET | `/api/v1/stream/status` | Yes | Get connection status |
+| GET | `/api/v1/stream/data` | Yes | Aggregate market, order, Contract V2, derived-data, scanner, and heartbeat SSE |
+| GET | `/api/v1/stream/data/tick_stk` | Yes | Stock tick data stream |
+| GET | `/api/v1/stream/data/bidask_stk` | Yes | Stock bid/ask data stream |
+| GET | `/api/v1/stream/data/tick_fop` | Yes | Futures/options tick data stream |
+| GET | `/api/v1/stream/data/bidask_fop` | Yes | Futures/options bid/ask data stream |
+| GET | `/api/v1/stream/data/quote_stk` | Yes | Stock quote data stream |
+| GET | `/api/v1/stream/data/quote_fop` | Yes | Futures/options quote data stream |
+| GET | `/api/v1/stream/data/quote_idx` | Yes | Index quote data stream |
+| GET | `/api/v1/stream/data/kbar` | Yes | Realtime KBar stream |
+| GET | `/api/v1/stream/data/calculated_index` | Yes | Calculated index stream |
+| GET | `/api/v1/stream/data/index_contribution` | Yes | Index contribution stream |
+| GET | `/api/v1/stream/data/industry_contribution` | Yes | Industry contribution stream |
+| GET | `/api/v1/stream/data/index_components` | Yes | Typed index-components projection stream |
+| GET | `/api/v1/stream/data/scanner` | Yes | Market signal stream |
+| GET | `/api/v1/stream/data/order_event` | Yes | Order event data stream |
+| GET | `/api/v1/stream/data/contract_event` | Yes | Contract V2 change notifications; optional region/type filters |
+
+### Watchlist / 自選清單
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/watchlist` | Yes | List all watchlists |
+| POST | `/api/v1/watchlist` | Yes | Create a new watchlist |
+| GET | `/api/v1/watchlist/{id}` | Yes | Get a single watchlist by ID |
+| PUT | `/api/v1/watchlist/{id}` | Yes | Sync (replace all) contracts in a watchlist |
+| DELETE | `/api/v1/watchlist/{id}` | Yes | Delete a watchlist |
+| POST | `/api/v1/watchlist/{id}/contracts` | Yes | Add contracts to a watchlist |
+| DELETE | `/api/v1/watchlist/{id}/contracts` | Yes | Remove contracts from a watchlist |
+
+### Apps / 自訂應用
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/apps` | Yes | List all uploaded apps |
+| POST | `/api/v1/apps/{name}` | Yes | Upload files for an app (multipart, 50MB limit) |
+| DELETE | `/api/v1/apps/{name}` | Yes | Delete an uploaded app |
+
+App files are served publicly (no auth) at:
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/apps/{**path}` | No | Serve uploaded app files |
+
+---
+
+## Endpoint Details / 端點詳情
+
+### Health & Info
+
+#### GET `/api/v1/health`
+
+Returns health status. Public, no auth required.
+
+```json
+{
+  "status": "healthy",
+  "version": "1.7.0",
+  "timestamp": "2024-01-15T08:30:00Z",
+  "token_expires_in_seconds": 86000,
+  "token_stale": false,
+  "contract_count": 55352,
+  "next_maintenance": "2026-05-28T00:24:17+00:00",
+  "ca_expires_in_days": 109,
+  "ca_expired": false,
+  "agent_harness": {
+    "enabled": true,
+    "mode": "all",
+    "capability_version": 1,
+    "capability_header": "X-Shioaji-Agent-Capability",
+    "digest_scheme": "compact_keyed_blake3",
+    "audience": "<per-daemon-audience>",
+    "max_ttl_seconds": 60
+  }
+}
+```
+
+`contract_count` reflects currently loaded/cached contracts and can change with lazy Contract V2 access; do not wait for a fixed full-market count. For health/auth readiness decisions, see [PREPARE.md](PREPARE.md).
+
+Token lifecycle (since 1.7.8): daily maintenance (`next_maintenance`) always
+logs in for a fresh 24h token, so `token_expires_in_seconds` normally lands
+around the next maintenance. Startup and Solace-outage recovery reuse a cached
+token only if it stays valid past the next maintenance. If the token still
+expires (for example maintenance kept failing), the server logs in again by
+itself with the session-recovery backoff; `token_stale=true` is then a
+transient state, not a signal to restart.
+
+#### GET `/api/v1/info`
+
+Returns API server information including simulation mode.
+
+```json
+{
+  "name": "Shioaji API Server",
+  "version": "1.7.0",
+  "description": "SinoPac Shioaji Cross-Platform Trading API HTTP Adaptor",
+  "protocols": ["HTTP/1.1"],
+  "scheme": "http",
+  "uds_plaintext": true,
+  "simulation": true,
+  "agent_harness": {
+    "enabled": true,
+    "mode": "all",
+    "capability_version": 1,
+    "capability_header": "X-Shioaji-Agent-Capability",
+    "digest_scheme": "compact_keyed_blake3",
+    "audience": "<per-daemon-audience>",
+    "max_ttl_seconds": 60
+  },
+  "instance_id": "3f1c2b6e8a47"
+}
+```
+
+`instance_id` (also in `/api/v1/health`) is an opaque 12-character id generated
+when the server process starts; it changes only on restart. Compare it as a
+string; do not parse it. Every HTTP response handled
+by the server, including 4xx/5xx errors, carries it in the
+`X-Shioaji-Instance` header. A missing header (for example a malformed request
+rejected before reaching the server) means "unknown", not "changed".
+
+After each login (startup, daily maintenance, session recovery) the server
+refills its trade cache with `update_status` for every signed account, so
+same-day `trade_id`s normally keep working across restarts and re-logins. A
+cancel/update whose `trade_id` is not cached waits for that refill; accounts
+that fail to refresh are retried a few times at most. This is best-effort:
+combo orders are not refilled, the cache still resets at the 06:00 trading-day
+rollover, and `GET` trades may be briefly empty right after a re-login. If a
+cancel/update still reports the trade missing, call `POST /api/v1/order/trades`
+(refresh) and use the returned `trade.order.id`.
+
+For simulation/production branching, see [PREPARE.md](PREPARE.md). When
+`agent_harness.enabled=true`, follow [AGENT_HARNESS.md](AGENT_HARNESS.md)
+before a broker mutation.
+
+When `enabled=false` and `audience` is non-null, the verifier is installed but
+runtime enforcement is paused. `GET /api/v1/agent/harness` reads the current
+state. Only the trusted host may call `PATCH /api/v1/agent/harness`; that
+control request always requires a valid one-time capability bound to operation
+`update_agent_harness` and the exact `{"enabled":true|false}` body, including
+while enforcement is paused. `POST` is not supported because this updates an
+existing resource.
+
+### Auth Endpoints
+
+#### GET `/api/v1/auth/accounts`
+
+List all trading accounts associated with the session.
+For account selection decisions, see [PREPARE.md](PREPARE.md).
+
+#### GET `/api/v1/auth/usage`
+
+Get API usage statistics (connections, data transfer, limits).
+For usage/quota decisions, see [PREPARE.md](PREPARE.md) and [MARKET_DATA.md](MARKET_DATA.md).
+
+#### GET `/api/v1/auth/ca_expiretime?person_id=<PERSON_ID>`
+
+Get CA certificate expiry time for a person. The `person_id` query parameter is required.
+For CA/order-readiness decisions, see [PREPARE.md](PREPARE.md) and [ORDERS.md](ORDERS.md).
+
+#### POST `/api/v1/auth/subscribe_trade`
+
+Subscribe to per-account order/deal events. Production and simulation both support this route. A successful response starts active reports for that account; without a successful subscription, the SSE stream only emits heartbeats. Mirrors `POST /api/v1/stream/subscribe` for market data: explicit per-resource opt-in.
+
+Request:
+
+```json
+{
+  "broker_id": "9A95",
+  "account_id": "1234567",
+  "account_type": "S"
+}
+```
+
+- `account_type`: `"S"` (stock) or `"F"` (futures/options).
+- Omit `broker_id`/`account_id` to subscribe the default account of `account_type`.
+
+Response (200):
+
+```json
+{
+  "account": { "broker_id": "9A95", "account_id": "1234567", "...": "..." },
+  "subscribe_trade": true,
+  "ts": 1747200000
+}
+```
+
+Call this route after login for each account before consuming `order_event`. This contract is the same in production and simulation.
+
+For trade-event subscription decisions, see [PREPARE.md](PREPARE.md), [ORDERS.md](ORDERS.md), and [STREAMING.md](STREAMING.md).
+
+#### POST `/api/v1/auth/unsubscribe_trade`
+
+Inverse of `subscribe_trade`. Stops order/deal events for the account when unsubscribe succeeds. Same request shape; response has `"subscribe_trade": false`.
+
+Production and simulation both support this route. A successful unsubscribe returns `"subscribe_trade": false` and stops active reports for that account.
+
+### Data Endpoints
+
+#### POST `/api/v1/data/snapshots`
+
+Get market data snapshots for multiple contracts.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+    { "security_type": "STK", "exchange": "TSE", "code": "2317" }
+  ]
+}
+```
+
+#### POST `/api/v1/data/ticks`
+
+Get tick data for a contract.
+
+```json
+{
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "date": "2024-01-15",
+  "query_type": "LastCount",
+  "last_cnt": 10
+}
+```
+
+`query_type`: `"AllDay"` or `"LastCount"`. Optional fields: `time_start`, `time_end`.
+
+#### POST `/api/v1/data/kbars`
+
+Get K-bar (OHLCV) data.
+
+```json
+{
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "start": "2024-01-01",
+  "end": "2024-01-31"
+}
+```
+
+#### POST `/api/v1/data/daily_quotes`
+
+Get daily quotes.
+
+```json
+{
+  "date": "2024-01-15",
+  "exclude": false
+}
+```
+
+#### POST `/api/v1/data/credit_enquire`
+
+Get credit enquiry data for contracts.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2330" }
+  ]
+}
+```
+
+#### POST `/api/v1/data/scanner`
+
+Get scanner ranking data.
+
+```json
+{
+  "scanner_type": "ChangePercentRank",
+  "date": "2024-01-15",
+  "ascending": false,
+  "count": 200
+}
+```
+
+Scanner types: `ChangePercentRank`, `ChangePriceRank`, `DayRangeRank`, `VolumeRank`, `AmountRank`, `TickCountRank`.
+
+#### GET `/api/v1/data/regulatory_punish`
+
+Get regulatory punish data. No request body.
+
+#### GET `/api/v1/data/regulatory_notice`
+
+Get regulatory notice data. No request body.
+
+#### POST `/api/v1/data/short_stock_sources`
+
+Get short stock sources for contracts.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2330" }
+  ]
+}
+```
+
+### Contract V2 Endpoints
+
+Contract V2 lookups use `GET`; managed combo construction uses `POST`. Region
+defaults to `TW`. They load only the requested type or shard and reuse the
+server's cache; there is no public reload, preload, or status endpoint.
+
+#### GET `/api/v1/data/contracts?security_type=<TYPE>`
+
+List Base contracts for exactly one required `security_type`: `STK`, `IND`, `FUT`, `OPT`, or `WRT`.
+
+```bash
+# All Base records for one type
+curl "http://localhost:8080/api/v1/data/contracts?security_type=STK&region=TW"
+
+# One-based pagination for a large UI
+curl "http://localhost:8080/api/v1/data/contracts?security_type=STK&region=TW&page=1&page_size=500"
+```
+
+Omit both `page` and `page_size` to return all Base records for the selected type. Supplying either enables pagination; `page_size` alone implies page 1. The response always contains `contracts`, `security_type`, `region`, and `total`; `page`, `page_size`, and `max_page` appear only for paged requests. There is no mixed-type aggregate response.
+
+#### GET `/api/v1/data/contracts/{code}`
+
+Look up one Base contract by exchange/master code. Optional query parameters are `region` and `security_type`. When `security_type` is omitted, the server searches types in that region; provide it when the code is ambiguous or the caller requires an exact type.
+
+```bash
+curl "http://localhost:8080/api/v1/data/contracts/IX0001?region=TW&security_type=IND"
+```
+
+#### GET `/api/v1/data/contracts/{code}/info`
+
+Return flat typed Info for STK, IND, FUT, or OPT. The optional `security_type` has the same narrowing behavior as Base lookup. `security_type` is the OpenAPI discriminator, and Base fields are flattened beside type-specific fields—there is no nested `base` object. WRT requires an underlying and must use the warrants collection below.
+
+```bash
+curl "http://localhost:8080/api/v1/data/contracts/2330/info?region=TW&security_type=STK"
+```
+
+For TW stocks, a missing source currency is normalized to `TWD`. Boolean and integer fields are emitted as JSON booleans and numbers, not strings.
+
+#### Type-specific collections
+
+| Endpoint | Required and optional filters |
+|----------|-------------------------------|
+| `GET /api/v1/data/contracts/futures` | Optional `root` or `underlying_code` (mutually exclusive), `delivery_month`, `region` |
+| `GET /api/v1/data/contracts/options` | Required `root`; optional `delivery_month`, `option_right=C\|P`, `strike_min`, `strike_max`, `expiry_weekday`, `region` |
+| `GET /api/v1/data/contracts/warrants` | Required `underlying_code`; optional `code`, `call_put=C\|P`, `strike_min`, `strike_max`, `expiry_from`, `expiry_to`, `region` |
+
+```bash
+curl "http://localhost:8080/api/v1/data/contracts/futures?root=TXF&region=TW"
+curl "http://localhost:8080/api/v1/data/contracts/options?root=TXO&option_right=C&region=TW"
+curl "http://localhost:8080/api/v1/data/contracts/warrants?underlying_code=2330&region=TW"
+```
+
+These return flat typed Info arrays. Use a shard-aware collection instead of listing every Base record when the task needs one futures root, option root, or warrant underlying.
+
+#### Managed combo contracts
+
+Build one combo from two canonical Base contracts:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/data/contracts/combo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "legs": [
+      {"security_type":"FUT","region":"TW","exchange":"TAIFEX","code":"TXFH6","target_code":null},
+      {"security_type":"FUT","region":"TW","exchange":"TAIFEX","code":"TXFI6","target_code":null}
+    ]
+  }'
+```
+
+Or enumerate every currently eligible futures combination for one family:
+
+```bash
+curl "http://localhost:8080/api/v1/data/contracts/combo/futures?root=TXF&region=TW"
+```
+
+Each response record contains `code`, `legs`, `region`, `exchange`,
+`combo_type`, and `managed`. The `code` is the same identity emitted by FOP
+SSE events, for example `TXFH6/I6`, so consumers can build
+`combo_by_code[combo.code]` without reimplementing the native topic encoder.
+Invalid or reversed legs return HTTP 400. See [COMBO_ORDERS.md](COMBO_ORDERS.md)
+for canonical ordering and topic mapping.
+
+The validated response record can be used as the `contract` value for quote
+subscription, or callers can send only its actionless `legs` and optional
+`combo_type`. The server runs the same Contract V2 validator again before
+building the native topic. No leg action is needed because one `BidAsk`
+subscription receives both sides:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/stream/subscribe \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "contract": {
+      "legs": [
+        {"security_type":"FUT", "region":"TW", "exchange":"TAIFEX", "code":"TXFH6", "target_code":null},
+        {"security_type":"FUT", "region":"TW", "exchange":"TAIFEX", "code":"TXFI6", "target_code":null}
+      ],
+      "combo_type":"TimeSpread"
+    },
+    "quote_type":"BidAsk",
+    "intraday_odd":false
+  }'
+```
+
+Then consume the FOP bid/ask SSE stream:
+
+```bash
+curl -N http://localhost:8080/api/v1/stream/data/bidask_fop
+```
+
+An event whose `data.code` is `TXFH6/I6` belongs to the combo record above.
+For canonical `[near, far]`, prices are quoted as `far - near`:
+
+- `bid_price`: resting Buy-combo side = sell near, buy far; a combo seller can
+  hit this bid.
+- `ask_price`: resting Sell-combo side = buy near, sell far; a combo buyer can
+  lift this ask.
+
+The same body sent to `POST /api/v1/stream/unsubscribe` removes the
+subscription. Market-data endpoints reject `action` on combo legs; directed
+`ComboBase` JSON is reserved for combo order endpoints. See
+[COMBO_ORDERS.md](COMBO_ORDERS.md#native-combo-bidask-meaning) for the
+authoritative direction and synthetic-price rules.
+
+#### Discovery and tick bands
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/v1/data/contracts/futures/roots?region=TW` | Futures root/name pairs |
+| `GET /api/v1/data/contracts/options/roots?region=TW` | Option root/name pairs without downloading option Info shards |
+| `GET /api/v1/data/contracts/warrants/underlyings?region=TW&include_name=true` | Warrant underlying keys, optional names, and counts |
+| `GET /api/v1/data/contracts/tick-bands/{rule}?security_type=FUT&region=TW` | One FUT/OPT tick-band rule; `security_type` must be `FUT` or `OPT` |
+
+Do not hard-code tick sizes. Fetch the rule referenced by `tick_rule`, because exchange bands can change.
+
+#### GET `/api/v1/stream/data/contract_event`
+
+Receive passive Contract V2 change notifications over SSE. Optional `region` and `security_type` filters reduce the stream. The event is a change signal; query the relevant Contract endpoint again for current data.
+
+```bash
+curl -N "http://localhost:8080/api/v1/stream/data/contract_event?region=TW&security_type=STK"
+```
+
+The SSE name is `contract_event`, the SSE `id` is the logical `event_id`, and JSON fields are `event_id`, `action`, `region`, `security_type`, `published_at`, `base_changed`, `info_changed`, `info_scope`, and `info_shards`. Internal hashes and chunk-transport fields are intentionally omitted.
+
+See [CONTRACTS.md](CONTRACTS.md) for lazy cache semantics, Python behavior, continuous-futures `target_code`, and WRT rules.
+
+### Order Endpoints
+
+#### POST `/api/v1/order/place_order`
+
+Place a stock or futures order. The server dispatches by security type.
+
+`time_in_force` (ROD/IOC/FOK) is the official field name since 1.7.9.
+`order_type` is its legacy name and is still accepted (marked deprecated in
+`/openapi.json`); sending both with different values returns 400. Every order
+object in responses (Trade.order, combo trades, order events) carries both
+`time_in_force` and `order_type` with the same value.
+
+Stock order:
+```json
+{
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "stock_order": {
+    "action": "Buy",
+    "price": 600.0,
+    "quantity": 1,
+    "price_type": "LMT",
+    "time_in_force": "ROD"
+  }
+}
+```
+
+Futures order:
+```json
+{
+  "contract": { "security_type": "FUT", "exchange": "TAIFEX", "code": "TXFF6" },
+  "futures_order": {
+    "action": "Buy",
+    "price": 17000.0,
+    "quantity": 1,
+    "price_type": "LMT",
+    "time_in_force": "ROD"
+  }
+}
+```
+
+**Selecting a specific account.** Omit `account` to use the default
+(first signed account of the matching type). To target a specific
+account, supply just `broker_id` + `account_id` — the server resolves
+the remaining fields (`person_id`, `signed`, `username`) from the
+login session. Available since 1.5.12 (#234).
+
+```json
+{
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "stock_order": {
+    "action": "Buy",
+    "price": 600.0,
+    "quantity": 1,
+    "price_type": "LMT",
+    "time_in_force": "ROD",
+    "account": { "broker_id": "9A95", "account_id": "1234567" }
+  }
+}
+```
+
+#### POST `/api/v1/order/cancel_order`
+
+```json
+{ "trade_id": "abc123" }
+```
+
+`trade_id` is `Trade.order.id` from a `Trade` returned by this server. Internally the server looks up that id in its trade cache to recover the original contract, order, account, and CA before sending cancel/update upstream. Since 1.7.8 the server refills that cache with `update_status` after every login (startup, daily maintenance, session recovery), and a cancel/update whose `trade_id` is not cached waits for that refill, so same-day ids keep working across restarts. If the caller only knows `ordno`/`seqno`, or the id is still not found, call `POST /api/v1/order/trades` with `refresh` omitted or `true`; it runs `update_status(account)`, refreshes the cache, and returns `Vec<Trade>`. Select the intended trade, then send `trade.order.id`.
+
+The returned `Trade` is not always the final cancelled state. Watch official `order_deal_event` via `/api/v1/stream/data/order_event`, or call `/api/v1/order/trades` again for reconciliation.
+
+#### POST `/api/v1/order/update_price`
+
+```json
+{ "trade_id": "abc123", "price": 605.0 }
+```
+
+Uses the same cache-backed `trade_id = Trade.order.id` rule as `cancel_order`. Call `/order/trades` first when the target trade may not already be cached by this server process.
+
+#### POST `/api/v1/order/update_qty`
+
+```json
+{ "trade_id": "abc123", "quantity": 2 }
+```
+
+Uses the same cache-backed `trade_id = Trade.order.id` rule as `cancel_order`: use `Trade.order.id` from `/order/trades` or a fresh place-order response. Quantity updates can reduce quantity only.
+
+#### POST `/api/v1/order/trades`
+
+Get trades for the resolved account. `refresh` is optional and defaults to
+`true`, preserving the historical behavior that calls `update_status()` before
+returning. Set it to `false` to read only this server process's in-memory cache
+without an upstream request:
+
+```json
+{ "account_type": "S", "refresh": false }
+```
+
+Cache-only results contain only trades already observed or refreshed by this
+running server and are filtered to the resolved `broker_id` and `account_id`.
+They are a local snapshot, not an authoritative reconciliation: use
+`refresh: true` when active reports may have been missed or final status must be
+confirmed.
+
+#### POST `/api/v1/order/place_comboorder`
+
+Place a combo (spread) order. Same account-selection rules as
+`place_order`: omit `account` for default, or supply `{broker_id,
+account_id}` to target a specific one (1.5.12+, #234).
+
+```json
+{
+  "combo_contract": {
+    "legs": [
+      {"security_type": "FUT", "region": "TW", "exchange": "TAIFEX", "code": "TXFH6", "target_code": null},
+      {"security_type": "FUT", "region": "TW", "exchange": "TAIFEX", "code": "TXFI6", "target_code": null}
+    ],
+    "combo_type": "TimeSpread"
+  },
+  "order": {
+    "action": "Buy",
+    "price": 10,
+    "quantity": 1,
+    "price_type": "LMT",
+    "time_in_force": "ROD",
+    "octype": "Auto",
+    "account": { "broker_id": "F002", "account_id": "1234567" }
+  }
+}
+```
+
+The recommended Contract V2 form omits `legs[].action`. The server validates
+the two legs, resolves the strategy, then derives wire leg directions from
+`order.action`. A legacy request with `action` on every leg remains supported;
+those leg actions stay authoritative. Mixing actionless and directed legs is a
+400 error.
+
+#### POST `/api/v1/order/cancel_comboorder`
+
+```json
+{ "trade_id": "abc123" }
+```
+
+#### POST `/api/v1/order/combotrades`
+
+List combo trades. Body: `AccountRequest`.
+
+#### POST `/api/v1/order/stock_reserve_summary`
+
+Get stock reserve summary. Body: `AccountRequest`.
+
+#### POST `/api/v1/order/stock_reserve_detail`
+
+Get stock reserve detail. Body: `AccountRequest`.
+
+#### POST `/api/v1/order/reserve_stock`
+
+Reserve stock.
+
+```json
+{
+  "account_type": "S",
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "share": 1000
+}
+```
+
+#### POST `/api/v1/order/earmarking_detail`
+
+Get earmarking detail. Body: `AccountRequest`.
+
+#### POST `/api/v1/order/reserve_earmarking`
+
+Reserve earmarking.
+
+```json
+{
+  "account_type": "S",
+  "contract": { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+  "share": 1000,
+  "price": 600.0
+}
+```
+
+#### POST `/api/v1/order/order_deal_records`
+
+Get order/deal records. Body: `AccountRequest`.
+
+### Portfolio Endpoints
+
+All portfolio endpoints accept `AccountRequest` (or extended request) as JSON body.
+
+`AccountRequest` fields (all optional):
+```json
+{
+  "account_type": "S",
+  "broker_id": "9A00",
+  "account_id": "1234567",
+  "person_id": null
+}
+```
+
+#### POST `/api/v1/portfolio/account_balance`
+
+Get account balance. Body: `AccountRequest`.
+
+#### POST `/api/v1/portfolio/margin`
+
+Get margin info. Body: `AccountRequest` (resolves to futures account).
+
+#### POST `/api/v1/portfolio/position_unit`
+
+Get positions.
+
+```json
+{
+  "account_type": "S",
+  "unit": "Common"
+}
+```
+
+`unit`: `"Common"` (default) or `"Share"`.
+
+#### POST `/api/v1/portfolio/position_detail`
+
+Get position detail.
+
+```json
+{
+  "account_type": "S",
+  "detail_id": 12345
+}
+```
+
+#### POST `/api/v1/portfolio/settlements`
+
+Get settlement list. Body: `AccountRequest`.
+
+#### POST `/api/v1/portfolio/settlement`
+
+Get settlements (legacy format). Body: `AccountRequest`.
+
+#### POST `/api/v1/portfolio/trading_limits`
+
+Get trading limits. Body: `AccountRequest`.
+
+#### POST `/api/v1/portfolio/profit_loss`
+
+Get profit and loss.
+
+```json
+{
+  "account_type": "S",
+  "begin_date": "2024-01-01",
+  "end_date": "2024-01-31",
+  "unit": "Common"
+}
+```
+
+#### POST `/api/v1/portfolio/profit_loss_detail`
+
+Get profit and loss detail.
+
+```json
+{
+  "account_type": "S",
+  "detail_id": 12345,
+  "unit": "Common"
+}
+```
+
+#### POST `/api/v1/portfolio/profitloss_sum`
+
+Get profit and loss summary.
+
+```json
+{
+  "account_type": "S",
+  "begin_date": "2024-01-01",
+  "end_date": "2024-01-31"
+}
+```
+
+### Stream Endpoints (SSE)
+
+All data stream endpoints use **Server-Sent Events**. Connect via GET with `Accept: text/event-stream`.
+
+Every stream includes a **heartbeat** every 30 seconds to keep the connection alive:
+```
+event: heartbeat
+data: {"type":"heartbeat","timestamp":"2024-01-15T08:30:00Z","connection_id":"42"}
+```
+
+#### Subscription workflow / 訂閱流程
+
+1. **Subscribe**: POST `/api/v1/stream/subscribe`
+2. **Connect**: GET the appropriate SSE endpoint
+3. **Receive**: Process incoming events
+4. **Unsubscribe**: POST `/api/v1/stream/unsubscribe`
+
+Subscription request:
+```json
+{
+  "security_type": "STK",
+  "exchange": "TSE",
+  "code": "2330",
+  "target_code": null,
+  "quote_type": "Tick",
+  "intraday_odd": false
+}
+```
+
+`quote_type`: `"Tick"`, `"BidAsk"`, `"Quote"`.
+
+For HTTP subscriptions to futures continuous-month aliases such as `TXFR1`/`TXFR2`, first call `GET /api/v1/data/contracts/TXFR1?security_type=FUT` and copy the returned `target_code` into the subscribe body. Regular futures codes do not need this. If `target_code` is missing for `TXFR1`/`TXFR2`, the server can return `200` while the SSE stream only emits heartbeats.
+
+**Intraday odd lot 盤中零股**: set `"intraday_odd": true` (works for both `"Tick"` and `"BidAsk"`; stocks only). Regular and odd-lot subscriptions are independent — you can subscribe to both for the same stock and tell them apart on the SSE side via the `intraday_odd` flag carried on each event payload:
+
+```json
+{
+  "security_type": "STK", "exchange": "TSE", "code": "2330",
+  "quote_type": "Tick", "intraday_odd": true
+}
+```
+
+```jsonc
+// example tick_stk SSE event payload
+event: tick_stk
+data: {"code":"2330","close":"2235","volume":100,"intraday_odd":true, ...}
+```
+
+#### Combined stream
+
+**GET `/api/v1/stream/data`** -- All data types merged into one SSE connection. Events are tagged:
+- `tick_stk`, `bidask_stk`, `quote_stk` -- stock data
+- `tick_fop`, `bidask_fop`, `quote_fop` -- futures/options data
+- `quote_idx` -- index data (QUO-only, exchange/master contract code)
+- `calculated_index`, `index_contribution`, `industry_contribution`, `index_components` -- enriched index data
+- `kbar` -- realtime stock KBar
+- `scanner` -- market signals
+- `order_event` -- order and deal events
+- `contract_event` -- sanitized Contract V2 change notifications
+- `heartbeat` -- keep-alive
+
+Optional `region` and `security_type` query parameters filter
+`contract_event` only. They do not filter quote, order, derived-data, scanner,
+KBar, or heartbeat events on the same connection:
+
+```bash
+curl -N "http://localhost:8080/api/v1/stream/data?region=TW&security_type=STK"
+```
+
+The aggregate stream emits one heartbeat and counts as one SSE connection.
+Use it when one client consumes several event families or when long-lived
+dedicated streams would occupy the client's connection pool. Dedicated
+endpoints remain available when a client intentionally needs only one event
+family or wants independent stream lifecycles.
+
+If a client falls behind a derived-data broadcast channel, the server emits a
+named `<event_name>_gap` event such as `calculated_index_gap` with
+`{"type":"lagged","dropped":N}`. Reconcile snapshot-based state through the
+matching REST endpoint after reconnect or a gap event. `contract_event` is also
+a change signal: re-query the relevant Contract V2 endpoint for current data.
+
+#### Individual streams
+
+| Endpoint | SSE Event Name | Description |
+|----------|---------------|-------------|
+| `/api/v1/stream/data/tick_stk` | `tick_stk` | Stock tick data |
+| `/api/v1/stream/data/bidask_stk` | `bidask_stk` | Stock bid/ask data |
+| `/api/v1/stream/data/tick_fop` | `tick_fop` | Futures/options tick data |
+| `/api/v1/stream/data/bidask_fop` | `bidask_fop` | Futures/options bid/ask data |
+| `/api/v1/stream/data/quote_stk` | `quote_stk` | Stock quote data |
+| `/api/v1/stream/data/quote_fop` | `quote_fop` | Futures/options quote data |
+| `/api/v1/stream/data/quote_idx` | `quote_idx` | Index quote data |
+| `/api/v1/stream/data/calculated_index` | `calculated_index` | Calculated index data |
+| `/api/v1/stream/data/index_contribution` | `index_contribution` | Index contribution data |
+| `/api/v1/stream/data/industry_contribution` | `industry_contribution` | Industry contribution data |
+| `/api/v1/stream/data/index_components` | `index_components` | Index-components projection data |
+| `/api/v1/stream/data/kbar` | `kbar` | Realtime stock KBar data |
+| `/api/v1/stream/data/scanner` | `scanner` | Market signal data |
+| `/api/v1/stream/data/order_event` | `order_event` | Order/deal events |
+| `/api/v1/stream/data/contract_event` | `contract_event` | Contract V2 change notification; re-query for current data |
+
+#### Connection management / 連線管理
+
+- **GET `/api/v1/stream/status`** -- returns `active_connections` count
+- **GET `/api/v1/stream/receivers`** -- returns receiver availability info
+- Connection count is tracked per SSE client. A `ConnectionGuard` ensures automatic cleanup when clients disconnect.
+
+### Watchlist Endpoints
+
+#### GET `/api/v1/watchlist`
+
+List all watchlists.
+
+#### POST `/api/v1/watchlist`
+
+Create a new watchlist.
+
+```json
+{
+  "name": "My Favorites",
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2330" },
+    { "security_type": "STK", "exchange": "TSE", "code": "2317" }
+  ]
+}
+```
+
+#### GET `/api/v1/watchlist/{id}`
+
+Get a single watchlist by ID.
+
+#### PUT `/api/v1/watchlist/{id}`
+
+Sync (replace all) contracts in a watchlist.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2454" }
+  ]
+}
+```
+
+#### DELETE `/api/v1/watchlist/{id}`
+
+Delete a watchlist by ID.
+
+#### POST `/api/v1/watchlist/{id}/contracts`
+
+Add contracts to a watchlist.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2454" }
+  ]
+}
+```
+
+#### DELETE `/api/v1/watchlist/{id}/contracts`
+
+Remove contracts from a watchlist.
+
+```json
+{
+  "contracts": [
+    { "security_type": "STK", "exchange": "TSE", "code": "2317" }
+  ]
+}
+```
+
+### Apps Endpoints
+
+#### GET `/api/v1/apps`
+
+List all uploaded apps.
+
+```json
+{ "apps": ["my-dashboard", "monitor"] }
+```
+
+#### POST `/api/v1/apps/{name}`
+
+Upload files for an app via multipart form. Field name: `files`. Maximum total size: **50 MB**. Requires `Content-Length` header (chunked uploads rejected).
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/apps/my-dashboard \
+  -F "files=@dist/index.html" \
+  -F "files=@dist/main.js" \
+  -F "files=@dist/style.css"
+```
+
+Response:
+```json
+{
+  "name": "my-dashboard",
+  "files": ["my-dashboard/index.html", "my-dashboard/main.js", "my-dashboard/style.css"]
+}
+```
+
+#### DELETE `/api/v1/apps/{name}`
+
+Delete an uploaded app and all its files.
+
+#### GET `/apps/{**path}` (not under /api/v1/)
+
+Serve uploaded app files. This is a public route (no auth required), served from memory. Path traversal attacks are blocked by `is_safe_path` validation.
+
+---
+
+## OpenAPI Documentation / OpenAPI 文件
+
+The server exposes an OpenAPI 3.0 specification. When in doubt, fetch `/openapi.json` from the running server to confirm exact field names, types, required/optional status, and enum values.
+
+伺服器提供 OpenAPI 3.0 規格。有疑問時，從運行中的伺服器取得 `/openapi.json`，即可確認欄位名稱、型別、必填/選填狀態及列舉值。
+
+| Path | Description |
+|------|-------------|
+| `/openapi.json` | Raw OpenAPI 3.0 JSON specification |
+| `/docs` | Interactive Scalar API documentation UI (browse, try endpoints) |
+
+### Using OpenAPI to discover API format / 使用 OpenAPI 查詢 API 格式
+
+#### Browse interactively / 互動式瀏覽
+
+Open `http://localhost:8080/docs` in a browser. The Scalar UI lets you:
+- Browse all endpoints grouped by tag (health, auth, data, order, portfolio, stream, watchlist, apps)
+- See request body schema with field names, types, defaults, and enum values
+- See response schema with all returned fields
+- Try endpoints directly from the browser (send real requests)
+
+#### Fetch the spec programmatically / 程式化取得規格
+
+```bash
+# Download the full OpenAPI spec
+curl -s http://localhost:8080/openapi.json | jq .
+
+# List all available endpoints
+curl -s http://localhost:8080/openapi.json | jq '.paths | keys[]'
+
+# Get the request schema for a specific endpoint (e.g., place_order)
+curl -s http://localhost:8080/openapi.json | jq '.paths["/api/v1/order/place_order"].post.requestBody.content["application/json"].schema'
+
+# Get the response schema
+curl -s http://localhost:8080/openapi.json | jq '.paths["/api/v1/order/place_order"].post.responses["200"].content["application/json"].schema'
+
+# List all schema definitions (reusable types)
+curl -s http://localhost:8080/openapi.json | jq '.components.schemas | keys[]'
+
+# Get a specific schema (e.g., StockOrder fields)
+curl -s http://localhost:8080/openapi.json | jq '.components.schemas["StockOrder"]'
+
+# Find all required fields for a request
+curl -s http://localhost:8080/openapi.json | jq '.components.schemas["PlaceOrderRequest"].required'
+
+# Get enum values for a field (e.g., Action)
+curl -s http://localhost:8080/openapi.json | jq '.components.schemas["Action"]'
+```
+
+#### When to use OpenAPI / 何時使用 OpenAPI
+
+This reference documents endpoint inventory and general usage patterns. Use `/openapi.json` when exact installed-server details matter:
+- Exact field names and casing (e.g., `security_type` vs `securityType`)
+- Required vs optional fields
+- Enum variants (all valid values for Action, OrderType, PriceType, etc.)
+- Nested object structures and array types
+- Default values
+
+The language reference guides (JAVASCRIPT.md, GO.md, etc.) show the general pattern and include OpenAPI client generation commands specific to each language. `/openapi.json` describes the currently running server version.
+
+The OpenAPI spec includes:
+- All endpoint definitions with request/response schemas
+- Security scheme: `bearer_auth` (HTTP Bearer with format `<SJ_API_KEY>:<SJ_SEC_KEY>`)
+- Runtime-matched operation security: loopback documents do not require bearer
+  auth; on a non-loopback bind, protected operations declare `bearer_auth`
+  while `/api/v1/health` and `/api/v1/info` remain public
+- Tags: `health`, `info`, `auth`, `data`, `order`, `portfolio`, `stream`, `watchlist`, `apps`
+- Component schemas for all request/response types
+
+---
+
+## Dashboard / 儀表板
+
+The server includes a built-in web dashboard.
+
+| Path | Description |
+|------|-------------|
+| `/` | Dashboard index (single-page app) |
+| `/{**path}` | Static assets (JS, CSS, images) with `index.html` fallback for SPA routing |
+
+The dashboard requires no external web files at runtime.
+
+---
+
+## Custom App Embedding / 自訂應用嵌入
+
+You can upload custom web applications to the running server:
+
+1. **Upload** via `POST /api/v1/apps/{name}` with multipart form data
+2. **Access** at `http://host:port/apps/{name}/index.html`
+3. **List** all apps via `GET /api/v1/apps`
+4. **Delete** via `DELETE /api/v1/apps/{name}`
+
+Apps are stored in memory (not persisted to disk). They are served publicly at `/apps/` without authentication, similar to the built-in dashboard.
+
+---
+
+## Middleware Stack / 中介層堆疊
+
+The server applies the following middleware in order:
+
+| Middleware | Description |
+|-----------|-------------|
+| `inject(state)` | Inject `ServerState` into the request depot |
+| `Cors` | Service-level preflight handling for configured origins, common methods and headers; successful preflight is cached for 600 seconds |
+| `Logger` | HTTP request/response logging |
+| `CatchPanic` | Recover from panics in handlers |
+| `Compression` | gzip compression (default level) |
+| `api_key_auth` | Bearer token authentication (only on non-localhost, only on protected routes) |
+| `max_size` | 50MB upload size limit (only on app upload endpoint) |
+
+### Router structure / 路由結構
+
+```
+/
+├── /api/v1/
+│   ├── (public)     /health, /info
+│   └── (protected)  /auth/*, /data/*, /order/*, /portfolio/*, /stream/*, /watchlist/*, /apps/*
+├── /openapi.json
+├── /docs
+├── /apps/{**path}      (uploaded apps, public)
+└── /{**path}           (dashboard SPA, public)
+```
+
+---
+
+## Error Responses / 錯誤回應
+
+All errors return JSON:
+
+```json
+{
+  "code": 400,
+  "message": "Description of the error",
+  "details": null
+}
+```
+
+Common status codes:
+
+| Code | Meaning |
+|------|---------|
+| 200 | Success |
+| 400 | Bad request (invalid parameters, missing fields) |
+| 401 | Unauthorized (missing or invalid credentials) |
+| 404 | Not found (contract, watchlist, app) |
+| 413 | Payload too large (app upload exceeds 50MB) |
+| 500 | Internal server error |

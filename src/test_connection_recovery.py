@@ -13,6 +13,11 @@ import shioaji_client as sc
     (sqlite3.OperationalError("NotReady"), "database"),
     (TimeoutError(), "transport"), (ValueError("broken config"), "other"),
     (RuntimeError("QuotaExceeded"), "quota"),
+    (RuntimeError("503 操作異常，請1分鐘後再重新登入"), "rate_limit"),
+    (RuntimeError("操作異常, 請 1 分鐘後再重新登入"), "rate_limit"),
+    (RuntimeError("Response Code: 429"), "rate_limit"),
+    (RuntimeError("RateLimitExceeded"), "rate_limit"),
+    (RuntimeError("503 Please update the version of shioaji"), "other"),
 ])
 def test_exact_failure_classification(error, kind):
     assert error_kind(error) == kind
@@ -24,6 +29,30 @@ def test_exception_graph_and_cycles_keep_database_precedence():
     outer.__context__ = sqlite3.OperationalError("database locked")
     outer.__cause__.__cause__ = outer
     assert error_kind(outer) == "database"
+
+
+def test_wrapped_ban_takes_precedence_over_authentication():
+    outer = RuntimeError("Response Code: 401")
+    outer.__cause__ = RuntimeError("操作異常，請1分鐘後再重新登入")
+    assert error_kind(outer) == "rate_limit"
+
+
+def test_rate_limit_extends_pending_retry_without_shortening_long_backoff():
+    clock = [0.]
+    gate = RecoveryGate(clock=lambda: clock[0], jitter=lambda: 1)
+    gate.fail("session", immediate=True)
+    gate.fail("rate_limit")
+    assert gate.pending and gate.next_attempt == 60
+    clock[0] = 59.9
+    assert not gate.due
+    clock[0] = 60
+    assert gate.due
+    gate.attempted()
+    gate.fail("rate_limit")
+    assert gate.next_attempt == 120
+    gate.next_attempt = 300  # An existing longer cooldown must be preserved.
+    gate.fail("rate_limit")
+    assert gate.next_attempt == 300
 
 
 def test_bounded_backoff_threshold_and_slow_circuit():
