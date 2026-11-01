@@ -23,6 +23,26 @@
   let refreshing = false;
   let lastTradeStatusAt = 0;
 
+  async function tradeFetch(url, options) {
+    const key = 'shioaji-trade-pending';
+    const fingerprint = JSON.stringify([url, options.method, options.body || '']);
+    let pending = JSON.parse(sessionStorage.getItem(key) || 'null');
+    if (pending && pending.fingerprint !== fingerprint) {
+      const status = await fetchRead('/api/trading/commands/' + encodeURIComponent(pending.id));
+      if (status.ok) {
+        const command = await status.json();
+        if (['succeeded', 'failed'].includes(command.state)) sessionStorage.removeItem(key);
+      }
+      throw new Error(`請先核對上一個交易指令 ${pending.id} 的結果，再進行其他操作。`);
+    }
+    pending ||= { id: crypto.randomUUID(), fingerprint };
+    sessionStorage.setItem(key, JSON.stringify(pending));
+    const response = await fetch(url, { ...options,
+      headers: { ...(options.headers || {}), 'Idempotency-Key': pending.id } });
+    if (response.ok || [400, 404, 409, 422].includes(response.status)) sessionStorage.removeItem(key);
+    return response;
+  }
+
   async function fetchRead(url) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
@@ -58,7 +78,10 @@
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
-    state.entryReady = info.bars_ready !== false && info.broker_ready !== false;
+    const selected = selectedContract();
+    const selectedQuote = selected && info.market_quotes ? info.market_quotes[selected.code] : null;
+    const contractReady = !info.contract_bars_ready || (selected && info.contract_bars_ready[selected.code]);
+    state.entryReady = info.bars_ready !== false && info.broker_ready !== false && Boolean(contractReady);
     lastTradeStatusAt = Date.now();
     entryEnabled = Boolean(info.auto_entry_enabled);
     entrySnapshot = info.curve_entry || null;
@@ -67,9 +90,11 @@
     badge.textContent = info.mode || (state.simulation ? '模擬環境' : '正式環境');
     badge.className = 'trade-badge ' + (state.simulation ? 'simulation' : 'production');
     const connection = $('trade-connection');
-    const quoteReady = Boolean(info.quote_connected);
+    const quoteReady = info.market_quotes ? Boolean(selectedQuote?.fresh) : Boolean(info.quote_connected);
+    const displayPrice = info.market_quotes ? selectedQuote?.price : info.last_quote;
+    const displayTime = info.market_quotes ? selectedQuote?.at : info.last_quote_at;
     connection.textContent = info.connected
-      ? (quoteReady ? `行情連線 · ${number(info.last_quote)} · ${info.last_quote_at || ''}` : '帳戶已連線，等待即時行情 tick')
+      ? (quoteReady ? `行情連線 · ${number(displayPrice)} · ${displayTime || ''}` : '帳戶已連線，等待即時行情 tick')
       : (info.error || '尚未連線');
     connection.className = 'trade-connection ' + (info.connected && quoteReady ? 'ok' : 'bad');
     const protection = info.protection;
@@ -79,7 +104,7 @@
         ? `固定出場：${protection.fixed_exit ? '監控中' : '受影響'} · 保本：${protection.breakeven ? '監控中' : '受影響'} · 曲線出場：${protection.curve_exit ? '監控中' : '暫停'} · 券商端保護：待核對`
         : (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick');
     if (info.reconciliation_error) connection.textContent = info.reconciliation_error;
-    state.price = info.last_quote === null ? (state.mock ? null : state.price) : Number(info.last_quote);
+    state.price = displayPrice == null ? null : Number(displayPrice);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
     $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
   }
@@ -343,7 +368,7 @@
     try {
       let result;
       for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await fetch(`/api/trading/orders/${encodeURIComponent(id)}/risk-settings`, {
+        const response = await tradeFetch(`/api/trading/orders/${encodeURIComponent(id)}/risk-settings`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
         });
         result = await response.json();
@@ -383,7 +408,7 @@
     renderOrders();
     message('正在向券商取消未成交委託…');
     try {
-      const response = await fetch(`/api/trading/orders/${encodeURIComponent(order.id)}/cancel`, { method: 'POST' });
+      const response = await tradeFetch(`/api/trading/orders/${encodeURIComponent(order.id)}/cancel`, { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || '取消委託失敗');
       state.orders = state.orders.map((item) => item.id === result.id ? result : item);
@@ -572,7 +597,7 @@
     entryBusy = true;
     renderEntry();
     try {
-      const response = await fetch('/api/trading/curve-entry', {
+      const response = await tradeFetch('/api/trading/curve-entry', {
         method: cancel ? 'DELETE' : 'POST', headers: { 'Content-Type': 'application/json' },
         ...(cancel ? {} : { body: JSON.stringify({ curve_id: curveId, contract_code: contract.code,
           action, quantity, simulation, confirmed: true }) }),
@@ -593,7 +618,7 @@
     const contract = selectedContract();
     if (!contract || !state.connected) return;
     try {
-      const response = await fetch('/api/trading/subscribe', {
+      const response = await tradeFetch('/api/trading/subscribe', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contract_code: contract.code }),
       });
@@ -629,7 +654,7 @@
     $('trade-submit').disabled = true;
     message('委託送出中…');
     try {
-      const response = await fetch('/api/trading/orders', {
+      const response = await tradeFetch('/api/trading/orders', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contract_code: contract.code, action, quantity, price, price_type: priceType,
@@ -650,7 +675,12 @@
   }
 
   $('trade-price-type').addEventListener('change', renderPreview);
-  $('trade-contract').addEventListener('change', () => { subscribeSelectedContract(); renderPreview(); renderEntry(); });
+  $('trade-contract').addEventListener('change', () => {
+    state.price = null;
+    state.entryReady = false;
+    $('trade-price').value = '';
+    subscribeSelectedContract(); refreshTrading(); renderPreview(); renderEntry();
+  });
   $('trade-price').addEventListener('input', renderPreview);
   $('trade-quantity').addEventListener('input', renderPreview);
   $('trade-curve').addEventListener('change', renderPreview);

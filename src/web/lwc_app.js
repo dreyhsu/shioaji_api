@@ -11,8 +11,8 @@
 
 const LWC = window.LightweightCharts;
 
-const REFRESH_MS = 60000;
-const INITIAL_BARS = 120; // ~6 trading days at 19 bars/day; 380 at once is unreadable
+let REFRESH_MS = 60000;
+let INITIAL_BARS = 120; // ~6 trading days at 19 bars/day; 380 at once is unreadable
 const PANE_PRICE = 0;
 const PANE_VOLUME = 1;
 // Height is directly proportional to the stretch factor, and pane 0 ships with
@@ -31,7 +31,9 @@ const C = {
 
 const params = new URLSearchParams(location.search);
 const CODE = params.get('code') || '';
-const DAYS = Number(params.get('days')) || 0;
+let DAYS = Number(params.get('days')) || 0;
+let curveHoverPixels = 8;
+let hoverCurves = [];
 const TIMEFRAMES = ['1m', '5m', '15m', '1h'];
 let timeframe = TIMEFRAMES.includes(params.get('timeframe')) ? params.get('timeframe') : '1h';
 let displayedTimeframe = null;
@@ -162,6 +164,8 @@ function initChart() {
   candles.attachPrimitive(pnlPrimitive);
 
   chart.subscribeCrosshairMove(onCrosshairMove);
+  listenForCurveHover(document.getElementById('chart'));
+  chart.timeScale().subscribeVisibleLogicalRangeChange(hideCurveHover);
   listenForBoxEdits(document.getElementById('chart'));
   listenForTradeLevelEdits(document.getElementById('chart'));
   listenForDrawClicks(document.getElementById('chart'));
@@ -234,12 +238,16 @@ function applySeries(specs) {
 }
 
 // ---------------------------------------------------------------- legend
+function labelText(value) {
+  return String(value).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
 function renderLegendRows() {
   const rows = [
     '<span class="lg"><i style="background:' + C.up + '"></i>' + (CODE || 'TMF') + ' ' + (displayedTimeframe || timeframe) + '</span>',
   ];
   for (const [, entry] of indicators) {
-    rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + entry.spec.label + '</span>');
+    rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + labelText(entry.spec.label) + '</span>');
   }
   document.getElementById('legend-series').innerHTML = rows.join('');
 }
@@ -264,6 +272,47 @@ function onCrosshairMove(param) {
     ' 低 ' + bar.low.toFixed(0) +
     ' 收 ' + bar.close.toFixed(0) +
     ' <b class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(0) + '</b>';
+}
+
+// ----------------------------------------------------------- curve identity
+function hideCurveHover() {
+  document.getElementById('curve-tooltip').hidden = true;
+}
+
+function listenForCurveHover(element) {
+  element.addEventListener('pointermove', event => {
+    const tooltip = document.getElementById('curve-tooltip');
+    if (draw.kind || boxDrag.hit || tradeLevelDrag.part || switchingTimeframe || event.buttons) {
+      hideCurveHover();
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    const point = {x: event.clientX - rect.left, y: event.clientY - rect.top};
+    const logical = chart.timeScale().coordinateToLogical(point.x);
+    if (logical === null || point.x < 0 || point.x > chart.timeScale().width() ||
+        point.y < 0 || point.y > chart.panes()[PANE_PRICE].getHeight()) {
+      hideCurveHover();
+      return;
+    }
+    const closest = CurveHover.hit(hoverCurves, point, {
+      logical, tolerance: curveHoverPixels, barSpacing: chart.timeScale().options().barSpacing,
+      x: time => chart.timeScale().timeToCoordinate(time),
+      y: (curve, price) => curve.series.priceToCoordinate(price),
+    });
+    if (!closest) { hideCurveHover(); return; }
+    const curve = closest.curve;
+    tooltip.textContent = `${curve.label || '曲線'} · [${curve.timeframe || '1h'}] · #${curve.id}`;
+    tooltip.hidden = false;
+    tooltip.style.left = Math.max(0, Math.min(point.x + 14, element.clientWidth - tooltip.offsetWidth - 6)) + 'px';
+    tooltip.style.top = Math.max(0, Math.min(point.y + 14, chart.panes()[PANE_PRICE].getHeight() - tooltip.offsetHeight - 6)) + 'px';
+  });
+  for (const name of ['pointerleave', 'pointerdown', 'pointercancel']) {
+    element.addEventListener(name, hideCurveHover, {capture: true, passive: true});
+  }
+  element.addEventListener('wheel', event => {
+    if (event.deltaX || event.deltaY) hideCurveHover();
+  }, {passive: true});
+  window.addEventListener('resize', hideCurveHover);
 }
 
 // ---------------------------------------------------------------- viewport
@@ -299,6 +348,7 @@ const HINTS = {
 };
 
 function setDrawing(kind) {
+  hideCurveHover();
   if (kind && (switchingTimeframe || displayedTimeframe !== timeframe
     || !canDraw(kind, timeframe))) return;
   draw.kind = kind;
@@ -512,7 +562,7 @@ function renderTrendlineList(lines) {
       const noun = line.kind === 'curve' ? '曲線' : '趨勢線';
       return (
         '<span class="tl"><i style="background:' + (line.color || TRENDLINE_COLOR) + '"></i>' +
-        '[' + (line.timeframe || '1h') + '] ' + (line.label || noun + ' #' + line.id) +
+        '[' + (line.timeframe || '1h') + '] ' + labelText(line.label || noun + ' #' + line.id) +
         (line.kind === 'curve' ? '' : ' <small>(' + line.anchors.length + ' 點)</small>') +
         '<button type="button" data-id="' + line.id + '" title="刪除">✕</button></span>'
       );
@@ -931,6 +981,8 @@ function updateTimeframeButtons(loading = false) {
 }
 
 async function selectTimeframe(next) {
+  hideCurveHover();
+  if (!chart) return;
   if (next === timeframe || boxDrag.hit) return;
   const previous = timeframe;
   timeframe = next;
@@ -958,6 +1010,7 @@ for (const button of document.querySelectorAll('[data-timeframe]')) {
 
 // ---------------------------------------------------------------- refresh loop
 async function refreshChart() {
+  if (!chart) return 0;
   const request = ++chartRequest;
   const query = ['timeframe=' + timeframe];
   if (CODE) query.push('code=' + encodeURIComponent(CODE));
@@ -977,6 +1030,11 @@ async function refreshChart() {
   // bars under the cursor stay put, so there is no visible-range save/restore.
   candles.setData(lastBars);
   applySeries(payload.series || []);
+  hideCurveHover();
+  hoverCurves = (payload.trendlines || []).filter(line => line.kind === 'curve').flatMap(line => {
+    const entry = indicators.get('trendline_' + line.id);
+    return entry ? [{...line, series: entry.series, data: entry.spec.data}] : [];
+  });
 
   // After setData: resolving a box's time to a logical index needs the new time
   // points in place.  An unchanged box payload still has to be re-resolved,
@@ -1000,7 +1058,7 @@ async function refreshChart() {
 }
 
 async function refresh() {
-  if (switchingTimeframe) return;
+  if (switchingTimeframe || !chart) return;
   try {
     const stateUrl = '/api/state' + (CODE ? '?code=' + encodeURIComponent(CODE) : '');
     const [stateResponse] = await Promise.all([fetch(stateUrl), refreshChart()]);
@@ -1014,7 +1072,26 @@ async function refresh() {
   }
 }
 
-initChart();
-updateTimeframeButtons();
-refresh();
-setInterval(refresh, REFRESH_MS);
+async function startDashboard() {
+  try {
+    const response = await fetch('/api/dashboard-config');
+    if (!response.ok) throw new Error('Dashboard 設定載入失敗');
+    const settings = await response.json();
+    timeframe = TIMEFRAMES.includes(params.get('timeframe')) ? params.get('timeframe') : settings.default_timeframe;
+    DAYS = DAYS || settings.history_days;
+    INITIAL_BARS = settings.initial_bars;
+    REFRESH_MS = settings.refresh_seconds * 1000;
+    curveHoverPixels = settings.curve_hover_pixels;
+    document.getElementById('recent').title = `顯示最近 ${INITIAL_BARS} 根 K 棒`;
+    document.getElementById('chart-refresh-note').textContent = `圖表每 ${settings.refresh_seconds} 秒更新`;
+    initChart();
+    updateTimeframeButtons();
+    await refresh();
+    setInterval(refresh, REFRESH_MS);
+  } catch (error) {
+    SNRStatus.setFreshness('設定載入失敗', 'bad');
+    document.getElementById('legend-ohlc').textContent = error.message;
+    console.error(error);
+  }
+}
+startDashboard();

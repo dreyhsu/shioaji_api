@@ -1,7 +1,7 @@
 """Market chart and order dashboard, with optional offline Mock API replay.
 
 The monitor collects production market data in a separate process. Order routes
-delegate to TradingService. ``--mock`` instead supplies a local broker and a fresh
+delegate to the independent localhost trade API. Configuration-selected Mock instead supplies a local broker and a fresh
 isolated database; no monitor process or broker credentials are needed.
 
 The page re-fetches once a minute, which matches how often the monitor has
@@ -20,7 +20,7 @@ without a browser; read-only ``/api/health`` never refreshes service heartbeats.
 from __future__ import annotations
 
 import argparse
-import asyncio
+import os
 import sys
 import time
 from functools import wraps
@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictBool
@@ -44,6 +44,12 @@ import session_bars as sb
 import snr_core as snr
 import trendline as tl
 import trading
+from service_control import ServiceControl, run_server
+from runtime_config import RuntimeConfig, DEFAULT_RUNTIME
+from dashboard_config import DashboardConfig
+from trade_client import TradeClient, command_id
+from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
+                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn)
 from mock_routes import router as mock_router
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -68,30 +74,47 @@ _LOAD_TTL_SECONDS = 5.0
 _LOAD_CACHE: dict[tuple[str, int], tuple[float, object]] = {}
 
 CONFIG = {"code": "TMFR1", "db_path": db.DEFAULT_DB_PATH, "days": 30}
-_TRADING_SERVICE: trading.TradingService | None = None
+_TRADING_SERVICE: trading.TradingService | TradeClient | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app):
     runtime = getattr(_app.state, "mock_runtime", None)
-    if runtime is not None:
-        runtime.start()
-    else:
-        try:
-            await asyncio.to_thread(_trading_service().ensure_connected)
-        except Exception as error:
-            print(f"交易服務啟動未就緒：{type(error).__name__}；請檢查獨立健康監督", flush=True)
+    control = ServiceControl(CONFIG.get('control_db_path', CONFIG['db_path']), 'dashboard', CONFIG.get('mode', 'simulation')).start()
+    _app.state.control = control
     try:
+        if runtime is not None:
+            runtime.start()
         yield
     finally:
-        if runtime is not None:
-            runtime.close()
-        if _TRADING_SERVICE is not None:
-            _TRADING_SERVICE.close()
+        try:
+            if runtime is not None:
+                runtime.close()
+            if _TRADING_SERVICE is not None:
+                _TRADING_SERVICE.close()
+        finally:
+            control.close()
 
 
 app = FastAPI(title="TMF S/R monitor", lifespan=_lifespan)
 app.include_router(mock_router)
+
+@app.middleware('http')
+async def trading_identity(request: Request, call_next):
+    token = command_id.set(request.headers.get('Idempotency-Key'))
+    try:
+        return await call_next(request)
+    finally:
+        command_id.reset(token)
+
+
+@app.get('/api/trading/commands/{identity}')
+def api_trade_command(identity: str):
+    service = _trading_service()
+    if not isinstance(service, TradeClient):
+        raise HTTPException(404, '此模式未使用獨立 trade 指令')
+    return service.command(identity)
+
 
 
 @app.get("/api/health")
@@ -122,15 +145,16 @@ def _mock_locked(function):
     return wrapped
 
 
-def _trading_service() -> trading.TradingService:
+def _trading_service() -> trading.TradingService | TradeClient:
     global _TRADING_SERVICE
     if _mock_runtime() is not None:
         return _mock_runtime().service
     if _TRADING_SERVICE is None or _TRADING_SERVICE.db_path != Path(CONFIG["db_path"]):
         if _TRADING_SERVICE is not None:
             _TRADING_SERVICE.close()
-        _TRADING_SERVICE = trading.TradingService(CONFIG["db_path"], CONFIG["code"],
-                                                 health_config=CONFIG.get("health_config", mh.DEFAULT_CONFIG))
+        _TRADING_SERVICE = TradeClient(CONFIG["db_path"], CONFIG["code"],
+                                       url=CONFIG.get("trade_url", "http://127.0.0.1:8766"),
+                                       mode=CONFIG.get("mode", "simulation"))
     return _TRADING_SERVICE
 
 
@@ -148,18 +172,26 @@ def ensure_lwc_bundle() -> None:
     )
 
 
-def _cached_load(code: str, days: int):
-    if _mock_runtime() is not None:
-        with _mock_runtime().lock:
-            return _load(code, days)
-    key = (code, days)
+def _cached_load(code: str, days: int, *, need_minutes=False):
+    runtime = _mock_runtime()
+    with db.session(CONFIG['db_path']) as conn:
+        version = db.chart_versions(conn, code)
+    version = (*version, id(runtime.service), runtime.cursor) if runtime else version
+    key = (str(Path(CONFIG['db_path']).resolve()), code, days, need_minutes)
     now = time.monotonic()
     cached = _LOAD_CACHE.get(key)
-    if cached is not None and now - cached[0] < _LOAD_TTL_SECONDS:
-        return cached[1]
-    data = _load(code, days)
-    _LOAD_CACHE[key] = (now, data)
+    if cached is not None and now - cached[0] < dashboard_settings().cache_seconds and cached[1] == version:
+        return cached[2]
+    data = _load(code, days, need_minutes=need_minutes)
+    _LOAD_CACHE[key] = (now, version, data)
     return data
+
+
+def _minutes(data):
+    if data['minute_bars'] is None:
+        with db.session(CONFIG['db_path']) as conn:
+            data['minute_bars'] = db.load_minute_bars(conn, data['code'])
+    return data['minute_bars']
 
 
 def _epoch(stamp) -> int:
@@ -242,7 +274,7 @@ def _drawing_values(data, line: dict) -> pd.Series:
     timeframe = line.get("timeframe", "1h")
     sources = data.setdefault("drawing_bars", {"1h": data["hourly"]})
     if timeframe not in sources:
-        sources[timeframe] = tl.source_bars(data["minute_bars"], timeframe)
+        sources[timeframe] = tl.source_bars(_minutes(data), timeframe)
     bars = data.get("chart_bars", data["hourly"])
     return tl.values_at_times(sources[timeframe], line["anchors"], bars["timestamp"],
                               line.get("kind") or "line", timeframe)
@@ -353,22 +385,32 @@ def _records(frame: pd.DataFrame) -> list[dict]:
     ]
 
 
-def _load(code: str, days: int):
+def _load(code: str, days: int, *, need_minutes=False):
     """Hourly bars, boxes and the ATR for the window the page shows."""
     with db.session(CONFIG["db_path"]) as conn:
-        minute_bars = db.load_minute_bars(conn, code)
+        conn.execute('BEGIN')
+        trendlines = db.load_trendlines(conn, code)
+        need_minutes = need_minutes or any(line.get('timeframe', '1h') != '1h' for line in trendlines)
+        summary = conn.execute('SELECT COUNT(*), MIN(minute_start), MAX(minute_start) FROM minute_bars WHERE code=?', (code,)).fetchone()
+        last = conn.execute('SELECT * FROM minute_bars WHERE code=? ORDER BY minute_start DESC LIMIT 1', (code,)).fetchone()
+        derived = conn.execute('SELECT * FROM dashboard_derived_versions WHERE code=?', (code,)).fetchone()
+        revision = db.chart_versions(conn, code)[0]
+        hourly = db.load_hourly_bars(conn, code)
+        fast = (derived is not None and derived['revision'] == revision
+                and derived['minute_count'] == summary[0] and derived['first_minute'] == summary[1]
+                and derived['last_minute'] == summary[2] and len(hourly) == derived['hourly_count'])
+        minute_bars = None if fast and not need_minutes else db.load_minute_bars(conn, code)
         reversals = db.load_reversals(conn, code, limit=300)
         boxes_db = db.load_boxes(conn, code)
         visits = db.load_visits(conn, code, limit=30)
         alerts = db.load_alerts(conn, code, limit=30)
         book_rows = db.count_orderbook_rows(conn, code)
-        trendlines = db.load_trendlines(conn, code)
         box_overrides = db.load_box_overrides(conn, code)
 
-    if minute_bars.empty:
+    if not summary[0]:
         return None
-
-    hourly = sb.minute_bars_to_hourly(minute_bars)
+    if not fast:
+        hourly = sb.minute_bars_to_hourly(minute_bars)
     cutoff = hourly["hour_start"].max() - pd.Timedelta(days=days)
     visible = hourly[hourly["hour_start"] >= cutoff].reset_index(drop=True)
 
@@ -379,7 +421,10 @@ def _load(code: str, days: int):
         atr = float(raw) if pd.notna(raw) else None
 
     return {
+        "code": code,
         "minute_bars": minute_bars,
+        "minute_count": summary[0],
+        "last_minute": dict(last),
         "hourly": hourly,
         "visible": visible,
         "boxes": boxes_db,
@@ -393,6 +438,20 @@ def _load(code: str, days: int):
     }
 
 
+def dashboard_settings():
+    return CONFIG.get('dashboard_settings', DashboardConfig())
+
+
+@app.get('/api/ready')
+def api_ready():
+    return {'pid': os.getpid(), 'mode': CONFIG.get('mode', 'simulation')}
+
+
+@app.get('/api/dashboard-config')
+def api_dashboard_config():
+    return {**dashboard_settings().public(), 'history_days': CONFIG['days']}
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(WEB_DIR / "lwc.html")
@@ -402,7 +461,7 @@ def index() -> FileResponse:
 @_mock_locked
 def api_chart(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
-    timeframe: Timeframe = "1h",
+    timeframe: Timeframe | None = None,
 ) -> dict:
     """Bars, boxes and indicator curves from a single read, so they agree.
 
@@ -411,7 +470,8 @@ def api_chart(
     boxes would disagree about where the right edge of the chart is.
     """
     code = code or CONFIG["code"]
-    data = _cached_load(code, days or CONFIG["days"])
+    timeframe = timeframe or dashboard_settings().default_timeframe
+    data = _cached_load(code, days or CONFIG["days"], need_minutes=timeframe != "1h")
     if data is None:
         runtime = _mock_runtime()
         if runtime is not None and code == runtime.code and runtime.cursor == 0:
@@ -420,7 +480,7 @@ def api_chart(
                     "bars": [], "boxes": [], "series": [], "trendlines": []}
         raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
     if timeframe != "1h":
-        bars = sb.minute_bars_to_interval(data["minute_bars"], TIMEFRAME_MINUTES[timeframe])
+        bars = sb.minute_bars_to_interval(_minutes(data), TIMEFRAME_MINUTES[timeframe])
         # Share the hourly view's cutoff so the same historical boxes remain visible.
         visible = bars[bars["timestamp"] >= data["visible"]["timestamp"].iloc[0]].reset_index(drop=True)
         data = {**data, "chart_bars": bars, "visible": visible}
@@ -439,7 +499,7 @@ def api_chart(
 @_mock_locked
 def api_bars(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
-    timeframe: Timeframe = "1h",
+    timeframe: Timeframe | None = None,
 ) -> dict:
     payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "timeframe", "generated_at", "bars")}
@@ -449,7 +509,7 @@ def api_bars(
 @_mock_locked
 def api_boxes(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
-    timeframe: Timeframe = "1h",
+    timeframe: Timeframe | None = None,
 ) -> dict:
     payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "generated_at", "boxes")}
@@ -459,7 +519,7 @@ def api_boxes(
 @_mock_locked
 def api_series(
     code: str | None = None, days: int = Query(default=0, ge=0, le=365),
-    timeframe: Timeframe = "1h",
+    timeframe: Timeframe | None = None,
 ) -> dict:
     payload = api_chart(code=code, days=days, timeframe=timeframe)
     return {k: payload[k] for k in ("code", "generated_at", "series")}
@@ -491,19 +551,20 @@ def _invalidate_cache() -> None:
 @_mock_locked
 def api_trendlines(code: str | None = None) -> list[dict]:
     code = code or CONFIG["code"]
-    with db.session(CONFIG["db_path"]) as conn:
-        lines = db.load_trendlines(conn, code)
-        minutes = db.load_minute_bars(conn, code)
-    sources = {}
+    data = _cached_load(code, CONFIG['days'])
+    if data is None:
+        return []
+    lines = [dict(line) for line in data['trendlines']]
+    sources = {'1h': data['hourly']}
     for line in lines:
-        line["curve_price"] = None
-        if line["kind"] == "curve" and not minutes.empty:
-            timeframe = line["timeframe"]
+        line['curve_price'] = None
+        if line['kind'] == 'curve':
+            timeframe = line['timeframe']
             if timeframe not in sources:
-                sources[timeframe] = tl.source_bars(minutes, timeframe)
-            value = tl.values_at_times(sources[timeframe], line["anchors"],
-                                      [minutes.iloc[-1]["minute_start"]], timeframe=timeframe).iloc[0]
-            line["curve_price"] = float(value) if pd.notna(value) else None
+                sources[timeframe] = tl.source_bars(_minutes(data), timeframe)
+            value = tl.values_at_times(sources[timeframe], line['anchors'],
+                [pd.Timestamp(data['last_minute']['minute_start'])], timeframe=timeframe).iloc[0]
+            line['curve_price'] = float(value) if pd.notna(value) else None
     return lines
 
 
@@ -536,53 +597,6 @@ def api_delete_trendline(line_id: int) -> dict:
     return {"deleted": line_id}
 
 
-class OrderIn(BaseModel):
-    contract_code: str = Field(min_length=1, max_length=24)
-    action: Literal["Buy", "Sell"]
-    quantity: int = Field(ge=1, le=100, strict=True)
-    price: float = Field(ge=0, allow_inf_nan=False)
-    price_type: Literal["LMT", "MKT", "MKP"] = "LMT"
-    order_type: Literal["ROD", "IOC", "FOK"] = "ROD"
-    curve_id: int | None = None
-    simulation: bool
-    confirmed: bool = False
-
-
-class TradeLevelsIn(BaseModel):
-    stop_price: float
-    target_price: float | None = None
-
-
-class TradeCurveIn(BaseModel):
-    target_price: float
-
-
-class TradeCurveSelectionIn(BaseModel):
-    curve_id: int | None = None
-
-
-class TradeRiskSettingsIn(BaseModel):
-    curve_id: int | None = Field(default=None, ge=1)
-    stop_price: float = Field(gt=0, allow_inf_nan=False)
-    target_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    breakeven_enabled: StrictBool
-    risk_revision: int = Field(ge=0, strict=True)
-    confirmed: StrictBool = False
-
-
-class ContractSubscriptionIn(BaseModel):
-    contract_code: str = Field(min_length=1, max_length=24)
-
-
-class CurveEntryIn(BaseModel):
-    action: Literal["Buy", "Sell"] = "Buy"
-    curve_id: int = Field(gt=0, strict=True)
-    contract_code: str = Field(min_length=1, max_length=24)
-    quantity: int = Field(default=1, ge=1, le=100, strict=True)
-    simulation: StrictBool
-    confirmed: StrictBool = False
-
-
 @app.get("/api/trading/curve-entry")
 @_mock_locked
 def api_curve_entry_status() -> dict:
@@ -598,6 +612,8 @@ def api_arm_curve_entry(body: CurveEntryIn) -> dict:
         return _trading_service().curve_entry.arm(**body.model_dump())
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -624,6 +640,8 @@ def api_trading_status() -> dict:
 def api_trading_contracts() -> list[dict]:
     try:
         return _trading_service().contracts()
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -633,6 +651,8 @@ def api_trading_contracts() -> list[dict]:
 def api_subscribe_trading_contract(body: ContractSubscriptionIn) -> dict:
     try:
         return _trading_service().subscribe_contract(body.contract_code)
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -642,6 +662,8 @@ def api_subscribe_trading_contract(body: ContractSubscriptionIn) -> dict:
 def api_trading_margin() -> dict:
     try:
         return _trading_service().margin()
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -668,6 +690,8 @@ def api_place_order(body: OrderIn) -> dict:
             return result
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -681,6 +705,8 @@ def api_cancel_trade_entry(order_id: str) -> dict:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except HTTPException:
+        raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -793,8 +819,7 @@ def api_state(code: str | None = None) -> dict:
                     "message": "回放尚未開始，按播放或 +1 分鐘載入第一根 K 棒"}
         return {"code": code, "ready": False, "message": "no minute bars stored yet"}
 
-    minute_bars = data["minute_bars"]
-    last_minute = minute_bars.iloc[-1]
+    last_minute = data["last_minute"]
     last_price = float(last_minute["close"])
     last_stamp = pd.Timestamp(last_minute["minute_start"])
     stale_minutes = (_dashboard_now() - last_stamp).total_seconds() / 60.0
@@ -838,7 +863,7 @@ def api_state(code: str | None = None) -> dict:
         "market_health": (None if _mock_runtime() is not None else api_health()),
         "in_session": sb.is_trading_time(_dashboard_now()),
         "hourly_bars": len(data["hourly"]),
-        "minute_bars": len(minute_bars),
+        "minute_bars": data["minute_count"],
         "hourly_atr": data["atr"],
         "sides": sides,
         "open_visits": _records(open_visits),
@@ -852,32 +877,44 @@ def api_state(code: str | None = None) -> dict:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--code", default="TMFR1")
+    parser.add_argument("--runtime-config", type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument("--dashboard-config", type=Path, default=None)
+    parser.add_argument("--code", default=None)
     parser.add_argument("--db", type=Path, default=None)
-    parser.add_argument("--mock", action="store_true", help="離線 V 型行情與 Mock 券商，不讀取券商帳密")
-    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
-    parser.add_argument("--days", type=int, default=30, help="how much history to chart")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--health-config", type=Path, default=None)
+    parser.add_argument("--trade-url", default=None)
+    parser.add_argument("--days", type=int, default=None, help="how much history to chart")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    import uvicorn
 
     args = parse_args(argv)
-    db_path = args.db or db.DEFAULT_DB_PATH
-    if args.mock:
+    runtime_config = RuntimeConfig.load(args.runtime_config)
+    settings = DashboardConfig.load(args.dashboard_config or runtime_config.dashboard_config)
+    code = args.code or runtime_config.signal_code
+    db_path = args.db or runtime_config.unified_db
+    app.state.mock_runtime = None
+    if runtime_config.mode == 'mock':
         from tempfile import mkdtemp
         from mock_runtime import MockRuntime
-        db_path = args.db or Path(mkdtemp(prefix="shioaji-mock-")) / "mock.db"
-        app.state.mock_runtime = MockRuntime(db_path, args.code)
+        from mock_config import load_mock_config
+        db_path = Path(mkdtemp(prefix="shioaji-mock-")) / "mock.db"
+        app.state.mock_runtime = MockRuntime(db_path, code, config=load_mock_config(runtime_config.mock_config),
+                                             settings_path=runtime_config.trading_config)
         print(f"離線 Mock API · 獨立資料庫 {db_path} · 回放初始暫停", flush=True)
-    CONFIG.update({"code": args.code, "db_path": db_path, "days": args.days, "health_config": args.health_config})
+    CONFIG.update(code=code, db_path=db_path, days=args.days or settings.history_days,
+                  health_config=args.health_config or runtime_config.health_config,
+                  trade_url=args.trade_url or runtime_config.trade_url, mode=runtime_config.mode,
+                  dashboard_settings=settings, control_db_path=runtime_config.unified_db)
+    args.host, args.port = args.host or settings.host, args.port or settings.port
     ensure_lwc_bundle()
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
-    print(f"dashboard for {args.code} -> http://{args.host}:{args.port}", flush=True)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    print(f"dashboard for {code} -> http://{args.host}:{args.port}", flush=True)
+    run_server(app, host=args.host, port=args.port, log_level="warning",
+               control=lambda: getattr(app.state, 'control', None))
     return 0
 
 

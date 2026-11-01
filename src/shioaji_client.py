@@ -81,8 +81,8 @@ def bind_session_down(api, callback) -> bool:
 # Session
 # --------------------------------------------------------------------------------------
 @contextmanager
-def connect(simulation: bool | None = None) -> Iterator[sj.Shioaji]:
-    """Log in from ``.env`` and always log out again."""
+def connect(simulation: bool | None = None, *, strict_logout: bool = False, session_observer=None) -> Iterator[sj.Shioaji]:
+    """Log in and always attempt logout; fetchers request observable logout failures."""
     load_dotenv(PROJECT_ROOT / ".env")
     try:
         api_key = os.environ["SHIOAJI_API_KEY"]
@@ -96,14 +96,34 @@ def connect(simulation: bool | None = None) -> Iterator[sj.Shioaji]:
         os.getenv("SHIOAJI_SIMULATION", "1") == "1" if simulation is None else simulation
     )
     api = sj.Shioaji(simulation=use_simulation)
+    def notify(event):
+        if session_observer is not None:
+            if event == 'login_started':
+                session_observer(event)  # persist intent before any possible login
+                return
+            try:
+                session_observer(event)
+            except Exception:
+                pass  # acknowledgement I/O must never prevent SDK logout
     try:
+        notify('login_started')
         api.login(api_key=api_key, secret_key=secret_key)
+        notify('login_succeeded')
         yield api
     finally:
         try:
-            api.logout()
-        except Exception:  # noqa: BLE001 - logout failures must not mask real errors
-            pass
+            notify('logout_started')
+            result = api.logout()
+            if result is False:
+                notify('logout_failed')
+                if strict_logout:
+                    raise DataUnavailable('broker logout returned false')
+            else:
+                notify('logout_succeeded')
+        except Exception:  # legacy callers retain best-effort cleanup
+            notify('logout_failed')
+            if strict_logout:
+                raise
 
 
 def resolve_contract(api: sj.Shioaji, code: str):

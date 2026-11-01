@@ -176,7 +176,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 0 20
   .trade-layout { grid-template-columns: 1fr; padding-inline: 12px; }
   #chart { height: 520px; }
 }
-/* Offline replay tools are visible only when --mock is explicitly enabled. */
+/* Offline replay tools are visible only when Mock is selected in runtime.json. */
 .mock-panel { margin: 16px; padding: 16px 20px; border: 1px solid #26a69a; border-radius: 10px; background: #122925; }
 .mock-panel[hidden] { display: none; }
 .mock-panel h2 { margin: 0; font-size: 17px; }
@@ -199,3 +199,20 @@ footer { color: var(--muted); font-size: 12px; text-align: center; padding: 0 20
 .risk-editor input:read-only { opacity: .65; }
 #risk-state { flex-basis: 100%; color: var(--muted); font-size: 12px; }
 #risk-state.bad { color: #ef5350; }
+
+#chart { position: relative; }
+.curve-tooltip {
+  position: absolute;
+  z-index: 20;
+  pointer-events: none;
+  max-width: min(360px, 90%);
+  overflow-wrap: anywhere;
+  padding: 6px 10px;
+  border: 1px solid #596074;
+  border-radius: 5px;
+  background: #252935;
+  color: #f4f5f8;
+  font-size: 13px;
+  box-shadow: 0 2px 8px #0006;
+}
+.curve-tooltip[hidden] { display: none; }

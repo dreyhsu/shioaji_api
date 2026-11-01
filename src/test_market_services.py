@@ -15,7 +15,9 @@ def test_jobs_have_separate_ownership_and_never_auto_restart_trading(tmp_path):
     for label, document in specs.items():
         roundtrip = plistlib.loads(plistlib.dumps(document))
         assert roundtrip == document
-        assert document["EnvironmentVariables"]["SHIOAJI_SIMULATION"] == "0"
+        assert "SHIOAJI_SIMULATION" not in document["EnvironmentVariables"]
+        assert "--runtime-config" in document["ProgramArguments"]
+        assert "--mode" not in document["ProgramArguments"]
         assert document["KeepAlive"] == ("trading" not in label)
         assert all(isinstance(value, str) for value in document["ProgramArguments"])
         if "watchdog" in label:

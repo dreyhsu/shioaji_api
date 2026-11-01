@@ -15,6 +15,7 @@ import threading
 
 import pandas as pd
 import market_clock
+from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 import market_health as mh
 from file_lease import FileLease
 
@@ -153,14 +154,19 @@ class IncidentNotifier:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--code", default="TMFR1")
-    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
-    parser.add_argument("--mode", choices=("production", "simulation"), default="production")
+    parser.add_argument("--runtime-config", type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--code", default=None)
+    parser.add_argument("--health-config", type=Path, default=None)
     parser.add_argument("--notify", action="store_true", help="enable Telegram delivery; local incidents are always logged")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=float, default=5)
     args = parser.parse_args(argv)
+    config = RuntimeConfig.load(args.runtime_config)
+    if skip_mock(config.mode):
+        return 0
+    args.db, args.code = args.db or config.unified_db, args.code or config.signal_code
+    args.health_config = args.health_config or config.health_config
     if not 0 < args.interval <= 60:
         parser.error("interval must be in (0, 60]")
     settings = mh.load_settings(args.health_config)
@@ -180,7 +186,7 @@ def main(argv=None):
         while not stop.is_set():
             calendar = mh.SessionCalendar.load(settings.calendar_path)
             now = market_clock.now()
-            issues = inspect_health(args.db, args.code, now=now, settings=settings, calendar=calendar, mode=args.mode)
+            issues = inspect_health(args.db, args.code, now=now, settings=settings, calendar=calendar, mode=config.mode)
             mh.atomic_json(directory / f"watchdog-{args.code}.json",
                            {"heartbeat_at": mh.iso(market_clock.now()), "issues": issues,
                             "notification_enabled": args.notify})

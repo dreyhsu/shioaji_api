@@ -12,19 +12,24 @@ macOS launchd 操作方式見[行情故障恢復操作手冊](doc/market_connect
 
 首次使用請先依[環境安裝說明](#環境)建立 `tss` 並安裝依賴；同名 conda 環境不代表套件已齊全。
 
+## 模式與整體啟動
+
+執行模式只從 [`config/runtime.json`](config/runtime.json) 讀取，預設 `mock`；`--mock`／`--mode` 已移除。修改後需重新啟動。macOS 用 `./start_all.sh` 或雙擊 `start_all.command`；Windows 可在 conda `tss` 執行 `python src/service_launcher.py`。啟動順序、停止方式與日誌見[一鍵啟動說明](doc/runtime_and_dashboard.md)。
+
+Dashboard 設定在 [`config/dashboard.json`](config/dashboard.json)：預設 `1h`、30 天、初始 120 根、每 60 秒刷新。1h 圖優先使用 monitor 的已驗證衍生資料；滑鼠停在已保存曲線旁可查看名稱、週期與 ID。
+
 ## 離線 Mock API：V 型行情測試
 
 ```bash
-conda run --no-capture-output -n tss python src/dashboard.py --mock --port 8766
+./start_all.sh
 ```
 
-開啟 [Mock Dashboard](http://127.0.0.1:8766)。不需啟動 `monitor.py`，不讀券商帳密；
+預設 `config/runtime.json` 的 `mode` 為 `mock`，也可雙擊 `start_all.command`。啟動後自動開啟 [Mock Dashboard](http://127.0.0.1:8765)。不需啟動 `monitor.py`，不讀券商帳密；
 每次啟動建立新的暫存資料庫，不使用 `data/tmf.db`。畫面顯示「離線 Mock API」，
 與 Shioaji 的券商模擬環境是不同模式。
 
 情境為 **60 小時下跌 → 8 小時 V 型反彈 → 2 小時回檔**（按有效交易分鐘計）。
-目前 `config/mock.json` 設為 `replay.start_bar: 0`，從 **0/4200 根**空圖開始，
-不預載歷史資料。播放速度依 `replay.interval_seconds`（目前 0.1 秒推進
+目前 `config/mock.json` 設為 `replay.start_bar: 3500`，初始預載 **3500/4200 根**；可改成 `0` 從空圖開始。播放速度依 `replay.interval_seconds`（目前 0.1 秒推進
 1 分鐘），也可按 +1 / +10 / +60 分鐘。未推進的資料不參與指標與策略。
 
 Mock 的可調參數集中在 [`config/mock.json`](config/mock.json)，**修改後需重新啟動 Mock Dashboard**。
@@ -131,7 +136,7 @@ stop 可獨立修改。取消曲線時帶出成交均價 ±2 倍進場 ATR，可
 Mock 只替換行情來源、時鐘與委託撮合，提供播放／暫停／快轉及重設；所有模式的
 突破進場、一次觸發、ATR、固定停損停利、曲線出場與操作介面都使用相同交易服務。
 
-非 Mock 使用 `.env` 的 `SHIOAJI_SIMULATION=1` 連券商模擬環境，`0` 為正式環境。
+非 Mock 在 `config/runtime.json` 設 `mode: "simulation"` 連券商模擬環境，`"production"` 為正式環境。
 需由 `monitor.py` 持續寫入相同資料庫的已收盤 1 分 K，Dashboard 負責交易監控。
 例如在兩個終端機分別執行（先設定好 `.env` 與必要帳戶權限）：
 
@@ -441,7 +446,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `src/probe_history.py` | API 能力探測 |
 | `src/snr_1_hour_chart.py` | 靜態 HTML 繪圖 CLI |
 
-正式行情使用兩個常駐行程：`monitor.py` 寫行情，`dashboard.py` 讀圖表並處理下單／畫線。sqlite 跑 WAL 模式；
+正式行情使用獨立 tick／kbar fetcher、每商品 monitor、trade 與 Dashboard；Dashboard 交易需求交給 trade，本身只讀圖表並處理畫線設定。sqlite 跑 WAL 模式；
 儀表板掛掉不影響資料收集。
 
 行情 session 恢復、逐合約 tick 健康、獨立告警與部署步驟見
@@ -460,7 +465,7 @@ DB 與盤別時段都是台北時間。程式裡的「現在」一律用 **UTC +
 | `/api/state` | 現價、落後分鐘、兩側箱體、近期停留／型態／通知 |
 | `/api/trading/*` | Shioaji 合約、委託、保證金、即時出場監控 |
 
-下單介面使用 `.env` 的 `SHIOAJI_SIMULATION` 決定模擬或正式環境，頁面會顯示目前模式；正式下單需設定 `SHIOAJI_CA_PATH`、`SHIOAJI_CA_PASSWD`、`SHIOAJI_PERSON_ID`。新倉送出前會顯示確認摘要。`config/trading.json` 的 `auto_exit_enabled` 預設為 `true`；設為 `false` 時停損／停利觸發只提醒，不會自動送平倉單。
+下單介面使用 `config/runtime.json` 的 `mode` 決定離線 Mock、券商模擬或正式環境，頁面會顯示目前模式；正式下單需設定 `SHIOAJI_CA_PATH`、`SHIOAJI_CA_PASSWD`、`SHIOAJI_PERSON_ID`。新倉送出前會顯示確認摘要。`config/trading.json` 的 `auto_exit_enabled` 預設為 `true`；設為 `false` 時停損／停利觸發只提醒，不會自動送平倉單。
 
 停損與固定停利預設為實際成交均價上下各 2 倍 1 小時 ATR，可在圖上拖曳或輸入調整，按「儲存」才生效。持倉成交後可由該筆部位選擇已保存的 1 小時曲線，曲線取代固定 +2 ATR 停利，但保留原停損；多單在 1 分 K 收盤由曲線上方穿越到下方時觸發停利，空單反向。曲線 target 唯讀並跟隨最新曲線位置，stop 可獨立修改；自動保本依 `config/trading.json` 的門檻與保留點數收緊 stop（預設超過 100 點後保留 5 點）。停損依即時 tick 監控，曲線停利依已收盤的 1 分 K 監控，觸發後送市價 IOC 平倉；服務、行情 tick 與分鐘 K 資料需持續更新。委託回報不明時會停止自動重送，須核對券商端委託。
 
@@ -616,5 +621,5 @@ conda run -n tss python -m pytest -q
     https://cdn.jsdelivr.net/npm/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js
   ```
 
-`.env` 需要：`SHIOAJI_API_KEY`、`SHIOAJI_SECRET_KEY`、`SHIOAJI_SIMULATION`、
+`.env` 需要：`SHIOAJI_API_KEY`、`SHIOAJI_SECRET_KEY`、
 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`。

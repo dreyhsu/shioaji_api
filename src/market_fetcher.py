@@ -28,6 +28,8 @@ from fetcher_storage import FetcherStore
 from file_lease import FileLease
 import market_health as mh
 import shioaji_client as sc
+from service_control import ServiceControl
+from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / 'config' / 'market_services.json'
@@ -148,6 +150,7 @@ def normalize_tick(quote, code, now):
 
 class FetcherRuntime:
     role = ''
+    stream_required = True
 
     def __init__(self, db_path, codes, *, mode, settings=None, calendar=None, connect_factory=None,
                  clock=taipei_now, monotonic=time.monotonic, sdk=None):
@@ -161,7 +164,9 @@ class FetcherRuntime:
         self.clock, self.monotonic = clock, monotonic
         self.calendar = calendar
         self.schedule = SessionSchedule(self.settings)
-        self.connect_factory = connect_factory or (lambda: sc.connect(simulation=mode == 'simulation'))
+        self.connect_factory = connect_factory or (lambda: sc.connect(simulation=mode == 'simulation', strict_logout=True, session_observer=self._session_event))
+        self._injected_connect = connect_factory is not None
+        self.control = None
         self.sdk = sdk or sc.sj
         self.instance = uuid.uuid4().hex
         self.generation = 0
@@ -190,12 +195,39 @@ class FetcherRuntime:
         self._last_state = None
         self._last_health = float('-inf')
         self._window = None
+        self.session_entered = False
+        self.logout_unconfirmed = False
+        self.stream_issue = None
+
+    def _session_event(self, event):
+        if self.control is not None:
+            self.control.session(event)
+
+    def event(self, event, **details):
+        """Durable per-owner journal; DB failures cannot erase session evidence."""
+        folder = self.db_path.parent / 'logs'
+        record = dict(id=uuid.uuid4().hex, timestamp=str(self.clock()), timezone='Asia/Taipei',
+                      role=self.role, mode=self.mode, codes=list(self.codes), instance=self.instance,
+                      generation=self.generation, event=event)
+        record.update(details)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            with (folder / f'{self.role}_events.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.health['audit_error'] = None
+        except OSError as error:
+            # Auditing must never prevent logout from releasing a live session.
+            self.health['audit_error'] = type(error).__name__
+            LOG.error('role=%s event=%s audit_failed=%s', self.role, event, type(error).__name__)
 
     def start(self):
         if self.started:
             return
         self.lease.acquire()
         try:
+            self.control = ServiceControl(self.db_path, f'{self.role}-fetcher', self.mode, broker=True).start()
             self.store = FetcherStore(self.db_path)
             self.started = True
             self.publish(state='starting')
@@ -204,6 +236,8 @@ class FetcherRuntime:
                 self.store.close()
             self.store = None
             self.started = False
+            if self.control is not None:
+                self.control.close()
             self.lease.close()
             raise
 
@@ -241,9 +275,16 @@ class FetcherRuntime:
 
     def _open(self):
         self.publish(state='connecting', operation='login', operation_started=str(self.clock()))
+        self.generation += 1
+        self.event('login_started')
+        if self._injected_connect:
+            self._session_event('login_started')
         self.context = self.connect_factory()
         self.api = self.context.__enter__()
-        self.generation += 1
+        self.session_entered = True
+        if self._injected_connect:
+            self._session_event('login_succeeded')
+        self.event('login_succeeded')
         generation = self.generation
         self.aliases, self.contracts = {}, {}
         for code in self.codes:
@@ -253,7 +294,6 @@ class FetcherRuntime:
                 alias = str(getattr(contract, attr, '') or '')
                 if alias:
                     self.aliases.setdefault(alias, set()).add(code)
-        self.api.set_on_tick_fop_v1_callback(lambda *args: self._callback(generation, args[-1]))
         def session_down():
             with self.lock:
                 if self.accepting and generation == self.generation:
@@ -261,23 +301,47 @@ class FetcherRuntime:
         sc.bind_session_down(self.api, session_down)
         self.down.clear()
         self.accepting = True
-        for contract in self.contracts.values():
-            self.api.quote.subscribe(contract, quote_type=self.sdk.QuoteType.Tick, version=self.sdk.QuoteVersion.v1)
+        if self.stream_required:
+            self.publish(operation='subscribe', operation_started=str(self.clock()))
+            self.api.set_on_tick_fop_v1_callback(lambda *args: self._callback(generation, args[-1]))
+            for contract in self.contracts.values():
+                self.api.quote.subscribe(contract, quote_type=self.sdk.QuoteType.Tick, version=self.sdk.QuoteVersion.v1)
         self.connected_at, self.connected_mono = pd.Timestamp(self.clock()), self.monotonic()
         self.last_fresh.clear()
         self.last_received.clear()
         self.on_connected()
         self.gate.pending = False  # reset attempts only after fresh stream data
-        self.publish(state='waiting_ticks', operation=None, error=None)
+        self.publish(state='waiting_ticks' if self.stream_required else 'connected', operation=None, error=None)
 
     def _disconnect(self):
+        closing_generation = self.generation
         with self.lock:
             self.accepting = False
             self.generation += 1
+        entered = self.session_entered
         try:
+            if entered:
+                if self.control and self.gate.reason != 'rate_limit':
+                    self.control.sample_usage(self.api)
+                if self._injected_connect:
+                    self._session_event('logout_started')
+                self.event('logout_started', generation=closing_generation)
             if self.context is not None:
                 self.context.__exit__(None, None, None)
+            if self._injected_connect:
+                self._session_event('logout_succeeded')
+            if entered:
+                self.event('logout_succeeded', generation=closing_generation)
+        except Exception as error:
+            if entered:
+                self._session_event('logout_failed')
+                self.logout_unconfirmed = True
+                self.health['logout_unconfirmed'] = True
+                self.event('logout_failed', generation=closing_generation,
+                           reason=error_kind(error), error_type=type(error).__name__)
+            raise
         finally:
+            self.session_entered = False
             self.context = self.api = None
             self.contracts.clear()
             self.last_fresh.clear()
@@ -309,6 +373,9 @@ class FetcherRuntime:
 
     def step(self):
         self.start()
+        if self.control and self.control.stop_requested:
+            self.publish(state='stopping', operation=None)
+            return
         now = pd.Timestamp(self.clock())
         calendar = self.calendar or mh.SessionCalendar.load(self.settings.calendar_path)
         window = self.schedule.window(now, calendar)
@@ -326,10 +393,15 @@ class FetcherRuntime:
                 self.publish(state='scheduled_closed' if calendar.covered(now) else 'calendar_unavailable',
                              operation=None, error=None, next_window=None)
                 return
+            if self.logout_unconfirmed:
+                self.publish(state='logout_unconfirmed', operation=None,
+                             error={'kind': 'logout_unconfirmed', 'type': 'ManualVerificationRequired'})
+                return
             if self.down.is_set() or self.overflow.is_set():
                 reason = 'queue_overflow' if self.overflow.is_set() else 'session_down'
                 if self.overflow.is_set():
                     self.health['queue_overflows'] += 1
+                self.event('realtime_fetch_failed' if self.stream_required else 'session_failed', reason=reason)
                 self._disconnect()
                 self.gate.fail(reason, immediate=True)
             if self.gate.pending:
@@ -361,6 +433,10 @@ class FetcherRuntime:
                 self._disconnect()
                 self.publish(state='scheduled_closed', operation=None)
                 return
+            if not self.stream_required:
+                self.gate.success()
+                self.publish(state='running', operation=None, error=None, window_end=str(window[1]))
+                return
             active = calendar.active(now)
             quiet = [code for code in self.codes
                      if self.monotonic() - self.last_fresh.get(code, self.connected_mono)
@@ -371,7 +447,15 @@ class FetcherRuntime:
                 for code in self.codes)
             # No trade is not evidence of a broken session. Keep stale data
             # visible, but reconnect only on session-down or an actual API error.
+            if (active and not fresh and self.stream_issue != 'stale'
+                    and self.monotonic() - self.connected_mono >= self.settings.tick_stale_seconds):
+                self.event('realtime_fetch_failed', reason='stale_or_missing_tick',
+                           quote_times={code: str(at) for code, at in self.last_received.items()})
+                self.stream_issue = 'stale'
             if fresh:
+                if self.stream_issue:
+                    self.event('realtime_fetch_recovered')
+                self.stream_issue = None
                 self.gate.success()
             self.publish(state='running' if fresh else 'waiting_ticks' if not active else 'stale',
                          operation=None, error=None, stream_fresh=fresh,
@@ -380,6 +464,12 @@ class FetcherRuntime:
                          window_end=str(window[1]))
         except Exception as error:
             kind = error_kind(error)
+            operation = self.health.get('operation')
+            event = ('backfill_failed' if operation == 'kbars' else
+                     'login_failed' if operation == 'login' else
+                     'realtime_fetch_failed' if self.stream_required else 'fetch_failed')
+            self.event(event, reason=kind, error_type=type(error).__name__,
+                       operation=operation, **(self.health.get('history_range', {}) if operation == 'kbars' else {}))
             if self.health.get('operation') == 'kbars':
                 self.health['history_error'] = {'kind': kind, 'type': type(error).__name__}
             if kind == 'rate_limit':
@@ -425,20 +515,29 @@ class FetcherRuntime:
                     self.store.close()
                     self.store = None
                     self.started = False
-                    self.lease.close()
+                    try:
+                        if self.control:
+                            self.control.close()
+                    finally:
+                        self.lease.close()
 
 
 def run_cli(runtime_class, argv=None):
     parser = argparse.ArgumentParser(description=runtime_class.__doc__)
-    parser.add_argument('--db', type=Path, default=ROOT / 'data' / 'market_fetchers.db')
-    parser.add_argument('--codes', nargs='+', default=['TMFR1'])
-    parser.add_argument('--mode', choices=('simulation', 'production'), required=True)
-    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument('--runtime-config', type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument('--db', type=Path, default=None)
+    parser.add_argument('--codes', nargs='+', default=None)
+    parser.add_argument('--config', type=Path, default=None)
     parser.add_argument('--once', action='store_true', help='one lifecycle step, then logout')
     if runtime_class.role == 'kbar':
-        parser.add_argument('--no-backfill', action='store_true', help='stream only; no historical repair queries')
+        parser.add_argument('--no-backfill', action='store_true', help='disable historical queries (diagnostic lifecycle only)')
     args = parser.parse_args(argv)
-    settings = FetcherSettings.load(args.config)
+    runtime_config = RuntimeConfig.load(args.runtime_config)
+    if skip_mock(runtime_config.mode):
+        return 0
+    args.db = args.db or runtime_config.acquisition_db
+    args.codes = args.codes or runtime_config.contracts
+    settings = FetcherSettings.load(args.config or runtime_config.market_config)
     log_dir = args.db.resolve().parent / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = TimedRotatingFileHandler(log_dir / f'{runtime_class.role}_fetcher.log', when='midnight',
@@ -454,9 +553,9 @@ def run_cli(runtime_class, argv=None):
         if sig is not None:
             signal.signal(sig, lambda *_: stop.set())
     options = {'backfill_enabled': not args.no_backfill} if runtime_class.role == 'kbar' else {}
-    runtime = runtime_class(args.db, args.codes, mode=args.mode, settings=settings, **options)
+    runtime = runtime_class(args.db, args.codes, mode=runtime_config.mode, settings=settings, **options)
     try:
-        while not stop.is_set():
+        while not stop.is_set() and not (runtime.control and runtime.control.stop_requested):
             runtime.step()
             if args.once:
                 break

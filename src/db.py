@@ -215,6 +215,36 @@ CREATE TABLE IF NOT EXISTS backfill_progress (
   done_at TEXT, rows INTEGER, note TEXT,
   PRIMARY KEY (code, task, key)
 );
+
+CREATE TABLE IF NOT EXISTS market_data_versions (code TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS dashboard_drawing_versions (code TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS dashboard_derived_versions (
+    code TEXT PRIMARY KEY, revision INTEGER NOT NULL, minute_count INTEGER NOT NULL,
+    first_minute TEXT NOT NULL, last_minute TEXT NOT NULL, hourly_count INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS minute_version_insert AFTER INSERT ON minute_bars BEGIN
+    INSERT INTO market_data_versions VALUES (NEW.code,1)
+    ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS minute_version_delete AFTER DELETE ON minute_bars BEGIN
+    INSERT INTO market_data_versions VALUES (OLD.code,1)
+    ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS minute_version_update AFTER UPDATE ON minute_bars
+WHEN OLD.open IS NOT NEW.open OR OLD.high IS NOT NEW.high OR OLD.low IS NOT NEW.low OR OLD.close IS NOT NEW.close OR OLD.volume IS NOT NEW.volume OR OLD.amount IS NOT NEW.amount OR OLD.session_id IS NOT NEW.session_id OR OLD.minute_start IS NOT NEW.minute_start OR OLD.code IS NOT NEW.code BEGIN
+    INSERT INTO market_data_versions VALUES (NEW.code,1) ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS drawing_version_insert AFTER INSERT ON trendlines BEGIN
+    INSERT INTO dashboard_drawing_versions VALUES (NEW.code,1)
+    ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS drawing_version_update AFTER UPDATE ON trendlines BEGIN
+    INSERT INTO dashboard_drawing_versions VALUES (NEW.code,1)
+    ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS drawing_version_delete AFTER DELETE ON trendlines BEGIN
+    INSERT INTO dashboard_drawing_versions VALUES (OLD.code,1)
+    ON CONFLICT(code) DO UPDATE SET revision=revision+1;
+END;
 """
 
 
@@ -280,7 +310,7 @@ def session(path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
 # --------------------------------------------------------------------------------------
 # Bars
 # --------------------------------------------------------------------------------------
-def upsert_minute_bars(conn: sqlite3.Connection, code: str, bars: pd.DataFrame) -> int:
+def upsert_minute_bars(conn: sqlite3.Connection, code: str, bars: pd.DataFrame, *, commit: bool = True) -> int:
     if bars.empty:
         return 0
     rows = [
@@ -309,7 +339,8 @@ def upsert_minute_bars(conn: sqlite3.Connection, code: str, bars: pd.DataFrame) 
         """,
         rows,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(rows)
 
 
@@ -981,3 +1012,25 @@ def backfill_done_keys(conn: sqlite3.Connection, code: str, task: str) -> set[st
         "SELECT key FROM backfill_progress WHERE code = ? AND task = ?", (code, task)
     ).fetchall()
     return {row["key"] for row in rows}
+
+
+def chart_versions(conn, code):
+    price = conn.execute('SELECT revision FROM market_data_versions WHERE code=?', (code,)).fetchone()
+    drawing = conn.execute('SELECT revision FROM dashboard_drawing_versions WHERE code=?', (code,)).fetchone()
+    return (price[0] if price else 0, drawing[0] if drawing else 0)
+
+
+def mark_dashboard_derived(conn, code, expected_revision, minutes, hourly):
+    """Certify a complete hourly view only when its source did not change."""
+    summary = conn.execute('SELECT COUNT(*), MIN(minute_start), MAX(minute_start) FROM minute_bars WHERE code=?',
+                           (code,)).fetchone()
+    valid = (not minutes.empty and summary[0] == len(minutes)
+             and summary[1] == _text(minutes.iloc[0]['minute_start'])
+             and summary[2] == _text(minutes.iloc[-1]['minute_start'])
+             and chart_versions(conn, code)[0] == expected_revision)
+    if valid:
+        conn.execute('INSERT OR REPLACE INTO dashboard_derived_versions VALUES (?,?,?,?,?,?)',
+                     (code, expected_revision, summary[0], summary[1], summary[2], len(hourly)))
+    else:
+        conn.execute('DELETE FROM dashboard_derived_versions WHERE code=?', (code,))
+    conn.commit()

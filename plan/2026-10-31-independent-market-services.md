@@ -56,12 +56,19 @@
 
 ## 交易日驗證與最近 30 日 JSON（後續階段）
 
-- 本機 Shioaji 1.7.7 公開介面沒有專用交易日曆方法，不能假定能直接取得歷史紀錄的交易日。
-- 獨立唯讀工具取得指定 DB／商品的最後一筆分鐘紀錄，以交易所日曆建立候選交易日，再用少量指定時段歷史 ticks 查詢驗證。
+- 2026-10-31 查核：在 conda `tss` 以 `shioaji.__version__`、`dir(shioaji.Shioaji)` 與 `inspect.signature` 確認本機為 1.7.7，公開介面沒有專用交易日曆／最近 N 個交易日方法。**可以用歷史行情 API 驗證候選日期有成交，但不能一次直接取得完整交易日曆。** 本次僅查核本機介面與官方文件，未登入券商、未實測近 30 日回傳資料，也未查詢當前連線用量。
+- 獨立唯讀工具取得指定 DB／商品的最後一筆分鐘紀錄，以交易所日曆建立候選交易日，再透過 K 線服務既有登入 session 查詢，不為日曆驗證另開 session。可先用 `api.ticks(contract, date=D, query_type=sj.constant.TicksQueryType.LastCount, last_cnt=1)` 取得最少量成交證據；須核對回傳時間、成交量與候選交易日／時段映射，不能只以回傳非空就通過。時段歸屬的驗證另用少量 `RangeTime` 查詢。
+- `ticks(date=D)` 的日期參數是交易日；期貨夜盤歸下一交易日。`kbars(start=..., end=...)` 可批次取得行情日期作為候選，但時間戳的自然日期不等於期貨交易日，不得直接 `unique(date)` 作為 TMF 交易日清單。本專案既有日期切片探測紀錄見 `doc/probe_findings.md`、`src/shioaji_client.py`。
+- 明確區分「近 30 個日曆日內有哪些交易日」與本計畫的「最近 30 個已確認交易日」。官方限制 `kbars()` 單次區間不超過 30 個日曆日；若用 K 棒輔助，需分段向前查詢至足 30 個交易日，不能只查一次近 30 日就宣稱已湊足。保留現有 7 日分段策略即可。
 - 必測一般夜盤、週五至週六、連假前夜盤；不使用單純日期加一天，也不將現有 `session_date` 直接當成已確認券商交易日。API 空資料或錯誤只能標未知。
 - `data/cache/trading_days-TMFR1.json` 以最後 DB 紀錄所屬交易日為上限保存最近 30 個已確認交易日；保存商品、時區、來源、對應時段、schema、更新時間及驗證狀態。
 - 不足 30 日標不完整；由 K 線服務單獨維護、原子替換，共用快取命中時不查 API，只在進入新交易日後增量更新。失敗保留舊檔並標過期。
 - 歷史快取不能取代未來開休市、特殊時段的 `market_calendar.json`。
+
+API 查核來源（2026-10-31）：
+
+- [Shioaji 官方歷史行情文件](https://sinotrade.github.io/zh/tutor/market_data/historical/)：`ticks` 的 `date` 為交易日，支援 `RangeTime`／`LastCount`；`kbars` 單次區間不超過 30 天。
+- [Shioaji 官方技能市場資料參考](https://github.com/Sinotrade/Shioaji/blob/master/plugins/shioaji/skills/shioaji/references/MARKET_DATA.md)：期貨夜盤交易日歸屬、連續合約與空資料判讀。
 
 ## 交易拆分、漏訊號及價差（後續階段）
 

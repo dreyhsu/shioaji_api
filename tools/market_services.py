@@ -18,25 +18,26 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 import market_clock
 import market_health as mh
+from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 
 
-def launchd_specs(root, python, db_path, *, code, mode, health_config, port=8765, notify=False):
+def launchd_specs(root, python, db_path, *, code, mode, health_config, port=8766, notify=False, runtime_config=DEFAULT_RUNTIME):
     root, db_path = Path(root).resolve(), Path(db_path).resolve()
     suffix = hashlib.sha256(f"{db_path}:{code}".encode()).hexdigest()[:10]
     specs = {}
     for role in ("monitor", "trading", "watchdog"):
         label = f"com.shioaji.{role}.{suffix}"
-        command = ([str(python), str(root / "src" / "health_watchdog.py"), "--mode", mode]
+        command = ([str(python), str(root / "src" / "health_watchdog.py")]
                    if role == "watchdog" else
                    [str(python), str(root / "tools" / "run_market_service.py"), "--role", role])
-        command += ["--db", str(db_path), "--code", code, "--health-config", str(Path(health_config).resolve())]
+        command += ["--runtime-config", str(Path(runtime_config).resolve()), "--db", str(db_path), "--code", code, "--health-config", str(Path(health_config).resolve())]
         if role == "trading":
             command += ["--port", str(port)]
         if role == "watchdog" and notify:
             command += ["--notify"]
         specs[label] = {"Label": label, "ProgramArguments": command, "WorkingDirectory": str(root),
                         "RunAtLoad": True, "KeepAlive": role != "trading", "ThrottleInterval": 30,
-                        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", "SHIOAJI_SIMULATION": "1" if mode == "simulation" else "0"},
+                        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
                         "StandardOutPath": str(root / "data" / "logs" / f"{label}.out.log"),
                         "StandardErrorPath": str(root / "data" / "logs" / f"{label}.err.log")}
     return specs
@@ -88,18 +89,24 @@ def preflight(db_path, code, mode, settings, *, now):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("preflight", "render"))
-    parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--code", default="TMFR1")
-    parser.add_argument("--mode", required=True, choices=("production", "simulation"))
-    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
+    parser.add_argument("--runtime-config", type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--code", default=None)
+    parser.add_argument("--health-config", type=Path, default=None)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--notify", action="store_true")
     args = parser.parse_args(argv)
+    config = RuntimeConfig.load(args.runtime_config)
+    if skip_mock(config.mode):
+        return 0
+    args.db, args.code = args.db or config.unified_db, args.code or config.signal_code
+    args.health_config = args.health_config or config.health_config
+    args.port = args.port or config.trade_port
     mh.health_path(args.db, "monitor", args.code)  # validate identity before writing paths
     settings = mh.load_settings(args.health_config)
     if args.action == "preflight":
-        result = preflight(args.db, args.code, args.mode, settings, now=market_clock.now())
+        result = preflight(args.db, args.code, config.mode, settings, now=market_clock.now())
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["configuration_ready"] and result["database_readable"] and result["unresolved_orders"] == 0 else 1
     if not args.output:
@@ -108,8 +115,8 @@ def main(argv=None):
         parser.error("render creates macOS launchd files only; on Windows run the documented service commands")
     if Path(sys.prefix).name != "tss":
         parser.error("render must run in conda env tss")
-    specs = launchd_specs(ROOT, sys.executable, args.db, code=args.code, mode=args.mode,
-                          health_config=args.health_config, port=args.port, notify=args.notify)
+    specs = launchd_specs(ROOT, sys.executable, args.db, code=args.code, mode=config.mode,
+                          health_config=args.health_config, port=args.port, notify=args.notify, runtime_config=args.runtime_config)
     args.output.mkdir(parents=True, exist_ok=True)
     for label, document in specs.items():
         path = args.output / f"{label}.plist"

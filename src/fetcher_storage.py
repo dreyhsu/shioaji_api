@@ -117,10 +117,10 @@ class FetcherStore:
         self.conn.commit()
         return pd.Timestamp(default)
 
-    def missing(self, code, mode, expected):
+    def missing(self, code, mode, expected, source=None):
         rows = self.conn.execute(
-            "SELECT minute_start FROM market_stream_bars WHERE code=? AND mode=? AND complete=1",
-            (code, mode),
+            "SELECT minute_start FROM market_stream_bars WHERE code=? AND mode=? AND complete=1 AND (? IS NULL OR source=?)",
+            (code, mode, source, source),
         ).fetchall()
         return sorted(expected - {pd.Timestamp(row[0]) for row in rows})
 

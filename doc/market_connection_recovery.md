@@ -1,5 +1,7 @@
 # 行情恢復、獨立監督及正式切換
 
+
+模式改由 `config/runtime.json` 控制（預設 Mock），不接受模式命令列參數。整體啟動與設定以 [runtime_and_dashboard.md](runtime_and_dashboard.md) 為準；以下個別服務命令只會在設定為非 Mock 時連線。
 本修復不會在匯入模組時登入、送單或發送通知。開發驗證僅使用 `tss`、暫存 SQLite 和注入的模擬券商；沒有停止、重啟或更動現有正式服務。
 
 2026-10-28 驗證：完整離線套件 610 項通過，包含本次新增 53 項故障與部署驗證；前端 JavaScript 語法檢查通過。仍有既有 `pytest_freezegun` 的 deprecation warnings。券商模擬帳號整合、正式程序角色、實際成交及跨程序登入／登出影響尚未核實，不在離線測試的證明範圍內。
@@ -75,7 +77,7 @@
 唯讀前置檢查（不核對券商，不更新資料庫）：
 
 ```sh
-conda run -n tss python tools/market_services.py preflight --db data/tmf.db --code TMFR1 --mode production
+conda run -n tss python tools/market_services.py preflight --db data/tmf.db --code TMFR1
 ```
 
 前置檢查的 `configuration_ready` 只代表日曆範圍足夠；`runtime_verified` 固定為 false，提醒仍需人工核對券商與執行中程序。舊版本沒有健康檔時顯示未辨識，不推測它執行的是目前磁碟版本。
@@ -89,13 +91,13 @@ conda run -n tss python tools/market_services.py preflight --db data/tmf.db --co
 ```sh
 conda run --no-capture-output -n tss python tools/run_market_service.py --role monitor --db data/tmf.db --code TMFR1
 conda run --no-capture-output -n tss python tools/run_market_service.py --role trading --db data/tmf.db --code TMFR1 --port 8765
-conda run --no-capture-output -n tss python src/health_watchdog.py --db data/tmf.db --code TMFR1 --mode production --notify
+conda run --no-capture-output -n tss python src/health_watchdog.py --db data/tmf.db --code TMFR1 --notify
 ```
 
 只產生可審查的 macOS launchd 設定檔，不安裝、不啟動：
 
 ```sh
-conda run -n tss python tools/market_services.py render --db data/tmf.db --code TMFR1 --mode production --output out/market-services --notify
+conda run -n tss python tools/market_services.py render --db data/tmf.db --code TMFR1 --output out/market-services --notify
 ```
 
 安裝前建立 `data/logs`、檢查產生的 Python 路徑確實屬於 `tss`、模式／DB／port 正確、沒有舊服務衝突，再依實際部署帳號用 launchd 載入。monitor／watchdog 設為獨立重啟；交易服務 `KeepAlive=false`，意外終止需核對後人工啟動，避免無人注意的交易程序循環重啟。重連開關為啟動時設定，不支援在不重啟下變更。
@@ -119,10 +121,10 @@ conda run -n tss python -c "import sys; print(sys.executable)"
 ```text
 -X utf8 -u tools\run_market_service.py --role monitor --db data\tmf.db --code TMFR1
 -X utf8 -u tools\run_market_service.py --role trading --db data\tmf.db --code TMFR1 --port 8765
--X utf8 -u src\health_watchdog.py --db data\tmf.db --code TMFR1 --mode production --notify
+-X utf8 -u src\health_watchdog.py --db data\tmf.db --code TMFR1 --notify
 ```
 
-以有權讀取專案設定及券商憑證的部署帳號執行，設定同一工作「不啟動新的執行個體」。monitor／watchdog 可設定失敗後重啟；trading 不設定自動重啟，先核對委託與部位。正式模式仍須確認 `.env` 的 `SHIOAJI_SIMULATION=0`。工作排程器的執行時間限制、電池供電及睡眠條件也應符合常駐需求。
+以有權讀取專案設定及券商憑證的部署帳號執行，設定同一工作「不啟動新的執行個體」。monitor／watchdog 可設定失敗後重啟；trading 不設定自動重啟，先核對委託與部位。正式模式須確認 `config/runtime.json` 的 `mode` 為 `production`；新版服務不依 `.env` 切換模式。工作排程器的執行時間限制、電池供電及睡眠條件也應符合常駐需求。
 
 Windows supervisor 建立自己的子程序群組，先嘗試 `CTRL_BREAK`，逾時或無主控台時才透過自己持有的子程序 handle 停止它，不呼叫 Unix 的 `killpg`／`SIGKILL`。互動執行可用 Ctrl+C 正常關閉；若強制終止排程工作，另行核對健康檔中的子程序 PID，不能假定它已一併結束。共用程序鎖仍會阻擋另一份服務重複登入。
 

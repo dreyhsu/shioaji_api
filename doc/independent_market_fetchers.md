@@ -1,22 +1,25 @@
-# 獨立 tick / 1 分 K 抓取服務（第一階段）
+# 行情回補、即時擷取與 monitor 統整（2026-11-01 更新）
 
-這兩個程式不需要啟動 `monitor.py`，不匯入或建立交易服務，也不送單。各自建立一個 Shioaji session；第一階段尚未替換原有 monitor／trade 的行情來源。
+
+模式改由 `config/runtime.json` 控制（預設 Mock），不接受模式命令列參數。整體啟動與設定以 [runtime_and_dashboard.md](runtime_and_dashboard.md) 為準；以下個別服務命令只會在設定為非 Mock 時連線。
+兩個 fetcher 各自持有一個 Shioaji session，可獨立執行、不建立交易服務、不送單。`kbar_fetcher.py` 專做歷史回補與核對，`tick_fetcher.py` 專做即時 tick、最新價及已收盤 1 分 K 候選。`monitor.py` 不登入券商，統整兩者資料並更新指標；Dashboard 與 trade 統一讀 monitor 寫出的 DB。獨立 trade 與 Dashboard 代理已實作，操作見 [independent_trade.md](independent_trade.md)。
 
 ## 啟動
 
 在專案根目錄執行，macOS 和 Windows 使用同樣參數。以下是操作說明，開發驗證沒有執行這些真實連線命令。
 
 ```text
-conda run --no-capture-output -n tss python -X utf8 -u src/tick_fetcher.py --mode simulation --codes TMFR1 TMFK6
-conda run --no-capture-output -n tss python -X utf8 -u src/kbar_fetcher.py --mode simulation --codes TMFR1
+conda run --no-capture-output -n tss python -X utf8 -u src/tick_fetcher.py --codes TMFR1 TMFK6
+conda run --no-capture-output -n tss python -X utf8 -u src/kbar_fetcher.py --codes TMFR1
+conda run --no-capture-output -n tss python -X utf8 -u src/monitor.py --fetcher-db data/market_fetchers.db --db data/tmf.db
 ```
 
-兩者預設共用獨立的 `data/market_fetchers.db`，可用 `--db` 指定另一個測試 DB。`--mode` 必填；`simulation` 仍是**券商連線模式**，需要 `.env` 憑證，不是離線 Mock。正式模式須明確指定 `--mode production`。
+兩者預設共用獨立的 `data/market_fetchers.db`，可用 `--db` 指定另一個測試 DB。模式由 `config/runtime.json` 設定；`simulation` 仍是**券商連線模式**，需要 `.env` 憑證，不是離線 Mock。正式模式須在 runtime 設定檔明確指定 `production`。
 
 - `--config` 指定設定檔，預設 `config/market_services.json`。
 - `--once` 做一輪生命週期後登出；tick 是非同步推送，一輪可能還沒有報價，不適合當成即時行情可用性的驗收。
-- K 線的 `--no-backfill` 只訂閱／彙整，不查歷史 API，方便獨立驗證 callback 與分鐘邊界。
-- Tick 支援多個 `--codes`；K 線一次只接受一個。連續合約報價的實際 underlying code 會映射回所設定代碼。
+- K 線的 `--no-backfill` 只測試排程登入／登出，不訂閱即時行情，也不查歷史 API；分鐘彙整測試改由 tick 服務執行。
+- Tick 與 K 線均支援多個 `--codes`；K 線在同一 session 內依合約維護獨立回補游標。連續合約報價的實際 underlying code 會映射回所設定代碼。
 - Ctrl+C 正常關閉；排程登出只結束連線，服務不退出。
 
 ## 設定與輸出
@@ -34,7 +37,7 @@ conda run --no-capture-output -n tss python -X utf8 -u src/kbar_fetcher.py --mod
 | `market_bar_checks` | 同分鐘兩來源 OHLCV／amount 比對，`match`／`mismatch`／`incomplete` 及差異 |
 | `market_fetcher_progress` | 持久化驗證起點，重啟不因新資料而忘掉較早缺口 |
 
-這些表不會覆寫策略用 `minute_bars`。`complete=1` 是資料範圍屬性，**不代表交易已就緒**。正式遷移前仍需驗證 broker 與 stream 一致性、來源新鮮度與交易閘門。
+fetcher 不會覆寫策略用 `minute_bars`；由 monitor 負責統一寫入。monitor 透過唯讀連線讀取來源 DB，不會自動建立缺少的來源，也不會改用券商 API fallback。`complete=1` 是資料範圍屬性，**不代表交易已就緒**。正式遷移前仍需驗證 broker 與 stream 一致性、來源新鮮度與交易閘門。
 
 健康檔位於 DB 旁 `.health/<DB檔名>/tick-fetcher.json` 和 `kbar-fetcher.json`；分別使用獨占鎖，一個角色／DB 只允許一個程序，兩種角色可以同時運行。健康檔含模式、PID、世代、錯誤種類、重試狀態、行情時間及 `staged_only: true`。
 
@@ -44,7 +47,23 @@ Tick 回呼只入記憶體佇列，由主執行緒寫入 DB；無新 tick 時不
 
 佇列溢位、session-down 或可辨識的連線／認證錯誤會觸發有退避的連線重建，DB 鎖定不重登。收到「操作異常，請1分鐘後再重新登入」等明確限流錯誤時，記錄為 `rate_limit`，停止該服務的 API 工作，至少等待 60 秒才重試；再次被拒絕就重新計時，已有更長退避則保留。冷卻期間不登入、不訂閱、不查歷史資料。此冷卻由各程序管理，不會自動暫停其他程序或電腦。
 
-K 線在收盤後預設等待 2 秒才發布前一分鐘；晚到 tick 會使已發布的候選分鐘失效，等待歷史修復。啟動／中斷分鐘不標完整，不為無成交分鐘補造 OHLC；保留現有 13:45 集合競價排除慣例。歷史查詢限於啟動／重連、成熟缺口修復及收盤核對，修復間隔預設 300 秒，不逐分鐘查歷史 API。SDK 超時或阻塞可能延後排程登出，健康檔會保留操作及開始時間供監督判斷。
+Tick 服務在收盤後預設等待 2 秒才發布前一分鐘；晚到 tick 會使已發布的候選分鐘失效，等待歷史修復。啟動／中斷分鐘不標完整，不為無成交分鐘補造 OHLC；保留現有 13:45 集合競價排除慣例。歷史查詢限於啟動／重連、成熟缺口修復及收盤核對，修復間隔預設 300 秒，不逐分鐘查歷史 API。SDK 超時或阻塞可能延後排程登出，健康檔會保留操作及開始時間供監督判斷。
+
+## Monitor 統整與稽核
+
+monitor 預設每秒檢查來源，僅在 K 棒改變時重算指標。只匯入已收盤完整分鐘，`broker` 優先於 `stream`；同時同步最新價，保留原始行情時間。來源 DB 與模式綁定在統一 DB，切換模式或來源請使用另一個統一 DB，避免模擬與正式資料混用。策略仍以 1 分 K 收定後判斷，獨立 trade 讀取同一 DB 的指標、`trendlines` 曲線與 `minute_bars`；Dashboard order 需求交由 trade API 執行。
+
+未核對的即時候選可顯示，但健康狀態保持 `staged_only`／`degraded`。目前採逐分鐘 broker 修復後才允許健康閘門通過，因此盤中最新候選尚未核對時通常不開放策略交易；來源整體驗收仍待後續完成；trade 維持相同健康閘門。五檔 fetcher 串接未完成，monitor 不再訂閱五檔或用 snapshot fallback，健康檔明確標示。
+
+來源 DB 旁 `logs/tick_events.jsonl`／`logs/kbar_events.jsonl` 保留原始稽核事件；獨立 trade 的事件另從統一 DB 旁 `logs/trade_events.jsonl` 讀取，使用 Asia/Taipei 時間（角色、模式、instance、generation）：
+
+- 登入／登出：started、succeeded、failed 分開記錄；fetcher 使用嚴格登出回報，例外或明確 false 回傳不得記成功。登出失敗會標示 `logout_unconfirmed`，同一程序停止新增登入，待人工確認舊連線釋放。
+- 回補：記錄查詢起訖 timestamp、排他上界、已收盤篩選截止、實際寫入資料起訖與筆數；失敗保留相同查詢區間及錯誤分類／型別。
+- 即時失敗：session-down、佇列溢位、過舊或缺少 tick、API／DB 錯誤；恢復另記事件。啟動給予新鮮度寬限，持續安靜不會每輪重複記錄過舊事件，也不會自行重登。
+
+monitor 即使晚啟動或重啟，仍會依原始時間補讀，事件 ID 去重、讀取位置持久化。彙整輸出位於統一 DB 旁 `logs/monitor.log`，並存入 `monitor_fetch_events`，可用 timestamp／role／event 查詢。資料庫稽核表是持久化查核依據，文字日誌寫入失敗時可由表內 document 重建；原始事件檔目前不自動輪替，不應刪除尚未彙整的事件。
+
+`--no-orderbook` 保留相容參數，但 monitor 所有模式都不自行抓五檔。`--backfill-days` 在 monitor 僅是空庫尚未取得 fetcher 起點時的驗證範圍，不會發出網路回補；空庫取得 kbar fetcher 的持久化起點後跟隨該範圍。
 
 ## 測試怎麼寫
 
@@ -75,3 +94,10 @@ conda run -n tss python -m pytest -q
 - Python 語法與行尾空白檢查通過。
 - 完整套件執行完成 660 項後長時間無進展，已中止；附近的一項交易一致性測試獨立執行通過。原因尚未確認，不能將首次拆分的 760 項結果當成本次完整回歸結果。
 - 本次沒有登入券商或在 Windows 原生環境執行。
+
+### 資料分工與 monitor 遷移驗證（2026-11-01）
+
+- conda `tss`：fetcher、monitor、DB、行情健康、watchdog、Dashboard 與 mock routes 的相關離線測試 **177 項通過**（13.37 秒）。涵蓋回補起訖、session 時間、失敗原因、登出失敗不誤報成功且阻止新增登入、原始事件補讀去重、來源失效撤回與 broker 修復優先。
+- 共用測試 `frame` 保持 DataFrame／session 欄位介面，watchdog 的兩項相容問題已修正並通過回歸。
+- 全套回歸執行至風控一致性測試附近長時間無進展，已結束該次測試程序；本次沒有全套通過的結論。停滯前顯示的 mock 路由案例，在獨立及上述相關測試組合中通過，尚未證實全套執行順序的影響。
+- 語法與 diff 空白檢查通過；未登入券商、未送單、未部署，未做 Windows 原生驗證。

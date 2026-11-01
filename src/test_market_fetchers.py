@@ -10,7 +10,8 @@ import pytest
 
 import db
 from file_lease import LeaseUnavailable
-from kbar_fetcher import KbarFetcher, MinuteAccumulator
+from kbar_fetcher import KbarFetcher
+from minute_accumulator import MinuteAccumulator
 from market_fetcher import FetcherSettings, SessionSchedule, Tick
 import market_health as mh
 from tick_fetcher import TickFetcher
@@ -173,13 +174,14 @@ def test_two_services_have_separate_sessions_and_can_stop_independently(rig):
     tick.step()
     bar.step()
     assert len(rig.apis) == 2
+    assert rig.apis[1].callback is None and rig.apis[1].subscribed == []
     rig.apis[0].tick(rig.now[0], 20001)
-    rig.apis[1].tick(rig.now[0], 21000)
     tick.close()
     assert rig.apis[0].closed and not rig.apis[1].closed
     rig.advance('2026-10-30 09:01:02', 62)
     bar.step()
-    assert rows(bar, 'market_stream_bars')[0]['close'] == 21000
+    assert rows(bar, 'market_stream_bars') == []
+    assert bar.health['state'] == 'running'
 
 
 def test_duplicate_role_is_rejected_but_other_mode_data_is_separate(rig):
@@ -297,7 +299,7 @@ def test_ohlcv_uses_tick_event_order_and_delays_close():
 
 def test_partial_start_and_late_ticks_are_not_certified(rig):
     rig.advance('2026-10-30 09:00:30')
-    service = rig.create(KbarFetcher, backfill_enabled=False)
+    service = rig.create()
     service.step()
     rig.apis[0].tick(rig.now[0])
     rig.advance('2026-10-30 09:01:02', 32)
@@ -316,7 +318,7 @@ def test_partial_start_and_late_ticks_are_not_certified(rig):
 
 def test_no_empty_bars_or_closing_auction_are_fabricated(rig):
     rig.advance('2026-10-30 13:44')
-    service = rig.create(KbarFetcher, backfill_enabled=False)
+    service = rig.create()
     service.step()
     rig.advance('2026-10-30 13:44:59', 59)
     rig.apis[0].tick('2026-10-30 13:44:59')
@@ -331,7 +333,7 @@ def test_no_empty_bars_or_closing_auction_are_fabricated(rig):
 
 def test_last_night_minute_is_written_before_0501_logout(rig):
     rig.advance('2026-10-31 04:59')
-    service = rig.create(KbarFetcher, backfill_enabled=False)
+    service = rig.create()
     service.step()
     rig.advance('2026-10-31 04:59:59', 59)
     rig.apis[0].tick('2026-10-31 04:59:59', 20001)
@@ -352,9 +354,12 @@ def test_history_only_on_start_gap_or_session_close_and_parity_is_recorded(rig):
     service = rig.create(KbarFetcher, fetch_history=history)
     service.step()
     assert len(requests) == 1 and not rows(service, 'market_stream_bars')  # reject still-open history bar
-    rig.apis[0].tick(rig.now[0], 20000)
+    tick = rig.create()
+    tick.step()
+    rig.apis[-1].tick(rig.now[0], 20000)
+    tick.step()
     rig.advance('2026-10-30 09:01:02', 62)
-    rig.apis[0].tick(rig.now[0], 20000)
+    tick.step()
     service.step()
     assert len(requests) == 1
     service.last_history = float('-inf')
@@ -418,7 +423,7 @@ def test_subscribe_failure_closes_partial_connection_and_retries_with_backoff(ri
 
 
 def test_pending_kbar_survives_storage_failure_without_broker_relogin(rig, monkeypatch):
-    service = rig.create(KbarFetcher, backfill_enabled=False)
+    service = rig.create()
     service.step()
     rig.apis[0].tick(rig.now[0])
     rig.advance('2026-10-30 09:01:02', 62)
@@ -436,7 +441,7 @@ def test_pending_kbar_survives_storage_failure_without_broker_relogin(rig, monke
 
 
 def test_reconnect_does_not_certify_a_minute_across_the_gap(rig):
-    service = rig.create(KbarFetcher, backfill_enabled=False)
+    service = rig.create()
     service.step()
     rig.apis[0].tick(rig.now[0])
     service.step()
@@ -454,7 +459,7 @@ def test_reconnect_does_not_certify_a_minute_across_the_gap(rig):
     assert len(rig.apis) == 2 and original_generation != service.generation
 
 
-@pytest.mark.parametrize('cls', [TickFetcher, KbarFetcher])
+@pytest.mark.parametrize('cls', [TickFetcher])
 def test_quiet_open_stream_stays_stale_without_relogin(rig, cls):
     options = {'backfill_enabled': False} if cls is KbarFetcher else {}
     service = rig.create(cls, **options)
@@ -547,4 +552,135 @@ def test_cli_help_never_starts_a_session(capsys):
         with pytest.raises(SystemExit) as result:
             entry(['--help'])
         assert result.value.code == 0
-        assert '--mode' in capsys.readouterr().out
+        help_text = capsys.readouterr().out
+        assert '--runtime-config' in help_text and '--mode' not in help_text
+
+
+def journal(service):
+    path = service.db_path.parent / 'logs' / f'{service.role}_events.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_backfill_audit_has_query_range_actual_range_and_failure_reason(rig):
+    def history(*args, **kwargs):
+        return pd.DataFrame([dict(minute_start=pd.Timestamp('2026-10-30 08:59'),
+                                 open=20000, high=20000, low=20000, close=20000, volume=1, amount=20000)])
+    service = rig.create(KbarFetcher, fetch_history=history)
+    service.step()
+    events = journal(service)
+    completed = next(row for row in events if row['event'] == 'backfill_completed')
+    assert completed['timestamp'] == str(rig.now[0])
+    assert completed['from_timestamp'] and completed['to_timestamp'] == '2026-10-31 00:00:00'
+    assert completed['to_exclusive'] and completed['data_from'] == completed['data_to'] == '2026-10-30 08:59:00'
+    assert completed['rows'] == 1
+    def failed(*args, **kwargs):
+        raise TimeoutError('private credential text must not enter logs')
+    service.fetch_history = failed
+    service.history_pending = True
+    rig.mono[0] += 301
+    service.step()
+    failure = journal(service)[-1]
+    assert failure['event'] == 'backfill_failed' and failure['reason'] == 'transport'
+    assert failure['error_type'] == 'TimeoutError' and failure['from_timestamp']
+    assert 'private credential' not in json.dumps(journal(service))
+
+
+def test_stale_event_is_timestamped_once_and_recovery_is_recorded(rig):
+    service = rig.create()
+    service.step()
+    assert not any(row['event'] == 'realtime_fetch_failed' for row in journal(service))
+    rig.advance('2026-10-30 09:00:11', 11)
+    service.step()
+    service.step()
+    failures = [row for row in journal(service) if row['event'] == 'realtime_fetch_failed']
+    assert len(failures) == 1 and failures[0]['timestamp'] == str(rig.now[0])
+    assert failures[0]['reason'] == 'stale_or_missing_tick'
+    rig.apis[0].tick(rig.now[0])
+    service.step()
+    assert journal(service)[-1]['event'] == 'realtime_fetch_recovered'
+
+
+def test_audit_failure_does_not_prevent_logout(rig, monkeypatch):
+    service = rig.create()
+    service.step()
+    from pathlib import Path
+    original = Path.open
+    def blocked(path, *args, **kwargs):
+        if path.name.endswith('_events.jsonl'):
+            raise OSError('disk unavailable')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', blocked)
+    service.close()
+    assert rig.apis[0].closed
+    assert service.health['audit_error'] == 'OSError'
+
+
+def test_logout_failure_is_not_logged_as_success(rig):
+    service = rig.create()
+    original = service.connect_factory
+    @contextmanager
+    def failing_logout():
+        with original() as api:
+            yield api
+        raise TimeoutError('logout failed')
+    service.connect_factory = failing_logout
+    service.step()
+    with pytest.raises(TimeoutError):
+        service.close()
+    events = journal(service)
+    assert any(row['event'] == 'logout_failed' and row['error_type'] == 'TimeoutError' for row in events)
+    assert not any(row['event'] == 'logout_succeeded' for row in events)
+
+
+@pytest.mark.parametrize('result', [False, TimeoutError('logout timeout')])
+def test_fetcher_connection_exposes_failed_sdk_logout(monkeypatch, result):
+    import shioaji_client as sc
+    monkeypatch.setattr(sc, 'load_dotenv', lambda *args: None)
+    monkeypatch.setenv('SHIOAJI_API_KEY', 'offline-test-key')
+    monkeypatch.setenv('SHIOAJI_SECRET_KEY', 'offline-test-secret')
+    def logout():
+        if isinstance(result, Exception):
+            raise result
+        return result
+    api = NS(login=lambda **kwargs: None, logout=logout)
+    monkeypatch.setattr(sc.sj, 'Shioaji', lambda **kwargs: api)
+    with pytest.raises((sc.DataUnavailable, TimeoutError)):
+        with sc.connect(simulation=True, strict_logout=True):
+            pass
+    # Existing callers keep their previous best-effort cleanup behavior.
+    with sc.connect(simulation=True):
+        pass
+
+
+def test_unconfirmed_logout_blocks_new_sessions(rig):
+    service = rig.create()
+    original = service.connect_factory
+    @contextmanager
+    def failing_logout():
+        with original() as api:
+            yield api
+        raise TimeoutError('logout timeout')
+    service.connect_factory = failing_logout
+    service.step()
+    rig.apis[0].down()
+    service.step()
+    assert service.health['logout_unconfirmed']
+    rig.advance('2026-10-30 09:00:10', 10)
+    service.step()
+    assert len(rig.apis) == 1 and service.health['state'] == 'logout_unconfirmed'
+
+
+def test_history_multiple_contracts_share_one_session_with_separate_cursors(rig):
+    calls = []
+    def history(api, contract, *args, **kwargs):
+        calls.append(contract.code)
+        return pd.DataFrame([dict(minute_start=pd.Timestamp('2026-10-30 08:59'),
+            open=20000, high=20000, low=20000, close=20000, volume=1, amount=20000)])
+    service = rig.create(KbarFetcher, codes=['TMFR1', 'TMFK6'], fetch_history=history)
+    service.step()
+    assert len(rig.apis) == 1 and rig.apis[0].subscribed == []
+    assert calls == ['TMFR1', 'TMFK6']
+    assert {row['code'] for row in rows(service, 'market_stream_bars')} == {'TMFR1', 'TMFK6'}
+    assert len(rows(service, 'market_fetcher_progress')) == 2
+    service.step()
+    assert calls == ['TMFR1', 'TMFK6']

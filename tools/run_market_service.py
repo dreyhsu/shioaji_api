@@ -22,6 +22,7 @@ import market_health as mh
 import market_clock
 from health_watchdog import age_seconds
 from file_lease import FileLease
+from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -75,16 +76,24 @@ def stop_child(child, *, grace_seconds=10):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", required=True, choices=("monitor", "trading"))
-    parser.add_argument("--db", required=True, type=Path)
-    parser.add_argument("--code", default="TMFR1")
-    parser.add_argument("--health-config", type=Path, default=mh.DEFAULT_CONFIG)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=8765, type=int)
+    parser.add_argument("--runtime-config", type=Path, default=DEFAULT_RUNTIME)
+    parser.add_argument("--db", default=None, type=Path)
+    parser.add_argument("--code", default=None)
+    parser.add_argument("--health-config", type=Path, default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", default=None, type=int)
     args = parser.parse_args(argv)
+    config = RuntimeConfig.load(args.runtime_config)
+    if skip_mock(config.mode):
+        return 0
+    args.db, args.code = args.db or config.unified_db, args.code or config.signal_code
+    args.health_config = args.health_config or config.health_config
+    args.host, args.port = args.host or config.trade_host, args.port or config.trade_port
     settings = mh.load_settings(args.health_config)
     path = mh.health_path(args.db, args.role, args.code)
     path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(ROOT / "src" / ("monitor.py" if args.role == "monitor" else "dashboard.py")),
+    command = [sys.executable, str(ROOT / "src" / ("monitor.py" if args.role == "monitor" else "trade.py")),
+               "--runtime-config", str(args.runtime_config.resolve()),
                "--db", str(args.db.resolve()), "--code", args.code, "--health-config", str(args.health_config.resolve())]
     if args.role == "trading":
         command += ["--host", args.host, "--port", str(args.port)]

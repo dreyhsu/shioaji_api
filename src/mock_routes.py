@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/mock")
 def runtime_for(request):
     runtime = getattr(request.app.state, "mock_runtime", None)
     if runtime is None:
-        raise HTTPException(status_code=404, detail="Mock API 未啟用，請使用 --mock 啟動")
+        raise HTTPException(status_code=404, detail="Mock API 未啟用，請將 runtime.json 的 mode 設為 mock 並重新啟動")
     return runtime
 
 

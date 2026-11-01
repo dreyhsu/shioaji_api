@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=risk-1">
+  <link rel="stylesheet" href="/static/style.css?v=curve-hover-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -175,7 +175,7 @@
     <div id="legend-ohlc" class="legend-ohlc"></div>
     <div id="trendlines" class="trendline-list"></div>
     <div id="draw-hint" class="draw-hint" hidden></div>
-    <div id="chart"></div>
+    <div id="chart"><div id="curve-tooltip" class="curve-tooltip" role="tooltip" hidden></div></div>
   </section>
 
   <section class="tables">
@@ -194,13 +194,14 @@
   </section>
 
   <footer>
-    圖表每 60 秒更新 · 期貨委託與自動出場依即時行情監控
+    <span id="chart-refresh-note">圖表設定載入中</span> · 交易保護狀態見上方
   </footer>
 
   <script src="/static/status.js?v=mock-6"></script>
   <script src="/static/boxes_primitive.js"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
-  <script src="/static/lwc_app.js?v=multiframe-curves-1"></script>
+  <script src="/static/curve_hover.js?v=1"></script>
+  <script src="/static/lwc_app.js?v=config-hover-1"></script>
   <script src="/static/trading.js?v=multiframe-curves-1"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>

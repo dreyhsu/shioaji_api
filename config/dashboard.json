@@ -1,0 +1,10 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "default_timeframe": "1h",
+  "history_days": 30,
+  "initial_bars": 120,
+  "refresh_seconds": 60,
+  "cache_seconds": 5,
+  "curve_hover_pixels": 8
+}

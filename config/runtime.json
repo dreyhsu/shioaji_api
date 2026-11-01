@@ -1,0 +1,14 @@
+{
+  "mode": "mock",
+  "signal_code": "TMFR1",
+  "contracts": ["TMFR1"],
+  "acquisition_db": "../data/market_fetchers.db",
+  "unified_db": "../data/tmf.db",
+  "market_config": "market_services.json",
+  "health_config": "market_health.json",
+  "trading_config": "trading.json",
+  "dashboard_config": "dashboard.json",
+  "mock_config": "mock.json",
+  "trade_host": "127.0.0.1",
+  "trade_port": 8766
+}
