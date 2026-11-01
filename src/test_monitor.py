@@ -331,8 +331,10 @@ def test_check_alerts_reloads_master_switch(conn, config, tmp_path, monkeypatch)
     assert list(db.load_alerts(conn, config.code)["hour_start"]) == ["2026-10-08 15:01:00"]
 
 
-def test_no_telegram_overrides_enabled_config(conn, alerts, monkeypatch):
-    config = monitor.parse_args(["--no-telegram"])
+def test_no_telegram_overrides_enabled_config(conn, alerts, monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"mode": "mock"}))
+    config = monitor.parse_args(["--no-telegram", "--runtime-config", str(runtime)])
     messages = []
     monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
     assert alerts.telegram_enabled

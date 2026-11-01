@@ -95,3 +95,12 @@ runtime 設定包含商品、acquisition／unified DB、trade 位址，以及行
 - macOS 已實際以預設 Mock 啟動，確認僅 Dashboard、初始暫停、預設 1h；實際畫曲線後 hover 顯示週期／ID，切換 5m 會隱藏舊提示。
 - 實測重複啟動遭拒，原服務仍正常。改用啟用 conda 後直接執行 Python 的方式後，Ctrl+C 正常結束，`run.json` 記錄 `stopped`、`forced_pids: []`。驗收服務已停止。
 - 未登入券商、未送單或正式部署；Windows 僅保留相容設計與替身測試，尚未原生驗收。
+
+
+### 跳空缺口與 Telegram
+
+圖表以灰色半透明矩形顯示 **1h 跳空缺口**，切換 1m／5m／15m 時仍顯示同一組 1h 缺口，與 SNR box 的來源週期一致。相鄰兩根完整、已收定的 1h K 棒，高低價範圍完全不重疊時形成缺口（向上：前高至後低；向下：後高至前低）。僅開盤價跳動但影線重疊不算缺口；同盤中間缺棒或不足 60 根分鐘資料不建立缺口。
+
+灰框從缺口形成的 K 棒向右延伸，保留原始上下界；後續已收定 1h K 棒的影線首次碰到近端視為進入，碰到遠端視為完全回補。完全回補後，灰框停在回補 K 棒，不再延伸。灰框不可拖曳，也不影響價格軸自動縮放或交易規則。
+
+monitor 透過既有 Telegram 流程發出 `gap_formed`（形成）、`gap_entered`（首次進入）、`gap_filled`（完全回補），各缺口各事件只提醒一次，紀錄存於 `telegram_alerts`，重啟不重送；提醒包含商品、方向、價格區間與台北確認時間。三項均可在 `config/alerts.json` 單獨開關，並遵守 `telegram_enabled`、`--no-telegram` 與 monitor 行情健康閘門。只提醒當前收定確認，不補發啟動前的歷史事件。Dashboard 不發送訊息，關閉瀏覽器不影響 monitor 提醒。Mock 不啟動 monitor，因此不發送這些提醒。

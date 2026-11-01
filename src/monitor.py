@@ -24,6 +24,7 @@ from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 import patterns as pt
 import session_bars as sb
 import snr_core as snr
+import gap_zones
 import telegram_notify as tg
 import market_health as mh
 from connection_recovery import error_kind
@@ -220,6 +221,9 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
         hourly_atr=state.hourly_atr,
         config=alerts,
     )
+    candidates.extend(gap_zones.alert_candidates(
+        gap_zones.collect(state.hourly, market_clock.now()), config.code,
+        minute['minute_start'], alerts))
     return sum(
         send_rule(conn, config, alerts, candidate, minute["minute_start"])
         for candidate in candidates

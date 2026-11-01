@@ -23,6 +23,7 @@
   };
 
   function boxStyle(box) {
+    if (box.box_type === 'gap') return { border: '#909090', fill: 'rgba(128, 128, 128, 0.40)' };
     const table = box.state === 'broken' ? BOX_BROKEN : BOX_FRESH;
     return table[box.box_type] || BOX_FRESH.support;
   }
@@ -203,7 +204,7 @@
         fill: style.fill,
         border: style.border,
         dashed: box.state === 'broken',
-        label: '#' + box.box_id + (box.adjusted ? ' ✎' : ''),
+        label: box.box_type === 'gap' ? '1h 跳空缺口' : '#' + box.box_id + (box.adjusted ? ' ✎' : ''),
         editable: src.isEditable(box),
         active: box === src._active,
         topText: String(Math.round(box.top)),
@@ -228,7 +229,7 @@
 
   // Only the live boxes -- the ones whose right edge is still advancing -- can be
   // reshaped; the rest are history.
-  BoxesPrimitive.prototype.isEditable = function (box) { return !!box.open; };
+  BoxesPrimitive.prototype.isEditable = function (box) { return box.box_type !== 'gap' && !!box.open; };
 
   // Hit test in pane CSS pixels.  Returns { box, part } with part 'top', 'bottom'
   // or 'body', or null.  Edges win over the body, and the grab band is a few px
@@ -302,7 +303,7 @@
     let high = -Infinity;
     for (let i = 0; i < this._boxes.length; i++) {
       const box = this._boxes[i];
-      if (!box.open || box._left === null || box._right === null) continue;
+      if (box.box_type === 'gap' || !box.open || box._left === null || box._right === null) continue;
       if (box._right < startLogical || box._left > endLogical) continue;
       if (box.bottom < low) low = box.bottom;
       if (box.top > high) high = box.top;

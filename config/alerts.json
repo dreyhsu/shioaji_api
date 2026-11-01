@@ -3,6 +3,9 @@
   "_telegram_enabled_comment": "Master switch for monitor alerts and Dashboard entry-fill Telegram notifications. false pauses notifications without replaying skipped fills. monitor.py --no-telegram only disables that monitor process. Offline Mock never sends entry notifications.",
   "telegram_enabled": true,
   "cooldown_minutes": 10,
+  "gap_formed": {"enabled": true},
+  "gap_entered": {"enabled": true},
+  "gap_filled": {"enabled": true},
 
   "_utc_offset_comment": "the market clock (TAIFEX = Taiwan, UTC+8). Every 'now' in the monitor and dashboard is UTC + this, whatever the computer's own timezone, so travelling (e.g. Japan, UTC+9) needs no change. Read at startup: restart monitor.py and dashboard.py after changing it.",
   "utc_offset_hours": 8,

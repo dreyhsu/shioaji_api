@@ -42,6 +42,7 @@ import market_clock
 import market_health as mh
 import session_bars as sb
 import snr_core as snr
+import gap_zones
 import trendline as tl
 import trading
 from service_control import ServiceControl, run_server
@@ -269,6 +270,25 @@ def _boxes_payload(data) -> list[dict]:
     return rows
 
 
+def _gaps_payload(data) -> list[dict]:
+    visible = data['visible']
+    start, end = visible['timestamp'].iloc[0], visible['timestamp'].iloc[-1]
+    rows = []
+    for zone in gap_zones.collect(data['hourly'], _dashboard_now()):
+        opened = zone['filled_at'] is None
+        right = end if opened else zone['right_time']
+        if right < start or zone['left_time'] > end:
+            continue
+        rows.append({
+            'box_id': zone['gap_id'], 'box_type': 'gap',
+            'direction': zone['direction'], 'state': 'open' if opened else 'filled',
+            'top': zone['top'], 'bottom': zone['bottom'],
+            'left_time': _epoch(max(start, zone['left_time'])),
+            'right_time': _epoch(min(end, right)), 'open': opened,
+        })
+    return rows
+
+
 def _drawing_values(data, line: dict) -> pd.Series:
     """Sample each drawing in its source timeframe on the selected candle grid."""
     timeframe = line.get("timeframe", "1h")
@@ -477,7 +497,7 @@ def api_chart(
         if runtime is not None and code == runtime.code and runtime.cursor == 0:
             return {"code": code, "timeframe": timeframe,
                     "generated_at": _dashboard_now().isoformat(sep=" "),
-                    "bars": [], "boxes": [], "series": [], "trendlines": []}
+                    "bars": [], "gaps": [], "boxes": [], "series": [], "trendlines": []}
         raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
     if timeframe != "1h":
         bars = sb.minute_bars_to_interval(_minutes(data), TIMEFRAME_MINUTES[timeframe])
@@ -490,6 +510,7 @@ def api_chart(
         "generated_at": _dashboard_now().isoformat(sep=" "),
         "bars": _bars_payload(data),
         "boxes": _boxes_payload(data),
+        "gaps": _gaps_payload(data),
         "series": _series_payload(data),
         "trendlines": data.get("trendlines") or [],
     }

@@ -43,6 +43,7 @@ let switchingTimeframe = false;
 let chart = null;
 let candles = null;
 let boxes = null;
+let gaps = null;
 let framed = false;
 const indicators = new Map(); // name -> { series, spec }
 let lastBars = [];
@@ -160,6 +161,8 @@ function initChart() {
 
   boxes = new BoxesPrimitive({ showLabels: true });
   candles.attachPrimitive(boxes);
+  gaps = new BoxesPrimitive({ showLabels: false });
+  candles.attachPrimitive(gaps);
   pnlPrimitive = new PnlPrimitive();
   candles.attachPrimitive(pnlPrimitive);
 
@@ -246,6 +249,7 @@ function renderLegendRows() {
   const rows = [
     '<span class="lg"><i style="background:' + C.up + '"></i>' + (CODE || 'TMF') + ' ' + (displayedTimeframe || timeframe) + '</span>',
   ];
+  rows.push('<span class="lg"><i style="background:#808080"></i>1h 跳空缺口</span>');
   for (const [, entry] of indicators) {
     rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + labelText(entry.spec.label) + '</span>');
   }
@@ -1041,6 +1045,7 @@ async function refreshChart() {
   // because appending a bar shifts every index.
   // Mid-drag, the box being dragged belongs to the pointer; the next poll catches up.
   if (!boxDrag.hit && !boxes.setBoxes(payload.boxes || [])) boxes.refreshIndices();
+  if (!gaps.setBoxes(payload.gaps || [])) gaps.refreshIndices();
 
   renderLegendRows();
   renderTrendlineList(payload.trendlines || []);
