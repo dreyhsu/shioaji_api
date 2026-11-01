@@ -11,6 +11,7 @@ DEFAULT_RUNTIME = ROOT / 'config' / 'runtime.json'
 
 class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra='forbid', frozen=True)
+    mode_comment: str = ''  # Human-readable guidance in the JSON configuration.
     mode: Literal['mock', 'simulation', 'production'] = 'mock'
     signal_code: str = Field(default='TMFR1', pattern=r'^[A-Za-z0-9]{1,24}$')
     contracts: list[str] = Field(default_factory=lambda: ['TMFR1'], min_length=1)

@@ -10,7 +10,13 @@
 
 會自動尋找 conda、啟用 `tss` 後直接執行 Python 啟動器並開啟瀏覽器，避免長時間執行的 `conda run` 攔截 Ctrl+C。缺少 conda／環境會明確報錯，可用 `CONDA_EXE` 指向 conda 的完整路徑。若不需要自動開瀏覽器：`./start_all.sh --no-browser`。
 
-Windows 可沿用相同設定，執行：
+## Windows
+
+雙擊專案根目錄的 `start_all.bat`，或在 PowerShell 執行 `./start_all.bat`（Command Prompt 使用 `start_all.bat`）。會自動尋找 conda、啟用 `tss` 並啟動共用 Python 啟動器；沿用 `config/runtime.json` 的模式，不需手動啟動各服務。可傳入相同參數，例如 `./start_all.bat --no-browser`。
+
+找不到 conda 時，從 Anaconda／Miniforge Prompt 執行，或將 `CONDA_EXE` 設為 `conda.exe` 的完整路徑。啟動失敗會保留視窗顯示錯誤。保持啟動視窗開啟；按 Ctrl+C 後等待服務正常停止。
+
+也可手動執行：
 
 ```text
 conda activate tss
@@ -22,6 +28,8 @@ python -X utf8 -u src/service_launcher.py
 ## 模式唯一來源
 
 修改 `config/runtime.json` 的 `mode`，然後停止並重新啟動。預設為 `mock`，不再接受 `--mock`／`--mode`：
+
+JSON 不支援一般註解；`mode_comment` 為純說明欄位，不影響模式選擇。正式模式的值是 `production`，不是 `prd`。macOS 正式啟動前，將 `mode` 設為 `production`，在 `contracts` 保留 `signal_code` 並加入實際交易月份合約，設定本機券商憑證與 CA，並將兩個 DB 路徑指向正式模式專用資料庫（不可沿用已綁定 simulation 的 DB）；再執行 `./start_all.sh` 或雙擊 `start_all.command`。
 
 | mode | 執行內容 |
 |---|---|
