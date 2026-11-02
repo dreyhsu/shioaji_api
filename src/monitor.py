@@ -478,6 +478,7 @@ class MonitorRuntime:
         self.last_fetch = float('-inf')
         self.last_frame = None
         self.last_state = None
+        self.signals_ready = False
         self.ready_since = None
         self.audit_path = Path(config.db_path).resolve().parent / 'logs' / 'monitor.log'
         conn.executescript('''
@@ -577,14 +578,54 @@ class MonitorRuntime:
             quotes = source.execute('SELECT * FROM market_latest_quotes WHERE mode=?',
                                     (self.config.mode,)).fetchall()
         frame = pd.DataFrame([dict(row) for row in records])
+        self.incomplete_stream_minutes = []
         if not frame.empty:
             frame['minute_start'] = pd.to_datetime(frame['minute_start'])
+            broker_minutes = set(frame.loc[(frame['source'] == 'broker') & (frame['complete'] == 1), 'minute_start'])
+            self.incomplete_stream_minutes = [stamp for stamp in frame.loc[
+                (frame['source'] == 'stream') & (frame['complete'] == 0), 'minute_start']
+                if stamp not in broker_minutes and stamp + pd.Timedelta(minutes=1) <= now]
             frame = frame[(frame['complete'] == 1) &
                           (frame['minute_start'] + pd.Timedelta(minutes=1) <= now)]
             # Broker revisions always supersede local tick aggregates.
             frame = frame.sort_values('source', ascending=False).drop_duplicates('minute_start', keep='last')
             frame = frame.sort_values('minute_start')
         return frame, quotes
+
+    def _stream_readiness(self, frame, quotes, now):
+        """Allow a complete live tail once broker history reaches its start."""
+        stream = frame[frame['source'] == 'stream'] if not frame.empty else frame
+        if stream.empty:
+            return True, None
+        broker = frame[frame['source'] == 'broker']
+        if broker.empty or broker['minute_start'].max() >= stream['minute_start'].min():
+            return False, 'history_not_bridged'
+        # Missing minutes between history and the live tail are checked by
+        # validate_bars. Never trust rows left by another tick owner/generation.
+        path = Path(self.config.fetcher_db).resolve()
+        health = mh.read_health(path.parent / '.health' / path.name / 'tick-fetcher.json')
+        try:
+            age = (now - pd.Timestamp(health['heartbeat_at'])).total_seconds()
+            if not (health['mode'] == self.config.mode
+                    and health['db_path'] == str(path)
+                    and self.config.code in health['codes']
+                    and health['state'] == 'running'
+                    and not health.get('audit_error') and not health.get('error')
+                    and not health.get('recovery', {}).get('pending', False)
+                    and -5 <= age <= self.settings.tick_stale_seconds):
+                return False, 'tick_fetcher_unhealthy'
+            if not ((stream['instance'] == health['instance']) &
+                    (stream['generation'] == health['generation'])).all():
+                return False, 'tick_generation_changed'
+            quote = next(dict(row) for row in quotes if row['code'] == self.config.code)
+            if quote['instance'] != health['instance'] or quote['generation'] != health['generation']:
+                return False, 'tick_generation_changed'
+            if not all(-5 <= (now - pd.Timestamp(quote[key])).total_seconds()
+                       <= self.settings.tick_stale_seconds for key in ('quote_at', 'received_at')):
+                return False, 'stale_or_missing_tick'
+        except (KeyError, TypeError, ValueError, StopIteration):
+            return False, 'tick_health_missing_or_invalid'
+        return True, None
 
     def step(self):
         now = pd.Timestamp(self.clock())
@@ -594,8 +635,9 @@ class MonitorRuntime:
                 return
             calendar = self.calendar or mh.SessionCalendar.load(self.settings.calendar_path)
             fresh, quotes = self._read_source(now)
-            self.publisher.publish(state='checking', operation='derive', operation_started=mh.iso(now),
-                                   validation_pending=True)
+            # Routine work does not invalidate the last completed validation.
+            # Consumers bound its age and the duration of this operation.
+            self.publisher.publish(operation='derive', operation_started=mh.iso(now))
             # Remove previously imported candidates invalidated by a late tick or reconnect.
             valid = set() if fresh.empty else set(fresh['minute_start'].map(mh.iso))
             imported = self.conn.execute('SELECT minute_start FROM monitor_bar_sources WHERE code=? AND source=\'stream\'',
@@ -615,20 +657,25 @@ class MonitorRuntime:
             self.conn.commit()
             bars = db.load_minute_bars(self.conn, self.config.code, since=mh.iso(self.since))
             validation = mh.validate_bars(bars, now, calendar, since=self.since,
-                                           lag_seconds=self.settings.bar_lag_seconds)
+                                           lag_seconds=self.settings.bar_lag_seconds,
+                                           pending_repair_minutes=self.incomplete_stream_minutes)
             unverified = self.conn.execute("SELECT COUNT(*) FROM monitor_bar_sources WHERE code=? AND source='stream'",
                                            (self.config.code,)).fetchone()[0]
-            ready = validation['ready'] and unverified == 0
-            if self.last_frame is None or not fresh.equals(self.last_frame):
+            stream_ready, stream_error = self._stream_readiness(fresh, quotes, now)
+            ready = validation['ready'] and stream_ready
+            if self.last_frame is None or not fresh.equals(self.last_frame) or (ready and not self.signals_ready):
                 self.last_state = run_cycle(None, None, self.conn, self.config, self.watchers, self.recorder,
                                            self.alerts, fresh=pd.DataFrame(), allow_signals=ready)
                 self.last_frame = fresh.copy()
+            self.signals_ready = ready
             state = self.last_state
             self.last_fetch = self.monotonic()
             self.ready_since = (self.ready_since or mh.iso(now)) if ready else None
             self.publisher.publish(state='healthy' if ready else 'degraded', operation=None, error=None,
-                bars=validation, validation_pending=not ready, staged_only=bool(unverified),
+                bars=validation, validation_pending=not ready, staged_only=bool(unverified and not ready),
                 unverified_stream_minutes=unverified, ready_since=self.ready_since,
+                stream_ready=stream_ready, stream_error=stream_error,
+                incomplete_tick_minutes=len(self.incomplete_stream_minutes),
                 fetcher_db=str(Path(self.config.fetcher_db).resolve()), cycle_completed_at=mh.iso(self.clock()),
                 book={'required': False, 'fresh': None, 'error': 'fetcher bidask integration pending'})
             return state

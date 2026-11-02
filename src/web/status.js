@@ -46,7 +46,7 @@
       const bars = monitor.bars || {};
       const ready = state.market_health.bars_ready;
       setPill($('freshness'), ready
-        ? (bars.active_session ? '行情驗證正常' : '休市 · 最近收盤資料完整')
+        ? (bars.active_session ? '行情已更新' : '休市 · 最近行情已更新')
         : `行情未就緒 · ${monitor.state || '無監督紀錄'}`, ready ? 'ok' : 'bad');
     } else if (stale >= STALE_BAD_MIN) {
       setPill($('freshness'), `資料落後 ${num(stale, 0)} 分`, 'bad');

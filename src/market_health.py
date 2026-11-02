@@ -156,7 +156,7 @@ class SessionCalendar:
         return set(pieces) - self.empty_minutes
 
 
-def validate_bars(bars, now, calendar, *, since, lag_seconds=180):
+def validate_bars(bars, now, calendar, *, since, lag_seconds=180, pending_repair_minutes=()):
     now, since = pd.Timestamp(now), pd.Timestamp(since)
     stamps = set(pd.to_datetime(bars["minute_start"])) if not bars.empty else set()
     closed = sorted(stamp for stamp in stamps if stamp + pd.Timedelta(minutes=1) <= now)
@@ -164,9 +164,15 @@ def validate_bars(bars, now, calendar, *, since, lag_seconds=180):
     expected = calendar.expected_minutes(since, now)
     # Delay is tolerated only at the live edge, never as an unexplained interior gap.
     mature = {stamp for stamp in expected if stamp + pd.Timedelta(minutes=1, seconds=lag_seconds) <= now}
+    if latest is not None:
+        mature |= {stamp for stamp in expected if stamp < latest}
     if not calendar.active(now):
         mature = expected  # final closing minute must be fetched after session end
     missing = sorted(mature - stamps)
+    # Explicitly incomplete tick minutes remain absent from strategy data and
+    # visible as repair work, but do not disable trading on current complete bars.
+    pending_repair = sorted((expected - stamps) & set(pd.to_datetime(list(pending_repair_minutes))))
+    blocking_missing = sorted(set(missing) - set(pending_repair))
     expected_latest = max(expected) if expected else None
     active = calendar.active(now)
     lag = (None if latest is None or expected_latest is None else
@@ -176,12 +182,15 @@ def validate_bars(bars, now, calendar, *, since, lag_seconds=180):
                      and (now - current_start).total_seconds() <= lag_seconds + 60)
     covered = calendar.covered(now) and calendar.covered(since)
     future_count = sum(stamp > now for stamp in stamps)
-    ready = (covered and not missing and not future_count and not opening_grace
+    ready = (covered and not blocking_missing and not future_count and not opening_grace
              and (not expected or latest is not None and lag is not None and lag <= lag_seconds))
     return {"ready": ready, "calendar_verified": covered, "calendar_error": calendar.error,
             "active_session": active, "opening_grace": opening_grace, "last_minute_start": iso(latest),
             "expected_minute_start": iso(expected_latest), "lag_seconds": lag,
             "missing_count": len(missing), "missing_sample": [iso(stamp) for stamp in missing[:20]],
+            "blocking_missing_count": len(blocking_missing),
+            "pending_repair_count": len(pending_repair),
+            "pending_repair_sample": [iso(stamp) for stamp in pending_repair[:20]],
             "future_count": future_count,
             "validation_since": iso(since)}
 
@@ -296,6 +305,11 @@ def monitor_ready(db_path, code, now, settings, *, mode=None):
                  and (mode is None or document.get("mode") == mode)
                  and document["state"] == "healthy" and document["bars"]["ready"]
                  and -5 <= age <= settings.heartbeat_seconds)
+        completed_age = (pd.Timestamp(now) - pd.Timestamp(document.get('cycle_completed_at', document['heartbeat_at']))).total_seconds()
+        ready = ready and -5 <= completed_age <= settings.heartbeat_seconds
+        if document.get('operation'):
+            operation_age = (pd.Timestamp(now) - pd.Timestamp(document['operation_started'])).total_seconds()
+            ready = ready and -5 <= operation_age <= settings.operation_timeout_seconds
         calendar = SessionCalendar.load(settings.calendar_path)
         if not calendar.covered(now):
             ready = False

@@ -34,6 +34,24 @@ def test_down_gap_and_exact_far_edge_fills():
     assert zone['filled_at'] == pd.Timestamp('2026-10-30 19:00')
 
 
+def test_oct30_open_gap_across_night_and_day_and_no_historical_notification(tmp_path, monkeypatch):
+    # Regression values inspected read-only from TMFR1: the 08:45 gap is still
+    # open when later candles enter it without reaching the prior low.
+    bars = candles([(45856, 46522), (44910, 45579), (45400, 45700)])
+    bars['timestamp'] = pd.to_datetime(['2026-10-30 04:00', '2026-10-30 08:45', '2026-10-30 12:45'])
+    bars['hour_start'] = bars['timestamp']
+    bars['session_id'] = ['2026-10-30 night', '2026-10-30 day', '2026-10-30 day']
+    zone, = gaps.collect(bars, '2026-11-02 09:30')
+    assert (zone['bottom'], zone['top'], zone['filled_at']) == (45579, 45856, None)
+    assert zone['created_at'] == pd.Timestamp('2026-10-30 09:45')
+    alerts = ar.AlertConfig(tmp_path / 'alerts.json')
+    assert len(list(gaps.alert_candidates([zone], 'TMFR1', '2026-10-30 09:44', alerts))) == 1
+    assert not list(gaps.alert_candidates([zone], 'TMFR1', '2026-11-02 09:29', alerts))
+    monkeypatch.setattr(dashboard, '_dashboard_now', lambda: pd.Timestamp('2026-11-02 09:30'))
+    payload, = dashboard._gaps_payload(dict(hourly=bars, visible=bars))
+    assert payload['box_id'] == '2026-10-30T08:45:00' and payload['open']
+
+
 def test_forming_candles_cannot_create_or_fill():
     bars = candles([(100, 110), (120, 130), (100, 135)])
     assert gaps.collect(bars, '2026-10-30 16:59') == []

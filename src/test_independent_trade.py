@@ -124,6 +124,23 @@ def test_stale_monitor_data_blocks_entry_without_quote_subscription(rig):
     assert r.client.get('/api/commands/order-1').json()['state'] == 'failed'
 
 
+def test_pending_incomplete_minute_does_not_disable_manual_order(rig):
+    r = rig
+    # A historical incomplete minute is repair work; current closed bars and
+    # fresh quotes are available for both the signal and actual contract.
+    for code in ('TMFR1', 'TMF209912'):
+        with db.session(r.path) as conn:
+            conn.execute("DELETE FROM minute_bars WHERE code=? AND minute_start='2026-10-30 08:59:00'", (code,))
+            conn.commit()
+        r.health[code].publish(state='healthy', incomplete_tick_minutes=1,
+            bars=dict(ready=True, last_minute_start='2026-10-30 09:01:00',
+                      missing_count=1, blocking_missing_count=0, pending_repair_count=1))
+    request(r)
+    r.runtime.step()
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'succeeded'
+    assert len(r.broker.trades) == 1
+
+
 def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
     r = rig
     request(r)

@@ -42,7 +42,7 @@ TMFR1 曲線與實際月份合約有不同價格，不能互相當作固定停�
 3. 每個代碼啟動一個 monitor，使用同一個 acquisition DB 與 unified DB，分別用 `--code` 指定 TMFR1／月份合約。多個 monitor 不登入券商，各自的健康檔／鎖按商品區分。
 4. 先啟動 fetcher，再啟動 monitor 與 trade。Dashboard 可從 trade 的合約快照取得實際月份合約代碼；換月時必須更新 fetcher／monitor 的代碼設定。Dashboard 的「訂閱合約」目前只更新 trade 的本機關注清單，不會自動變更 fetcher 啟動參數。
 
-新來源的候選完整性與 broker 核對限制維持不變：尚未核對的即時分鐘會讓 monitor 保持 `staged_only`／`degraded`，trade 不會繞過健康閘門。目前 broker 修復採節流，不能宣稱每分鐘都會及時取得可交易資料；來源整體驗收與實際時效仍須後續券商模擬驗證。
+依 2026-11-02 決策，broker 歷史接上 tick K 尾段、日曆／行情時效通過且目前 tick instance／generation 與健康狀態正常時，monitor 可就緒，不要求最新每根 K 都先經 broker 核對。明確 incomplete 的 tick 分鐘僅列為待修復，不單獨阻擋下單；策略資料不匯入該分鐘，曲線突破仍須使用相鄰完整收定分鐘。未解釋缺棒、串流中斷／過舊或世代不符仍關閉閘門；trade 共用 monitor 健康狀態。broker 修復／核對持續節流執行並優先覆蓋，來源整體驗收與實際時效仍須後續券商模擬驗證。
 
 ## 交易判斷
 

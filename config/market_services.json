@@ -1,7 +1,7 @@
 {
   "timezone": "Asia/Taipei",
   "calendar_path": "market_calendar.json",
-  "scheduled_login_times": ["08:44", "14:59"],
+  "scheduled_login_times": ["08:40", "14:50"],
   "scheduled_logout_times": ["13:46", "05:01"],
   "tick_publish_seconds": 1,
   "kbar_publish_seconds": 60,

@@ -31,7 +31,7 @@ use conda env tss
 - Dashboard 必須將 order／啟用／取消需求送給獨立 trade API，不在 Dashboard 程序內下單。指令須有持久化唯一 ID；逾時查狀態，不盲目重送。正式／模擬模式使用 `TradeClient`，不得回退為 Dashboard 內嵌券商連線；僅設定檔選擇的 Mock／注入測試保留原來離線交易引擎。
 - fetcher 預設寫 `data/market_fetchers.db` 的 `market_*` 資料表；monitor 透過 `--fetcher-db` 唯讀取得來源，透過 `--db` 寫統一資料庫（預設 `data/tmf.db`）。Dashboard／未來 trade 使用同一個統一 DB；不要直接跳過 monitor 讀 acquisition DB 作策略判斷。
 - monitor 僅匯入已收盤完整 K 棒，歷史 broker 資料優先於 tick 候選；晚到 tick／中斷造成失效的候選須撤回。來源與 simulation／production 綁定於統一 DB，同一 DB 不可切換來源或模式混用；最新價保留原始行情與接收時間。
-- `complete` 不等於可交易。即時候選尚未經 broker 核對時可供圖表觀察，但 monitor 保持 `staged_only`／交易健康閘門關閉；完成 broker 修復與日曆完整性驗證才可就緒。Windows 原生與券商一致性驗證仍待完成。
+- 依 2026-11-02 決策，broker 歷史 K 已接上 tick 彙整區間，且日曆、行情時效、目前 tick instance／generation 與健康檢查通過時，monitor 即可就緒；不要求每根 tick K 先經 broker 核對。明確標記為 incomplete 的 tick 分鐘（含啟動／中斷分鐘、晚到 tick 失效）僅列為 `pending_repair`，不單獨停用下單或讓 UI 宣稱行情過舊；不匯入策略 K、不補造價格，後續由 broker 回補。未解釋缺棒、串流中斷／過舊或世代不符仍關閉閘門；曲線突破仍須使用相鄰完整收定分鐘，不能跨缺棒判斷。broker 核對優先覆蓋。`unverified_stream_minutes` 保留待核對數量，`staged_only` 僅表示仍不可採用的候選。Windows 原生與券商一致性驗證仍待完成。
 - monitor 不使用券商五檔訂閱或 snapshot fallback；五檔搬至 fetcher 的串接尚待開發，不能為了五檔在 monitor 新增登入。
 
 ## Monitor 必備稽核紀錄

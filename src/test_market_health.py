@@ -47,6 +47,36 @@ def test_live_delay_is_allowed_but_final_minute_must_be_caught_up():
     assert mh.validate_bars(frame, "2026-10-28 08:00", calendar, since="2026-10-28 04:57")["ready"]
 
 
+def test_recent_interior_gap_is_not_excused_by_live_edge_delay():
+    calendar = mh.SessionCalendar(calendar_document())
+    frame = bars('2026-10-27 19:00', '2026-10-27 19:09')
+    frame = frame[frame.minute_start != pd.Timestamp('2026-10-27 19:08')]
+    result = mh.validate_bars(frame, '2026-10-27 19:10:03', calendar, since='2026-10-27 19:00')
+    assert not result['ready']
+    assert result['missing_sample'] == ['2026-10-27 19:08:00']
+
+
+@pytest.mark.parametrize('changes,ready', [
+    ({}, True),
+    ({'operation_started': '2026-10-27 19:07:59'}, False),
+    ({'cycle_completed_at': '2026-10-27 19:06:59'}, False),
+    ({'state': 'failed'}, False),
+    ({'bars': {'ready': False, 'last_minute_start': '2026-10-27 19:09:00'}}, False),
+    ({'bars': {'ready': True, 'last_minute_start': '2026-10-27 19:05:00'}}, False),
+])
+def test_monitor_ready_uses_bounded_completed_result_during_update(tmp_path, monkeypatch, changes, ready):
+    path = tmp_path / 'market.db'
+    document = dict(db_path=str(path.resolve()), code='TMFR1', mode='simulation',
+        state='healthy', heartbeat_at='2026-10-27 19:10:00',
+        cycle_completed_at='2026-10-27 19:09:59', operation='derive',
+        operation_started='2026-10-27 19:10:00',
+        bars=dict(ready=True, last_minute_start='2026-10-27 19:09:00'))
+    document.update(changes)
+    mh.atomic_json(mh.health_path(path, 'monitor', 'TMFR1'), document)
+    monkeypatch.setattr(mh.SessionCalendar, 'load', lambda path: mh.SessionCalendar(calendar_document()))
+    assert mh.monitor_ready(path, 'TMFR1', '2026-10-27 19:10:00', mh.HealthSettings(), mode='simulation')[0] is ready
+
+
 def test_lag_uses_seconds_and_opening_grace_does_not_certify_old_data():
     calendar = mh.SessionCalendar(calendar_document())
     frame = bars("2026-10-27 19:00", "2026-10-27 19:06")

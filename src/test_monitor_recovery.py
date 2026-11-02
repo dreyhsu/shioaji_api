@@ -47,7 +47,14 @@ def runtime(tmp_path, monkeypatch):
                                   clock=lambda: now[0], monotonic=lambda: mono[0])
     def put(rows=None, source='broker', mode='simulation'):
         store.bars('TMFR1', mode, rows or bar_rows(), source, 'offline', 1)
-    yield NS(item=item, conn=conn, store=store, now=now, mono=mono, put=put, config=config)
+    def live(**changes):
+        document = dict(mode='simulation', db_path=str(source.resolve()), codes=['TMFR1'],
+                        state='running', instance='offline', generation=1, heartbeat_at=str(now[0]))
+        document.update(changes)
+        mh.atomic_json(source.parent / '.health' / source.name / 'tick-fetcher.json', document)
+        store.quotes([dict(code='TMFR1', mode='simulation', price=20000, volume=1,
+                           quote_at=str(now[0]), received_at=str(now[0]), instance='offline', generation=1)])
+    yield NS(item=item, conn=conn, store=store, now=now, mono=mono, put=put, live=live, config=config)
     item.close()
     store.close()
     conn.close()
@@ -76,7 +83,7 @@ def test_only_closed_complete_bars_of_selected_mode_are_imported(runtime):
     assert len(bars) == 2 and bars.iloc[-1]['close'] == 20000
 
 
-def test_stream_candidates_visible_but_not_trade_ready_until_broker_check(runtime):
+def test_stream_only_waits_for_broker_history(runtime):
     r = runtime
     r.put(source='stream')
     r.item.step()
@@ -89,15 +96,160 @@ def test_stream_candidates_visible_but_not_trade_ready_until_broker_check(runtim
     assert db.load_minute_bars(r.conn, 'TMFR1').iloc[-1]['close'] == 20005
 
 
-def test_late_tick_invalidation_removes_previously_imported_candidate(runtime):
+def test_broker_history_bridges_to_healthy_tick_tail_without_per_bar_check(runtime):
     r = runtime
-    r.put(source='stream')
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live()
     r.item.step()
+    assert health(r)['state'] == 'healthy'
+    assert not health(r)['staged_only']
+    assert health(r)['unverified_stream_minutes'] == 1
+    # Further complete tick minutes keep trading ready without a broker refresh.
+    r.now[0] += pd.Timedelta(minutes=1)
+    r.mono[0] += 1
+    r.put(bar_rows('2026-10-30 09:02', '2026-10-30 09:02'), source='stream')
+    r.live()
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    # Broker revisions still win over a previously trusted tick minute.
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01', price=20005))
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    assert db.load_minute_bars(r.conn, 'TMFR1').iloc[-2]['close'] == 20005
+
+
+@pytest.mark.parametrize('changes', [dict(state='stale'), dict(state='stopped'),
+    dict(generation=2), dict(instance='other'), dict(mode='production'),
+    dict(heartbeat_at='2026-10-30 09:00:00'), dict(recovery={'pending': True})])
+def test_live_tail_requires_current_healthy_tick_owner(runtime, changes):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live(**changes)
+    r.item.step()
+    assert health(r)['bars']['ready']
+    assert health(r)['state'] == 'degraded'
+
+
+def test_live_tail_rejects_stale_quotes_and_history_gap(runtime):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live()
+    r.now[0] += pd.Timedelta(seconds=11)
+    r.live(heartbeat_at=str(r.now[0]))
+    r.store.conn.execute("UPDATE market_latest_quotes SET quote_at='2026-10-30 09:02:03'")
+    r.store.conn.commit()
+    r.item.step()
+    assert health(r)['stream_error'] == 'stale_or_missing_tick'
+    r.now[0] = pd.Timestamp('2026-10-30 09:04:03')
+    r.put(bar_rows('2026-10-30 09:03', '2026-10-30 09:03'), source='stream')
+    r.live()
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['bars']['missing_count'] == 1
+    assert health(r)['state'] == 'degraded'
+
+
+def test_same_frame_is_evaluated_when_tick_health_recovers(runtime, monkeypatch):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live(state='stale')
+    calls = []
+    original = monitor.run_cycle
+    def cycle(*args, **kwargs):
+        calls.append(kwargs['allow_signals'])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(monitor, 'run_cycle', cycle)
+    r.item.step()
+    r.live()
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    assert calls == [False, True]
+
+
+def test_routine_derivation_preserves_last_completed_ready_state(runtime, monkeypatch):
+    r = runtime
+    r.put()
+    r.item.step()
+    previous_completed = health(r)['cycle_completed_at']
+    original = monitor.run_cycle
+    observed = []
+    def cycle(*args, **kwargs):
+        h = health(r)
+        observed.append(h)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(monitor, 'run_cycle', cycle)
+    r.put(bar_rows(price=20001))
+    r.mono[0] += 1
+    r.item.step()
+    assert len(observed) == 1
+    assert observed[0]['operation'] == 'derive'
+    assert observed[0]['state'] == 'healthy'
+    assert observed[0]['bars']['ready'] and not observed[0]['validation_pending']
+    assert observed[0]['cycle_completed_at'] == previous_completed
+
+
+def test_first_validation_does_not_claim_ready_during_derivation(runtime, monkeypatch):
+    r = runtime
+    r.put()
+    original = monitor.run_cycle
+    def cycle(*args, **kwargs):
+        assert health(r)['state'] != 'healthy'
+        return original(*args, **kwargs)
+    monkeypatch.setattr(monitor, 'run_cycle', cycle)
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+
+
+def test_late_tick_invalidation_removes_candidate_without_disabling_current_data(runtime):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live()
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
     r.store.invalidate('TMFR1', 'simulation', [pd.Timestamp('2026-10-30 09:01')])
     r.mono[0] += 1
     r.item.step()
     assert db.last_minute_start(r.conn, 'TMFR1') == pd.Timestamp('2026-10-30 09:00')
-    assert health(r)['state'] != 'healthy'
+    assert health(r)['state'] == 'healthy'
+    assert health(r)['incomplete_tick_minutes'] == 1
+    assert health(r)['bars']['pending_repair_count'] == 1
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'))
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    assert health(r)['bars']['pending_repair_count'] == 0
+
+
+def test_incomplete_restart_minute_does_not_block_live_tail_or_trade_health(runtime, monkeypatch):
+    r = runtime
+    r.now[0] = pd.Timestamp('2026-10-30 09:03:03')
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01', complete=False), source='stream')
+    r.put(bar_rows('2026-10-30 09:02', '2026-10-30 09:02'), source='stream')
+    r.live()
+    r.item.step()
+    h = health(r)
+    assert h['state'] == 'healthy' and h['bars']['ready']
+    assert h['bars']['missing_count'] == 1
+    assert h['bars']['blocking_missing_count'] == 0
+    assert h['bars']['pending_repair_count'] == 1
+    assert h['stream_error'] is None
+    assert pd.Timestamp('2026-10-30 09:01') not in set(db.load_minute_bars(r.conn, 'TMFR1').minute_start)
+    # Same shared health gate consumed by Dashboard and trade.
+    monkeypatch.setattr(mh.SessionCalendar, 'load', lambda path: r.item.calendar)
+    assert mh.monitor_ready(r.config.db_path, 'TMFR1', r.now[0], r.item.settings, mode='simulation')[0]
+    # The exemption does not excuse an outage or stale market data.
+    r.live(state='stale')
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'degraded'
 
 
 def test_interior_gap_waits_for_fetcher_repair_without_login(runtime):

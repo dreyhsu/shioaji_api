@@ -41,6 +41,8 @@ fetcher 不會覆寫策略用 `minute_bars`；由 monitor 負責統一寫入。m
 
 健康檔位於 DB 旁 `.health/<DB檔名>/tick-fetcher.json` 和 `kbar-fetcher.json`；分別使用獨占鎖，一個角色／DB 只允許一個程序，兩種角色可以同時運行。健康檔含模式、PID、世代、錯誤種類、重試狀態、行情時間及 `staged_only: true`。
 
+monitor 的例行匯入／指標更新以 `operation: derive` 表示，不將上一輪已完成的 `healthy` 改成短暫 `checking`；首次驗證前仍不宣稱就緒。共用健康閘門同時檢查 `cycle_completed_at` 的時效與 `operation_started` 的操作逾時，避免工作卡住卻因心跳刷新而永遠維持就緒。完成本輪後才發布新的就緒結果；失敗仍發布 `failed`。Dashboard 不會因剛好讀到例行更新而顯示行情未就緒。
+
 日誌位於 DB 旁 `logs/tick_fetcher.log`、`kbar_fetcher.log`，UTC 時間標記為 `Z`，保留 14 天輪替；排程及行情時間仍為台北時間。日誌不輸出憑證或任意例外字串。
 
 Tick 回呼只入記憶體佇列，由主執行緒寫入 DB；無新 tick 時不更新行情時間。沒有成交不等於斷線：開盤時報價過舊會顯示 `stale`、`stream_fresh: false`，不會僅因單一或全部合約安靜就重新登入。`stream_recovery_seconds` 保留為長時間無新鮮 tick 的診斷門檻（預設 60 秒），對應健康檔的 `quiet_codes`，不再觸發重連。若 SDK 未回報斷線且沒有 API 錯誤，靜默故障會維持過舊狀態，需要依健康檔排查。
@@ -53,7 +55,7 @@ Tick 服務在收盤後預設等待 2 秒才發布前一分鐘；晚到 tick 會
 
 monitor 預設每秒檢查來源，僅在 K 棒改變時重算指標。只匯入已收盤完整分鐘，`broker` 優先於 `stream`；同時同步最新價，保留原始行情時間。來源 DB 與模式綁定在統一 DB，切換模式或來源請使用另一個統一 DB，避免模擬與正式資料混用。策略仍以 1 分 K 收定後判斷，獨立 trade 讀取同一 DB 的指標、`trendlines` 曲線與 `minute_bars`；Dashboard order 需求交由 trade API 執行。
 
-未核對的即時候選可顯示，但健康狀態保持 `staged_only`／`degraded`。目前採逐分鐘 broker 修復後才允許健康閘門通過，因此盤中最新候選尚未核對時通常不開放策略交易；來源整體驗收仍待後續完成；trade 維持相同健康閘門。五檔 fetcher 串接未完成，monitor 不再訂閱五檔或用 snapshot fallback，健康檔明確標示。
+依 2026-11-02 決策，broker 歷史 K 接上 tick K 尾段，且日曆、行情時效、目前 tick instance／generation、fetcher 心跳與報價新鮮度檢查通過後，monitor 可為 `healthy`；不再逐根等待 broker 核對。明確標記 incomplete 的分鐘不匯入策略 K，但僅列為待修復，不單獨阻擋下單；`bars.pending_repair_count/sample` 保存這些分鐘，`missing_count/sample` 仍保留實際缺棒，`blocking_missing_count` 為排除已知 incomplete 後的阻擋數。未解釋缺棒、串流中斷／過舊或世代不符仍關閉閘門。`unverified_stream_minutes` 保留尚未核對的數量，不單獨阻擋就緒；`stream_error` 記錄無法採用 tick 尾段的原因，`staged_only` 表示候選仍被阻擋。broker 核對仍持續且優先覆蓋；來源整體驗收仍待後續完成，trade 共用此閘門。五檔 fetcher 串接未完成，monitor 不再訂閱五檔或用 snapshot fallback，健康檔明確標示。
 
 來源 DB 旁 `logs/tick_events.jsonl`／`logs/kbar_events.jsonl` 保留原始稽核事件；獨立 trade 的事件另從統一 DB 旁 `logs/trade_events.jsonl` 讀取，使用 Asia/Taipei 時間（角色、模式、instance、generation）：
 
