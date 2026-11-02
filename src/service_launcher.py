@@ -264,7 +264,7 @@ def main(argv=None):
         ui = DashboardConfig.load(config.dashboard_config)
         preflight(config, ui, ports=False)
         # Serialize cleanup+startup so concurrent invocations cannot restart
-        # services while another invocation is still confirming old logouts.
+        # services while another invocation is still stopping old processes.
         startup = FileLease(control_folder(config.unified_db) / 'startup.lock')
         startup.acquire()
         supervisor = Supervisor(config, ui, args.runtime_config)

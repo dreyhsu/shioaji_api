@@ -51,38 +51,34 @@ def test_cleanup_waits_for_old_owner_logout_and_release_before_new_login(control
     assert read_owner(parent.path)['state'] == 'stopped'
 
 
-def test_dead_owner_with_unacknowledged_session_blocks_without_creating_api(controls):
+def test_dead_owner_with_unacknowledged_session_allows_restart(controls):
     r = controls
     control = r.owner('tick-fetcher')
     control.lease.close()  # crash: no close or logout acknowledgement
-    with pytest.raises(RuntimeError, match='登出未確認'):
-        cleanup_previous(r.config)
+    assert cleanup_previous(r.config) == []
     assert read_owner(control.path)['session_state'] == 'active'
-    with pytest.raises(RuntimeError, match='不得新增登入'):
-        ServiceControl(r.config.acquisition_db, 'tick-fetcher', 'simulation', broker=True).start()
+    replacement = ServiceControl(r.config.acquisition_db, 'tick-fetcher', 'simulation', broker=True).start()
+    replacement.close()
+    control.started = False  # crashed owner must not overwrite replacement telemetry
 
 
-def test_failed_logout_does_not_unlock_startup(controls):
+def test_failed_logout_does_not_block_startup_after_process_stops(controls):
     r = controls
     control = r.owner('tick-fetcher')
     def worker(_):
         control.session('logout_failed')
         control.close()
-    with pytest.raises(RuntimeError, match='登出未確認'):
-        cleanup_previous(r.config, wait=worker)
+    cleanup_previous(r.config, wait=worker)
     record = read_owner(control.path)
     assert record['state'] == 'stopped' and record['logout_unconfirmed']
 
 
-def test_same_owner_cannot_relogin_after_unconfirmed_logout(controls):
+def test_logout_telemetry_does_not_block_next_login(controls):
     control = controls.owner('tick-fetcher')
-    with pytest.raises(RuntimeError, match='不得新增登入'):
-        control.session('login_started')
     control.session('logout_failed')
-    # A later event cannot erase the uncertainty of an earlier failed logout.
-    control.session('logout_succeeded')
-    with pytest.raises(RuntimeError, match='不得新增登入'):
-        control.session('login_started')
+    control.session('login_started')
+    assert read_owner(control.path)['session_state'] == 'login_started'
+    assert read_owner(control.path)['logout_unconfirmed']
 
 
 def test_cleanup_timeout_leaves_old_worker_alive_and_never_force_kills(controls, monkeypatch):
@@ -94,9 +90,19 @@ def test_cleanup_timeout_leaves_old_worker_alive_and_never_force_kills(controls,
     clock = [0.]
     def wait(seconds):
         clock[0] += seconds
-    with pytest.raises(RuntimeError, match='不強制終止、不新增登入'):
+    with pytest.raises(RuntimeError, match='不強制終止、不啟動重複服務'):
         cleanup_previous(r.config, timeout=.2, clock=lambda: clock[0], wait=wait)
     assert control.started and control.stop_requested
+
+
+def test_cleanup_accepts_exited_process_without_stopped_acknowledgement(controls):
+    r = controls
+    control = r.owner('tick-fetcher')
+    def crash(_):
+        control.lease.close()
+    result = cleanup_previous(r.config, wait=crash)
+    assert result[0]['state'] == 'running'
+    assert result[0]['session_state'] == 'active'
 
 
 def test_stale_request_cannot_stop_new_instance(controls):
@@ -138,7 +144,7 @@ def test_legacy_running_owner_requires_manual_logout_without_signalling_pid(cont
             cleanup_previous(r.config)
 
 
-def test_legacy_journal_needs_matching_logout_success(controls):
+def test_legacy_unmatched_journal_does_not_block_startup(controls):
     r = controls
     folder = control_folder(r.config.acquisition_db)
     folder.mkdir(parents=True)
@@ -148,8 +154,8 @@ def test_legacy_journal_needs_matching_logout_success(controls):
     journal = logs / 'tick_events.jsonl'
     record = dict(instance='old', generation=1, event='login_succeeded')
     journal.write_text(json.dumps(record) + '\n')
-    with pytest.raises(RuntimeError, match='登出未確認'):
-        cleanup_previous(r.config)
+    assert cleanup_previous(r.config) == []
+    assert journal.read_text() == json.dumps(record) + '\n'
     with journal.open('a') as output:
         output.write(json.dumps({**record, 'event': 'logout_succeeded'}) + '\n')
     assert cleanup_previous(r.config) == []

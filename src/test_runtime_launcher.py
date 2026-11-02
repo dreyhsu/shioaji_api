@@ -189,10 +189,10 @@ def test_prestart_cleanup_failure_prevents_any_new_service(tmp_path, monkeypatch
     (tmp_path / 'dashboard.json').write_text('{}')
     calls = []
     monkeypatch.setattr(launcher, 'preflight', lambda *args, **kwargs: calls.append(('preflight', kwargs['ports'])))
-    def unconfirmed(config):
+    def still_running(config):
         calls.append('cleanup')
-        raise RuntimeError('logout 未確認')
-    monkeypatch.setattr(launcher, 'cleanup_previous', unconfirmed)
+        raise RuntimeError('舊服務停止逾時')
+    monkeypatch.setattr(launcher, 'cleanup_previous', still_running)
     monkeypatch.setattr(launcher.Supervisor, 'start', lambda self: pytest.fail('must not start new services'))
     assert launcher.main(['--runtime-config', str(path), '--no-browser']) == 1
     assert calls == [('preflight', False), 'cleanup']

@@ -34,7 +34,7 @@ class OrderSession:
 
     def _check(self):
         if ((self.service.control and self.service.control.stop_requested)
-                or self.service.window() is None or self.service.logout_unconfirmed
+                or self.service.window() is None
                 or self.service._recovery.pending or not self.service._broker_ready):
             raise ValueError('交易窗口或券商核對狀態已改變，暫停送單')
 
@@ -177,8 +177,6 @@ class IndependentTradingService(TradingService):
         return self.schedule.window(self._now(), calendar)
 
     def ensure_connected(self):
-        if self.logout_unconfirmed:
-            raise ValueError('上次登出未確認，請先人工核對連線')
         if self._recovery.pending and self._api is not None:
             raise ValueError('交易連線恢復中，請先核對委託與部位')
         if self.window() is None:
@@ -307,8 +305,7 @@ class IndependentTradingService(TradingService):
         if self._recovery.due and self.health_settings.trading_reconnect_enabled:
             self._recovery.attempted()
             self._close_api()
-            if not self.logout_unconfirmed:
-                self._open()
+            self._open()
 
     def _entry_data_ready(self, entry):
         return (self._curve_data_ready() and self._broker_ready and not self._recovery.pending

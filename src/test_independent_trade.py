@@ -371,7 +371,7 @@ def test_login_crossing_cutoff_logs_out_before_accepting_any_order(rig):
     assert r.service._api is None and not r.broker.trades
 
 
-def test_logout_failure_blocks_next_scheduled_login(rig):
+def test_logout_failure_does_not_block_next_scheduled_login(rig):
     r = rig
     r.runtime.step()
     r.broker.logout = lambda: False
@@ -380,7 +380,7 @@ def test_logout_failure_blocks_next_scheduled_login(rig):
     assert r.service.logout_unconfirmed
     r.update('2026-10-30 15:00:03')
     r.runtime.step()
-    assert len(r.apis) == 1
+    assert len(r.apis) == 2
 
 
 def test_actual_broker_call_rechecks_cutoff_after_validation(rig):

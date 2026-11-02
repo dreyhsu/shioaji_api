@@ -30,7 +30,7 @@ conda run --no-capture-output -n tss python -X utf8 -u src/dashboard.py --db dat
 - `--config` 指向 `config/market_services.json`，控制排程與交易日曆；`--health-config` 控制健康驗證及委託核對間隔；`--settings` 指向自動交易／保本設定。`--no-telegram` 關閉成交通知。
 - trade 只允許 loopback 位址、單一 worker，不可使用 reload／多 worker 開出多個 session。健康檔與鎖沿用 `.health/<DB檔名>/trading-<code>.json` 的既有路徑格式，與舊內嵌交易服務互斥。
 - 一般登入窗口為 08:44–13:46、14:59–次日 05:01，仍須經日曆驗證。休息期間 API 常駐且不登入；登出前盡可能核對狀態，不自動平倉、撤單或刪除不明委託。SDK 阻塞可能使實際登出晚於排程。
-- 非預期斷線預設暫停；只有 `trading_reconnect_enabled=true` 才啟用自動重連，啟用前仍須券商模擬驗收。重新登入必須核對券商委託、部位與新鮮 DB 行情。登出未確認則停止新登入。
+- 非預期斷線預設暫停；只有 `trading_reconnect_enabled=true` 才啟用自動重連，啟用前仍須券商模擬驗收。重新登入必須核對券商委託、部位與新鮮 DB 行情。2026-11-02 起，登出結果僅作稽核，不再阻擋後續登入。
 - 原始 session 稽核位於統一 DB 旁 `logs/trade_events.jsonl`，monitor 會彙整到 `monitor_fetch_events`／`logs/monitor.log`。沒有查詢 `api.usage()`，不代表已查核實際連線用量。
 
 ## 必要行情資料
@@ -78,6 +78,6 @@ conda run -n tss pytest -q src/test_independent_trade.py src/test_market_fetcher
 ### 本次驗證結果
 
 - conda `tss`：獨立 trade、fetcher、Dashboard、曲線進場、委託、重連、monitor、watchdog、風控設定、DB、行情健康與 Mock routes 的相關測試 **286 項通過**（16.87 秒）。這是相關測試組合，未宣稱全套通過。
-- 新 trade 整合測試涵蓋只讀查詢不登入／不查券商、同 ID 去重及內容衝突、送單已接受但回應遺失不重送、processing 重啟轉 unknown、排程外不登入、登出不平倉、登入跨登出時間先釋放 session、登出未確認不新增登入、tick 越線不提前出場、曲線版本變更、monitor checking 不重設起點，以及實際報價與收定判斷價格分離。
+- 新 trade 整合測試涵蓋只讀查詢不登入／不查券商、同 ID 去重及內容衝突、送單已接受但回應遺失不重送、processing 重啟轉 unknown、排程外不登入、登出不平倉、登入跨登出時間先釋放 session、登出失敗仍可在下次排程登入、tick 越線不提前出場、曲線版本變更、monitor checking 不重設起點，以及實際報價與收定判斷價格分離。
 - JavaScript 語法、Python 語法與 diff 空白檢查通過；另以離線瀏覽器環境替身驗證「回應遺失 → 頁面重載 → 同指令 ID 重試」，不產生新指令 ID。
 - 未登入券商、未送單、未部署；實際券商多 session、CA、回報／部位跨 session 核對、資料時效與 Windows 原生行為仍待驗收。

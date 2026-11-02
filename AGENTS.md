@@ -41,7 +41,7 @@ use conda env tss
 - 回補：`backfill_started`／`backfill_completed`／`backfill_failed`，保留查詢 `from_timestamp`、`to_timestamp`（日期查詢上界為排他）、已收盤篩選截止，以及實際寫入資料的起訖與筆數；空資料不視為缺口已補齊。
 - 即時資料失敗：記錄發生時間與可辨識原因，如 `session_down`、`queue_overflow`、`stale_or_missing_tick`、錯誤分類／例外型別；恢復時另記 `realtime_fetch_recovered`。沒有新成交只代表行情過舊，不單靠安靜重登。
 - fetcher 在 acquisition DB 旁 `logs/tick_events.jsonl`、`logs/kbar_events.jsonl` 保存原始事件；monitor 可於稍後啟動並補讀，依事件 ID 去重、持久化讀取位置。彙整輸出為統一 DB 旁 `logs/monitor.log` 及 `monitor_fetch_events` 資料表（後者是可查詢的稽核紀錄）。原始事件檔目前不自動輪替；不可直接刪除尚未彙整的事件。
-- 登出失敗後保留 `logout_unconfirmed`，同一程序不得再新增登入，須先人工核對舊連線是否釋放；不可用重連掩蓋未確認的 session。
+- 登出失敗保留 `logout_unconfirmed` 作稽核紀錄；依 2026-11-02 決策，不以登出確認狀態阻擋啟動或後續登入，重連仍遵循原排程與重試設定。
 - 不記錄金鑰、憑證或可能含憑證的任意例外全文；使用安全的錯誤分類與型別。稽核寫入故障不得阻止既有 session 登出，健康檔須顯示 `audit_error`。
 
 ## 獨立 trade 開發約定（2026-11-01）
@@ -53,7 +53,7 @@ use conda env tss
 - trade 的「訂閱」指令只更新本機關注清單，尚未動態調整 fetcher 訂閱；換月須更新 fetcher／monitor 代碼。不可為每個月份合約額外建立一個券商 session。
 - `trade_commands` 保存唯一 ID、正規化請求、執行狀態與結果；同 ID 同內容讀原結果，同 ID 不同內容回 409。HTTP handler 先保存 accepted，背景執行前改 processing；重啟遺留 processing 改 unknown，不自動重送。委託／指令結果不明時須人工核對，不能刪除 claim 後重送。
 - Dashboard 使用 `Idempotency-Key`，瀏覽器保留未確認的指令 ID；逾時查原結果，同一操作重試沿用 ID。讀取 API 不觸發登入、同步委託或保證金查詢；關閉 Dashboard 不停止 trade。
-- trade 跟隨行情排程登入／登出；收盤後停止新增委託，盡可能保存狀態但不自動平倉／撤單。排程外 API 仍常駐。非預期重連沿用 `trading_reconnect_enabled` 閘門，登出不明時禁止新增登入。
+- trade 跟隨行情排程登入／登出；收盤後停止新增委託，盡可能保存狀態但不自動平倉／撤單。排程外 API 仍常駐。非預期重連沿用 `trading_reconnect_enabled` 閘門；登出結果僅作稽核，不阻擋後續登入。
 - `logs/trade_events.jsonl` 由 monitor 一併彙整，與 tick／kbar 一樣保留原始 session 時間。完整操作與限制見 `doc/independent_trade.md`；舊計畫的最後 10 秒 tick 參考價／額外價差補單尚未具備，不能宣稱已實作。
 
 ## 模式、整體啟動與 Dashboard（2026-11-01）
@@ -62,8 +62,8 @@ use conda env tss
 - Mock 沿用 Dashboard 內嵌離線回放／假券商，建立新的暫存 DB、初始暫停；不啟動 fetcher／monitor／獨立 trade，不讀券商憑證。非 Mock 必須明確配置訊號與實際月份合約。
 - macOS 用 `start_all.sh` 或雙擊 `start_all.command`，自動找到 conda `tss`；共用的 `service_launcher.py` 也可於 Windows 執行。啟動器快照本次 runtime／Dashboard 設定，避免啟動途中混用模式。
 - 非 Mock 啟動順序為 tick、kbar、每商品 monitor、trade、Dashboard。只管理本次建立的程序組；遇失敗或 Ctrl+C 先優雅停止，45 秒後才終止卡住者並記錄登出未確認，不自動重啟或廣泛終止其他 Python 程序。
-- 啟動任何新服務前，`service_control.py` 檢查設定中兩個 DB 旁的本專案 owner 紀錄。發現舊券商服務（含排程外待機者）時，以 instance 專屬停止要求通知原啟動器及服務，由原持有 API 的程序呼叫 logout；等待所有舊服務停止且券商 owner 確認 `logged_out`／從未登入後才繼續。此清理最多等 45 秒，不強制終止舊程序；逾時、登出失敗、程序已死但缺確認、無協作協定的舊版仍在執行時，停止新啟動並提示人工核對。單純 Mock 重複啟動仍拒絕，不停止原 Mock。
-- `.health/<DB名>/*.owner.json`、`*.owner.lock` 與 `*.owner.stop.json` 保存持有者、OS 鎖與針對該 instance 的停止要求；登入意圖須在 SDK login 前持久化。不能刪除／改寫未確認 owner 紀錄來繞過閘門，不能憑 PID 猜測並終止其他程序。登出前若可行，僅透過既有 API 記錄 `connections_before_logout`；本機紀錄不是券商全域 session 清單。其他機器、不同 DB 路徑或未受管程序須由原持有者登出；失去原 API 物件的連線不能由新登入代為登出。
+- 啟動任何新服務前，`service_control.py` 檢查設定中兩個 DB 旁的本專案程序鎖。發現仍在執行的舊券商服務（含排程外待機者）時，以 instance 專屬停止要求通知原啟動器及服務，由原持有 API 的程序嘗試 logout；最多等 45 秒讓舊程序釋放鎖，不強制終止舊程序。只因程序仍在執行／無協作協定的舊版仍在執行而阻擋重複啟動，不再要求登出成功確認；已停止程序的未確認紀錄不阻擋啟動。單純 Mock 重複啟動仍拒絕，不停止原 Mock。
+- `.health/<DB名>/*.owner.json`、`*.owner.lock` 與 `*.owner.stop.json` 保存持有者、OS 鎖與針對該 instance 的停止要求；登入意圖須在 SDK login 前持久化。取得程序鎖後可建立本次 owner 紀錄，歷史 session 事件仍保留於原始日誌，不偽造登出成功。不能憑 PID 猜測並終止其他程序。登出前若可行，僅透過既有 API 記錄 `connections_before_logout`；本機紀錄不是券商全域 session 清單。其他機器、不同 DB 路徑或未受管程序須由原持有者登出；失去原 API 物件的連線不能由新登入代為登出。
 - `config/dashboard.json` 控制 UI 預設週期、歷史天數、可見根數、刷新／快取間隔與 hover 距離；預設 1h、30 天、120 根、60 秒、5 秒、8 像素。`/api/dashboard-config` 只提供顯示設定，`/api/ready` 提供本程序 PID／模式做啟動驗證。
 - 1h 快速路徑須核對分鐘資料版本與完整的 monitor 衍生版本；缺少、過舊或只涵蓋部分歷史時退回分鐘重建。小週期資料依需求載入；保留完整 ATR、delta volume 與曲線來源幾何，不因加速更改交易價格或條件。
 - 曲線 hover 使用畫面取樣線段距離；顯示純文字名稱／週期／ID，同距離以較小 ID 決定，繪製與拖曳期間不顯示。詳細操作見 `doc/runtime_and_dashboard.md`。

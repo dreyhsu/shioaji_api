@@ -47,13 +47,13 @@ runtime 設定包含商品、acquisition／unified DB、trade 位址，以及行
 
 非 Mock 依序啟動 tick → kbar → 每個商品的 monitor → trade → Dashboard。啟動前驗證設定與 port；各步驟檢查屬於本次 PID 的健康檔或 `/api/ready`，不將「程序已啟動」當成「資料已驗證可交易」。日曆、資料完整性與委託／部位核對閘門維持原規則。
 
-每次日誌位於統一 DB 旁 `logs/launcher/<時間與識別碼>/`，包含各服務 `.log`、本次設定快照與 `run.json`。原 fetcher／monitor／trade 的健康檔與 session 稽核仍保留。啟動器以獨占鎖序列化「檢查舊連線 → 清理 → 啟動」，避免同時啟動兩份。
+每次日誌位於統一 DB 旁 `logs/launcher/<時間與識別碼>/`，包含各服務 `.log`、本次設定快照與 `run.json`。原 fetcher／monitor／trade 的健康檔與 session 稽核仍保留。啟動器以獨占鎖序列化「檢查舊程序 → 停止 → 啟動」，避免同時啟動兩份。
 
-### 啟動前先登出舊 session
+### 啟動前停止舊程序（2026-11-02 更新）
 
-`start_all.sh`／`.command` 與 Windows Python 入口共用此檢查。啟動器先讀取設定中 acquisition／unified DB 旁的 `.health/<DB名>/*.owner.json` 與程序鎖。發現本機本專案的舊券商服務時，會要求原啟動器及服務正常停止，由原本持有 Shioaji API 的程序呼叫 `logout()`；確認舊服務停止、券商 owner 留下登出成功（或從未登入）紀錄後，才啟動新服務。排程外待機的舊券商服務也須停止，避免稍後再次登入。僅有 Mock 執行時仍拒絕重複啟動，保留原 Mock。
+`start_all.sh`／`.command` 與 Windows Python 入口共用此檢查。啟動器讀取設定中 acquisition／unified DB 旁的 owner 紀錄與程序鎖。發現仍在執行的舊券商服務時，要求原啟動器及服務正常停止，由原本持有 Shioaji API 的程序嘗試 `logout()`；等待舊程序釋放鎖後啟動新服務。排程外待機的舊券商服務也須停止。僅有 Mock 執行時仍拒絕重複啟動，保留原 Mock。
 
-停止要求含原程序的 instance 識別碼，不根據 PID 搜尋或終止其他 Python 程序。最多等待 45 秒；逾時或登出失敗就停止新啟動，保留舊程序，不以強制終止當作登出成功。若程序已崩潰但紀錄仍是登入中／登出未確認，或舊版服務無法回覆確認，畫面會提示在原視窗 Ctrl+C 或人工核對。不可刪除未確認的 owner 紀錄來繞過此檢查。
+停止要求含原程序的 instance 識別碼，不根據 PID 搜尋或終止其他 Python 程序。最多等待 45 秒；舊程序仍持有鎖才停止新啟動。登出結果只作稽核，不再要求登出成功確認；已結束程序留下的登入中／登出未確認紀錄，以及舊事件日誌，都不阻擋重啟。各服務後續登入也不再被這項確認狀態鎖住，仍遵守原排程、重試與交易核對規則。原始日誌保留，不補造登出成功。
 
 這個流程不會為了檢查而登入券商。若舊程序已有 API，登出前可記錄 `usage().connections` 為 `connections_before_logout`；該數字是查詢當時的用量，不代表清理後為零。Shioaji 的 `logout()` 只釋放該 API 的 session，不能由新 API 代登出其他電腦、未受管理程序或已失去原 API 物件的連線。不同設定使用不同 DB 路徑時，也須在原啟動視窗停止原服務；啟動器不宣稱能列出或清除全域 session。
 
@@ -87,7 +87,7 @@ runtime 設定包含商品、acquisition／unified DB、trade 位址，以及行
 
 ## 本次驗收（2026-11-01）
 
-- 啟動前 session 清理新增驗證：相關離線回歸 **402 項通過**，另加測同一 owner 登出未確認後不得重登。涵蓋先登出再啟動、崩潰／逾時／登出失敗阻擋、舊版紀錄、instance 過期要求隔離、既有 API 用量查詢與清理時不強制終止。
+- 2026-11-02 更新：移除登出確認閘門；離線測試改驗證未確認紀錄不阻擋啟動／後續登入、舊程序仍執行時等待或拒絕重複啟動，以及保留真實登出失敗日誌。
 - macOS 實際以隔離暫存 DB 啟動 Mock，驗證 instance 停止要求由啟動器傳給 Dashboard，兩者正常結束並釋放鎖及 port；`forced_pids`、`pending_pids` 皆為空，驗收服務已停止。此測試不登入券商，未驗證券商端實際連線數。
 - conda `tss` 的設定／啟動器、小時圖、Dashboard、trade、fetcher、monitor、資料庫、健康檢查與既有交易相關測試共 **387 項通過**（21.49 秒）；這是相關測試組合，未宣稱全套通過。
 - `node tools/test_curve_hover.cjs`：**8 項**命中幾何測試通過，涵蓋重疊曲線、距離門檻、空資料、平移／縮放與縮小後端點附近命中。

@@ -393,10 +393,6 @@ class FetcherRuntime:
                 self.publish(state='scheduled_closed' if calendar.covered(now) else 'calendar_unavailable',
                              operation=None, error=None, next_window=None)
                 return
-            if self.logout_unconfirmed:
-                self.publish(state='logout_unconfirmed', operation=None,
-                             error={'kind': 'logout_unconfirmed', 'type': 'ManualVerificationRequired'})
-                return
             if self.down.is_set() or self.overflow.is_set():
                 reason = 'queue_overflow' if self.overflow.is_set() else 'session_down'
                 if self.overflow.is_set():

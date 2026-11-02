@@ -191,7 +191,7 @@ class TradeRuntime:
         with s._lock:
             try:
                 window = s.window()
-                if window is not None and self.last_window is None and not s.logout_unconfirmed:
+                if window is not None and self.last_window is None:
                     s._recovery.success()  # a new scheduled session still requires broker reconciliation
                 self.last_window = window
                 if s._api is not None and window != s.session_window:
@@ -202,7 +202,7 @@ class TradeRuntime:
                         s._persist_trade_state(order['id'], entry=trades.get(order['entry_trade_id']),
                             exit_trade=trades.get(order.get('exit_trade_id')))
                     s._close_api()
-                if window is not None and not s.logout_unconfirmed:
+                if window is not None:
                     if s._api is None and not s._recovery.pending:
                         s.ensure_connected()
                     elif s._api is None:
@@ -216,8 +216,7 @@ class TradeRuntime:
                             s.last_margin = s._monotonic()
                             s.margin_cache = s.margin()
                 self.process_commands()
-                s._publish_health(state=('logout_unconfirmed' if s.logout_unconfirmed else
-                    'scheduled_closed' if window is None else 'healthy' if s._broker_ready and not s._recovery.pending else 'degraded'),
+                s._publish_health(state=('scheduled_closed' if window is None else 'healthy' if s._broker_ready and not s._recovery.pending else 'degraded'),
                     operation=None, cycle_completed_at=mh.iso(s._now()))
                 self.save_snapshot()
             except Exception as error:

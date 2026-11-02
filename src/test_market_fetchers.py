@@ -652,7 +652,7 @@ def test_fetcher_connection_exposes_failed_sdk_logout(monkeypatch, result):
         pass
 
 
-def test_unconfirmed_logout_blocks_new_sessions(rig):
+def test_unconfirmed_logout_does_not_block_recovery(rig):
     service = rig.create()
     original = service.connect_factory
     @contextmanager
@@ -665,9 +665,11 @@ def test_unconfirmed_logout_blocks_new_sessions(rig):
     rig.apis[0].down()
     service.step()
     assert service.health['logout_unconfirmed']
+    service.connect_factory = original
     rig.advance('2026-10-30 09:00:10', 10)
     service.step()
-    assert len(rig.apis) == 1 and service.health['state'] == 'logout_unconfirmed'
+    assert len(rig.apis) == 2
+    assert service.health['state'] != 'logout_unconfirmed'
 
 
 def test_history_multiple_contracts_share_one_session_with_separate_cursors(rig):
