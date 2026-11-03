@@ -256,6 +256,13 @@ class TradingService:
                 defaults[key] = value
         return defaults
 
+    def _order_breakeven_settings(self, row):
+        settings = self.breakeven_settings()
+        for key in settings:
+            if row.get(key) is not None:
+                settings[key] = float(row[key])
+        return settings
+
     def _open(self):
         if self._api is not None:
             return self._api
@@ -617,7 +624,7 @@ class TradingService:
                     updates.update(stop_price=align_tick(stop, tick), target_price=None if current.get("curve_id") else align_tick(target, tick))
                 if current.get("breakeven_enabled") and current.get("breakeven_triggered_at"):
                     direction = 1 if current["action"] == "Buy" else -1
-                    offset = self.breakeven_settings()["breakeven_offset_points"]
+                    offset = self._order_breakeven_settings(current)["breakeven_offset_points"]
                     protection = align_tick(avg + direction * offset, float(current.get("contract_tick") or 1), direction)
                     old_floor = current.get("breakeven_price")
                     if old_floor is not None:
@@ -660,7 +667,7 @@ class TradingService:
             return row
         entry = row.get("avg_fill_price")
         direction = 1 if row["action"] == "Buy" else -1
-        settings = self.breakeven_settings()
+        settings = self._order_breakeven_settings(row)
         if entry is None or direction * (price - entry) <= settings["breakeven_trigger_points"]:
             return row
         protection = align_tick(entry + direction * settings["breakeven_offset_points"], float(row.get("contract_tick") or 1), direction)
@@ -1258,8 +1265,17 @@ class TradingService:
     @risk_locked
     def update_risk_settings(self, row_id: str, *, curve_id: int | None, stop_price: float,
                              target_price: float | None, breakeven_enabled: bool,
-                             risk_revision: int, confirmed: bool = False) -> dict:
+                             risk_revision: int, confirmed: bool = False,
+                             breakeven_trigger_points: float | None = None,
+                             breakeven_offset_points: float | None = None) -> dict:
         row = self._editable_risk_order(row_id)
+        point_values = dict(breakeven_trigger_points=breakeven_trigger_points,
+                            breakeven_offset_points=breakeven_offset_points)
+        for key, value in point_values.items():
+            if value is None:
+                point_values[key] = row.get(key)
+            elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError('保本觸發與保留點數必須是有效的非負數')
         quote = self._fresh_risk_quote(row)
         if quote is not None:
             row = self._apply_breakeven(row, quote)
@@ -1295,12 +1311,13 @@ class TradingService:
                 raise ValueError("保本已觸發，請先關閉保本並儲存，再放寬 stop")
         triggered = row.get("breakeven_triggered_at") if breakeven_enabled else None
         protection = row.get("breakeven_price") if breakeven_enabled else None
-        settings = self.breakeven_settings()
-        if (breakeven_enabled and not triggered and quote is not None
-                and direction * (quote - row["avg_fill_price"]) > settings["breakeven_trigger_points"]):
-            protection = align_tick(row["avg_fill_price"] + direction * settings["breakeven_offset_points"], tick, direction)
+        settings = self._order_breakeven_settings({**row, **point_values})
+        if (breakeven_enabled and (triggered or quote is not None
+                and direction * (quote - row["avg_fill_price"]) > settings["breakeven_trigger_points"])):
+            new_protection = align_tick(row["avg_fill_price"] + direction * settings["breakeven_offset_points"], tick, direction)
+            protection = new_protection if protection is None else max(protection, new_protection) if direction > 0 else min(protection, new_protection)
             stop = max(stop, protection) if direction > 0 else min(stop, protection)
-            triggered = self._now().isoformat(sep=" ")
+            triggered = triggered or self._now().isoformat(sep=" ")
         if curve_id is None and direction * (target - stop) <= 0:
             raise ValueError("套用保本後 stop 與 target 次序不符，請調整 target")
         if quote is not None:
@@ -1312,7 +1329,7 @@ class TradingService:
                     if curve_id is not None and changed_curve else row.get("curve_check_from") if curve_id is not None else None)
         desired = dict(curve_id=curve_id, stop_price=stop, target_price=target, curve_check_from=baseline,
                        breakeven_enabled=int(breakeven_enabled), breakeven_triggered_at=triggered,
-                       breakeven_price=protection, levels_customized=1)
+                       breakeven_price=protection, levels_customized=1, **point_values)
         if all(row.get(key) == value for key, value in desired.items()):
             return self._public_order(row)
         now = self._now().isoformat(sep=" ")
@@ -1320,8 +1337,10 @@ class TradingService:
             cursor = conn.execute(
                 "UPDATE managed_orders SET curve_id = ?, stop_price = ?, target_price = ?, curve_check_from = ?, "
                 "breakeven_enabled = ?, breakeven_triggered_at = ?, breakeven_price = ?, levels_customized = 1, "
+                "breakeven_trigger_points = ?, breakeven_offset_points = ?, "
                 "curve_armed = 0, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ? AND risk_revision = ?",
-                (curve_id, stop, target, baseline, int(breakeven_enabled), triggered, protection, now, row_id, risk_revision))
+                (curve_id, stop, target, baseline, int(breakeven_enabled), triggered, protection,
+                 point_values['breakeven_trigger_points'], point_values['breakeven_offset_points'], now, row_id, risk_revision))
             if not cursor.rowcount:
                 raise RiskConflict("出場設定已更新，請重新核對")
             conn.commit()
@@ -1438,6 +1457,7 @@ class TradingService:
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}
+        item.update(self._order_breakeven_settings(row))
         item["curve_price"] = self._curve_value(row) if row.get("curve_id") is not None else None
         entry = row.get("avg_fill_price") or row.get("price")
         item["default_stop_price"] = item["default_target_price"] = None

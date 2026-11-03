@@ -241,6 +241,7 @@ def test_schema_migration_enables_existing_orders_idempotently(tmp_path):
     row = dict(conn.execute("SELECT * FROM managed_orders WHERE id = 'old'").fetchone())
     assert row['breakeven_enabled'] == 1 and row['risk_revision'] == 0
     assert row['breakeven_triggered_at'] is None and row['contract_tick'] == 1
+    assert row['breakeven_trigger_points'] is None and row['breakeven_offset_points'] is None
     conn.close()
 
 
@@ -290,3 +291,84 @@ def test_config_can_set_pure_breakeven_zero_offset(fake_service):
     service.settings_path.write_text('{"breakeven_trigger_points": 20, "breakeven_offset_points": 0}')
     tick(service, 46291)
     assert service._active_order(order['id'])['stop_price'] == 46270
+
+
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+def test_per_order_breakeven_points_are_isolated_and_persist(fake_service, action, direction):
+    service, api, _ = fake_service
+    first = filled(service, api, action)
+    second = filled(service, api, action)
+    first = save(service, first, breakeven_trigger_points=40, breakeven_offset_points=12)
+    assert first['breakeven_trigger_points'] == 40 and first['breakeven_offset_points'] == 12
+    assert service._public_order(service._active_order(second['id']))['breakeven_trigger_points'] == 100
+    tick(service, 46270 + direction * 40)
+    assert not service._active_order(first['id'])['breakeven_triggered_at']
+    tick(service, 46270 + direction * 41)
+    protected = service._active_order(first['id'])
+    assert protected['stop_price'] == 46270 + direction * 12
+    assert not service._active_order(second['id'])['breakeven_triggered_at']
+    # Fill-average corrections also use this order's offset.
+    api.trades[0].status.deals = [SimpleNamespace(quantity=1, price=46270 + direction * 10)]
+    service._persist_trade_state(first['id'], entry=api.trades[0])
+    assert service._active_order(first['id'])['stop_price'] == 46270 + direction * 22
+    restarted = trading.TradingService(service.db_path, service.code, simulation=True, start_worker=False)
+    try:
+        saved = restarted._public_order(restarted._active_order(first['id']))
+        assert saved['breakeven_trigger_points'] == 40 and saved['breakeven_offset_points'] == 12
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+def test_editing_latched_offset_only_tightens_and_legacy_edits_keep_points(fake_service, action, direction):
+    service, api, _ = fake_service
+    order = filled(service, api, action)
+    order = save(service, order, breakeven_trigger_points=30, breakeven_offset_points=10)
+    tick(service, 46270 + direction * 40)
+    order = service._public_order(service._active_order(order['id']))
+    order = save(service, order, breakeven_offset_points=20)
+    assert order['stop_price'] == 46270 + direction * 20
+    order = save(service, order, breakeven_trigger_points=200, breakeven_offset_points=0)
+    assert order['stop_price'] == 46270 + direction * 20
+    assert order['breakeven_triggered_at']
+    updated = service.update_levels(order['id'], order['stop_price'], order['target_price'])
+    assert updated['breakeven_trigger_points'] == 200 and updated['breakeven_offset_points'] == 0
+
+
+def test_lowering_order_trigger_applies_on_save_without_changing_defaults(fake_service):
+    service, api, _ = fake_service
+    order = filled(service, api)
+    tick(service, 46290)
+    updated = save(service, order, breakeven_trigger_points=10, breakeven_offset_points=0)
+    assert updated['breakeven_triggered_at'] and updated['stop_price'] == 46270
+    assert service.breakeven_settings()['breakeven_trigger_points'] == 100
+
+
+@pytest.mark.parametrize('key', ['breakeven_trigger_points', 'breakeven_offset_points'])
+@pytest.mark.parametrize('value', [-1, float('nan'), float('inf'), True])
+def test_invalid_per_order_points_rejected_without_writing(fake_service, key, value):
+    service, api, _ = fake_service
+    order = filled(service, api)
+    with pytest.raises(ValueError, match='非負數'):
+        save(service, order, **{key: value})
+    assert service._active_order(order['id'])[key] is None
+
+
+def test_dashboard_risk_api_saves_per_order_points(fake_service, monkeypatch):
+    service, api, _ = fake_service
+    order = filled(service, api)
+    monkeypatch.setattr(dashboard, '_TRADING_SERVICE', service)
+    monkeypatch.setattr(dashboard.app.state, 'mock_runtime', None, raising=False)
+    monkeypatch.setitem(dashboard.CONFIG, 'db_path', service.db_path)
+    monkeypatch.setitem(dashboard.CONFIG, 'code', service.code)
+    payload = {key: order[key] for key in ('curve_id', 'stop_price', 'target_price', 'risk_revision')}
+    payload.update(breakeven_enabled=True, breakeven_trigger_points=70, breakeven_offset_points=9)
+    with TestClient(dashboard.app) as client:
+        response = client.put(f"/api/trading/orders/{order['id']}/risk-settings", json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()['breakeven_trigger_points'] == 70
+        assert response.json()['breakeven_offset_points'] == 9
+        assert client.put(f"/api/trading/orders/{order['id']}/risk-settings",
+                          json={**payload, 'breakeven_trigger_points': -1}).status_code == 422
+        assert client.put(f"/api/trading/orders/{order['id']}/risk-settings",
+                          json={**payload, 'breakeven_offset_points': True}).status_code == 422

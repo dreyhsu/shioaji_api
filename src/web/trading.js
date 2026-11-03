@@ -74,7 +74,6 @@
   }
 
   function setMode(info) {
-    $('risk-breakeven-label').textContent = `浮盈超過 ${info.breakeven_trigger_points ?? '—'} 點自動保本（保留 ${info.breakeven_offset_points ?? '—'} 點）`;
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
@@ -259,6 +258,8 @@
   function riskValues(order) {
     return { curve_id: order.curve_id || null, stop_price: order.stop_price,
       target_price: order.target_price, breakeven_enabled: Boolean(order.breakeven_enabled),
+      breakeven_trigger_points: order.breakeven_trigger_points,
+      breakeven_offset_points: order.breakeven_offset_points,
       risk_revision: Number(order.risk_revision) };
   }
 
@@ -320,10 +321,15 @@
       $('risk-target').required = !values.curve_id;
       $('risk-target').placeholder = values.curve_id && target == null ? '曲線暫不可用' : '';
       $('risk-breakeven').checked = values.breakeven_enabled;
+      for (const [id, value] of [['trigger', values.breakeven_trigger_points], ['offset', values.breakeven_offset_points]]) {
+        const input = $('risk-breakeven-' + id);
+        if (document.activeElement !== input) input.value = value ?? '';
+      }
+      $('risk-breakeven-label').textContent = `浮盈超過 ${values.breakeven_trigger_points ?? '—'} 點啟動，保留 ${values.breakeven_offset_points ?? '—'} 點`;
       const stale = Number(values.risk_revision) !== Number(order.risk_revision);
       let status = riskErrors.get(order.id) || riskNotice || (riskDrafts.has(order.id) ? '尚未儲存：系統仍沿用原出場設定。' : '已儲存；拖曳邊界或輸入價格後按儲存。');
       if (stale) status = '出場設定或成交狀態已更新（可能已自動保本）。草稿已保留，請按還原重新核對。';
-      else if (order.breakeven_enabled && order.breakeven_triggered_at) status += ` 保本已觸發，保護價 ${number(order.breakeven_price, 2)}；stop 只能收緊。`;
+      else if (order.breakeven_enabled && order.breakeven_triggered_at) status += ` 保本已觸發，保護價 ${number(order.breakeven_price, 2)}；調低保留點數不會放寬既有 stop。`;
       if (values.curve_id) status += ' 曲線 target 僅供顯示，依 1m 收盤穿越出場。';
       $('risk-state').textContent = status;
       $('risk-state').classList.toggle('bad', stale || riskErrors.has(order.id));
@@ -362,6 +368,8 @@
     const draft = riskDrafts.get(id);
     if (!draft || riskSaving.has(id)) return;
     const payload = { ...draft, stop_price: Number(draft.stop_price),
+      breakeven_trigger_points: Number(draft.breakeven_trigger_points),
+      breakeven_offset_points: Number(draft.breakeven_offset_points),
       target_price: draft.curve_id ? null : Number(draft.target_price) };
     riskSaving.add(id);
     renderRiskEditor();
@@ -733,6 +741,9 @@
     $('risk-' + key).addEventListener('input', (event) => updateRiskDraft(state.selectedId, { [key + '_price']: event.target.value }));
   }
   $('risk-breakeven').addEventListener('change', (event) => updateRiskDraft(state.selectedId, { breakeven_enabled: event.target.checked }));
+  for (const [id, key] of [['trigger', 'breakeven_trigger_points'], ['offset', 'breakeven_offset_points']]) {
+    $('risk-breakeven-' + id).addEventListener('input', (event) => updateRiskDraft(state.selectedId, { [key]: event.target.value }));
+  }
   $('risk-reset').addEventListener('click', () => {
     riskDrafts.delete(state.selectedId);
     riskErrors.delete(state.selectedId);

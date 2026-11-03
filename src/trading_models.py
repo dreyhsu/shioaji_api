@@ -32,6 +32,8 @@ class TradeRiskSettingsIn(BaseModel):
     stop_price: float = Field(gt=0, allow_inf_nan=False)
     target_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     breakeven_enabled: StrictBool
+    breakeven_trigger_points: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    breakeven_offset_points: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
     risk_revision: int = Field(ge=0, strict=True)
     confirmed: StrictBool = False
 

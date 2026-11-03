@@ -49,6 +49,7 @@ use conda env tss
 - `trade.py` 為 loopback 常駐 API（預設 8766），所有券商 I/O 由單一背景執行緒依序執行；API 查詢僅讀背景快照。不得多 worker／reload 啟動多個登入。
 - `trade_service.py` 是既有 `TradingService` 的獨立程序適配層，不註冊行情 callback、不訂閱 tick、不抓歷史資料；`trading.py` 保留離線回放與既有委託／部位邏輯。
 - 自動進出場、固定停損／停利、保本均以已驗證收定 1 分 K 判斷。曲線使用 TMFR1，固定價格風控使用實際月份合約；兩者必須各有 monitor 健康狀態與共用 DB 資料，不將連續合約價格冒充月份合約價格。手動委託通過驗證後執行。
+- 2026-11-03：Dashboard 停損／停利調整區可逐單保存 `breakeven_trigger_points`（浮盈觸發點數）及 `breakeven_offset_points`（保留獲利點數）；未個別設定時沿用共用設定，預設 100／5。參數經 trade 持久化指令與風控版本檢查更新，不影響其他單。保本已觸發後，調高觸發點數不解除保護，調低保留點數不自動放寬既有 stop。
 - tick／kbar fetcher 的 `--codes` 須同時包含訊號商品與實際月份合約；kbar 支援多個合約共用同一 session、獨立回補游標。每個代碼用一個無券商連線的 monitor，寫入同一統一 DB。先啟動 fetcher，再啟動 monitor／trade。
 - trade 的「訂閱」指令只更新本機關注清單，尚未動態調整 fetcher 訂閱；換月須更新 fetcher／monitor 代碼。不可為每個月份合約額外建立一個券商 session。
 - `trade_commands` 保存唯一 ID、正規化請求、執行狀態與結果；同 ID 同內容讀原結果，同 ID 不同內容回 409。HTTP handler 先保存 accepted，背景執行前改 processing；重啟遺留 processing 改 unknown，不自動重送。委託／指令結果不明時須人工核對，不能刪除 claim 後重送。

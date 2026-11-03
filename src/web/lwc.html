@@ -167,7 +167,9 @@
       <label>停利方式 <select id="risk-mode" aria-label="停利方式"></select></label>
       <label>Target <input id="risk-target" type="number" min="0" aria-label="Target 價格"></label>
       <label>Stop <input id="risk-stop" required type="number" min="0" aria-label="Stop 價格"></label>
-      <label class="risk-check"><input id="risk-breakeven" type="checkbox"><span id="risk-breakeven-label">自動保本（讀取設定中）</span></label>
+      <label class="risk-check"><input id="risk-breakeven" type="checkbox"><span id="risk-breakeven-label">自動保本</span></label>
+      <label>浮盈觸發點數 <input id="risk-breakeven-trigger" required type="number" min="0" step="any" aria-label="浮盈觸發點數"></label>
+      <label>保留獲利點數 <input id="risk-breakeven-offset" required type="number" min="0" step="any" aria-label="保留獲利點數"></label>
       <button id="risk-save" type="submit">儲存</button>
       <button id="risk-reset" type="button">還原</button>
       <span id="risk-state" role="status" aria-live="polite"></span>
@@ -202,7 +204,7 @@
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
   <script src="/static/curve_hover.js?v=1"></script>
   <script src="/static/lwc_app.js?v=config-hover-gap-2"></script>
-  <script src="/static/trading.js?v=multiframe-curves-1"></script>
+  <script src="/static/trading.js?v=per-order-breakeven-2"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

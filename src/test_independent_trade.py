@@ -141,6 +141,29 @@ def test_pending_incomplete_minute_does_not_disable_manual_order(rig):
     assert len(r.broker.trades) == 1
 
 
+def test_per_order_breakeven_points_pass_through_durable_trade_command(rig):
+    r = rig
+    request(r)
+    r.runtime.step()
+    r.runtime.step()
+    order = r.service.orders()[0]
+    payload = dict(curve_id=None, stop_price=order['stop_price'], target_price=order['target_price'],
+        breakeven_enabled=True, risk_revision=order['risk_revision'],
+        breakeven_trigger_points=60, breakeven_offset_points=8)
+    response = r.client.post('/api/commands', json=dict(id='risk-points', name='update_risk',
+        target=order['id'], payload=payload))
+    assert response.status_code == 202
+    r.runtime.step()
+    command = r.client.get('/api/commands/risk-points').json()
+    assert command['state'] == 'succeeded'
+    assert command['result']['breakeven_trigger_points'] == 60
+    assert command['result']['breakeven_offset_points'] == 8
+    # Retrying this exact ID reads the original outcome, without another edit.
+    repeated = r.client.post('/api/commands', json=dict(id='risk-points', name='update_risk',
+        target=order['id'], payload=payload)).json()
+    assert repeated['result']['risk_revision'] == command['result']['risk_revision']
+
+
 def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
     r = rig
     request(r)
