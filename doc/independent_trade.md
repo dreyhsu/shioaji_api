@@ -55,6 +55,16 @@ TMFR1 曲線與實際月份合約有不同價格，不能互相當作固定停�
 
 ## 指令與快照 API
 
+### Telegram 進場與平倉成交通知
+
+trade 在券商確認進場或出場成交口數增加、且交易狀態成功保存後，使用背景執行緒發送 Telegram。支援手動／曲線進場與停損、停利、保本、曲線出場等本服務管理的委託；委託送出、拒絕或取消但未成交不通知為開倉／平倉。部分成交分次通知累計口數，部分平倉顯示剩餘部位，全部平倉才顯示部位已清空。
+
+沿用 `.env` 的 `TELEGRAM_BOT_TOKEN`／`TELEGRAM_CHAT_ID`、`config/alerts.json` 的 `telegram_enabled` 總開關，以及 trade 的 `--no-telegram`。Mock 仍不發送。訊息包含商品、方向、環境、台北時間、券商成交均價與口數；出場另含原因、剩餘口數及每口未扣費價差。實際平倉均價保存於 `managed_orders.avg_exit_price`，未收到成交價格時明示待回報，不以觸發價或最新 tick 代替。未經本服務追蹤的外部委託／其他電腦操作不保證通知。
+
+`telegram_alerts` 以 managed order、進場／出場階段、累計成交量持久化去重，事件分別為 `entry_fill`／`exit_fill`，重新啟動或重複回報不重發。通知暫停期間的成交不在恢復開關後補發。傳送與紀錄故障不阻斷下單或出場監控；傳送結果保存在 `ok` 欄位，沿用有限次網路重試，不保證 Telegram 一定送達。
+
+### HTTP endpoints
+
 | API | 用途 |
 |---|---|
 | `GET /api/snapshot` | 背景保存的 status、contracts、margin、orders；不查券商 |

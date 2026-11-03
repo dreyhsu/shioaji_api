@@ -121,7 +121,7 @@ def _trade_id(trade: Any) -> str | None:
     return _value(_value(trade, "order"), "id") or _value(_value(trade, "status"), "id")
 
 
-def _fill_summary(trade: Any) -> tuple[int, float | None]:
+def _fill_summary(trade: Any, *, confirmed_price_only=False) -> tuple[int, float | None]:
     status = _value(trade, "status")
     filled = int(_value(status, "deal_quantity", 0) or 0)
     deals = _value(status, "deals", []) or []
@@ -129,17 +129,24 @@ def _fill_summary(trade: Any) -> tuple[int, float | None]:
         deals = list(deals.values())
     total_quantity = 0
     total_value = 0.0
+    invalid_deal_price = False
     for deal in deals:
         quantity = int(_value(deal, "quantity", 0) or 0)
         price = float(_value(deal, "price", 0) or 0)
+        if quantity > 0 and (not math.isfinite(price) or price <= 0):
+            invalid_deal_price = True
         total_quantity += quantity
         total_value += quantity * price
     if total_quantity:
+        if confirmed_price_only and invalid_deal_price:
+            return max(filled, total_quantity), None
         return max(filled, total_quantity), total_value / total_quantity
     average = _value(status, "average_price") or _value(status, "deal_price")
     order = _value(trade, "order")
-    if average is None and filled:
+    if average is None and filled and not confirmed_price_only:
         average = _value(status, "modified_price") or _value(order, "price")
+    if confirmed_price_only and average is not None and (not math.isfinite(float(average)) or float(average) <= 0):
+        average = None
     return filled, None if average is None else float(average)
 
 
@@ -601,6 +608,7 @@ class TradingService:
         original = self._active_order(row_id)
         now = self._now().isoformat(sep=" ")
         new_fill = False
+        new_exit_fill = False
         updates: dict[str, Any] = {"updated_at": now}
         if entry is not None:
             filled, avg = _fill_summary(entry)
@@ -634,9 +642,12 @@ class TradingService:
             if terminal and filled == 0 and status in {"Cancelled", "Failed", "Rejected"}:
                 updates.update(active=0, auto_exit=0)
         if exit_trade is not None:
-            quantity, _ = _fill_summary(exit_trade)
+            quantity, avg_exit = _fill_summary(exit_trade, confirmed_price_only=True)
+            new_exit_fill = quantity > int(original.get('exit_filled_quantity', 0))
             status = _trade_status(exit_trade)
             updates.update(exit_filled_quantity=quantity, exit_status=status)
+            if quantity > 0 and (avg_exit is not None or new_exit_fill):
+                updates['avg_exit_price'] = avg_exit
             row = self._active_order(row_id)
             if quantity >= int(row["filled_quantity"]):
                 updates["active"] = 0
@@ -656,6 +667,8 @@ class TradingService:
 
         if new_fill:
             self.entry_notifier.notify(self._active_order(row_id))
+        if new_exit_fill:
+            self.entry_notifier.notify_exit(self._active_order(row_id))
 
     def _apply_breakeven(self, row: dict, price: float) -> dict:
         """Called under the shared risk lock for every fresh tick and after fill sync."""
@@ -1453,7 +1466,7 @@ class TradingService:
             "avg_fill_price", "price", "price_type", "order_type", "atr", "stop_price",
             "target_price", "curve_id", "auto_exit", "simulation", "entry_trade_id",
             "curve_check_from", "contract_tick", "breakeven_enabled", "breakeven_triggered_at", "breakeven_price", "risk_revision",
-            "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity",
+            "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity", "avg_exit_price",
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}

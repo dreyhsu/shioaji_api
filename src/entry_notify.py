@@ -1,6 +1,6 @@
-"""Persistently deduplicate entry-fill notifications and send off the trading thread.
+"""Persistently deduplicate position-fill notifications off the trading thread.
 
-Input is a persisted managed-order snapshot after its filled quantity increases.
+Input is a persisted managed-order snapshot after entry/exit quantity increases.
 Each cumulative quantity claims one alert, including across service restarts.
 Disabled notifications are skipped without consuming an alert; the trading service
 still saves fills, so enabling later does not replay skipped fills. Transport or
@@ -24,35 +24,44 @@ class EntryNotifier:
 
     @staticmethod
     def _background(task):
-        threading.Thread(target=task, name="telegram-entry", daemon=True).start()
+        threading.Thread(target=task, name="telegram-fill", daemon=True).start()
 
     def notify(self, row):
+        self._notify(row, 'entry')
+
+    def notify_exit(self, row):
+        self._notify(row, 'exit')
+
+    def _notify(self, row, phase):
         try:
             if not self.enabled:
                 return
             self.config.reload()
             if not self.config.telegram_enabled:
                 return
-            message = tg.format_entry_fill(row)
+            quantity = row['filled_quantity'] if phase == 'entry' else row['exit_filled_quantity']
+            if quantity <= 0:
+                return
+            message = tg.format_entry_fill(row) if phase == 'entry' else tg.format_exit_fill(row)
             with db.session(self.db_path) as conn:
                 alert_id = db.record_alert(
                     conn, row["code"], hour_start=row["created_at"],
-                    box_type=f"entry:{row['id']}:{row['filled_quantity']}",
-                    box_id=None, visit_id=None, kind="entry_fill", message=message,
+                    box_type=f"{phase}:{row['id']}:{quantity}",
+                    box_id=None, visit_id=None, kind=f"{phase}_fill", message=message,
                 )
             if alert_id is not None:
                 self.dispatch(lambda: self._deliver(alert_id, message))
         except Exception as error:  # notification failures cannot interrupt trading
-            print(f"[Telegram] Entry notification failed: {type(error).__name__}: {error}")
+            print(f"[Telegram] {phase} notification failed: {type(error).__name__}")
 
     def _deliver(self, alert_id, message):
         ok = False
         try:
             ok = tg.send_message(message)
         except Exception as error:
-            print(f"[Telegram] Entry delivery failed: {type(error).__name__}: {error}")
+            print(f"[Telegram] Fill delivery failed: {type(error).__name__}")
         try:
             with db.session(self.db_path) as conn:
                 db.mark_alert_sent(conn, alert_id, ok)
         except Exception as error:
-            print(f"[Telegram] Entry delivery status failed: {type(error).__name__}: {error}")
+            print(f"[Telegram] Fill delivery status failed: {type(error).__name__}")

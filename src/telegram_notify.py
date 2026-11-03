@@ -1,4 +1,4 @@
-"""Telegram formatting and transport for market alerts and entry fills.
+"""Telegram formatting and transport for market alerts and position fills.
 
 The transport follows ``src/telegram_sample.py``: POST to ``sendMessage`` with
 ``parse_mode=HTML`` and credentials from ``.env``.
@@ -96,13 +96,37 @@ def format_entry_fill(row: dict) -> str:
     return (
         f"<b>{escape(str(row['contract_code']))} {side}進場成交</b>\n"
         f"環境：{mode}\n"
-        f"時間：{escape(str(row['updated_at']))}\n\n"
+        f"時間：{escape(str(row['updated_at']))} (Asia/Taipei)\n\n"
         f"累計成交：{row['filled_quantity']} / {row['quantity']} 口\n"
         f"成交均價：<b>{price(row.get('avg_fill_price'))}</b>\n"
         f"進場 ATR：{price(row.get('atr'))}\n"
         f"停損：{price(row.get('stop_price'))}\n"
         f"停利：{target}\n"
         f"委託編號：{escape(str(row['entry_trade_id']))}"
+    )
+
+
+def format_exit_fill(row: dict) -> str:
+    """Report broker-confirmed exit prices, never the signal/reference price."""
+    side = '多單賣出' if row['action'] == 'Buy' else '空單買回'
+    remaining = max(0, int(row['filled_quantity']) - int(row['exit_filled_quantity']))
+    state = '平倉成交' if remaining == 0 else '部分平倉成交'
+    mode = '模擬環境' if row['simulation'] else '正式環境'
+    entry, exit_price = row.get('avg_fill_price'), row.get('avg_exit_price')
+    price = lambda value: '待券商回報' if value is None else f'{value:,.2f}'
+    points = ('待券商回報' if entry is None or exit_price is None else
+              f"{(exit_price - entry) * (1 if row['action'] == 'Buy' else -1):+,.2f} 點")
+    reason = {'stop': '停損／保本', 'target': '固定停利', 'curve': '曲線出場'}.get(
+        row.get('trigger_reason'), row.get('trigger_reason') or '券商成交回報')
+    return (
+        f"<b>{escape(str(row['contract_code']))} {side}{state}</b>\n"
+        f"環境：{mode}\n時間：{escape(str(row['updated_at']))} (Asia/Taipei)\n\n"
+        f"累計平倉：{row['exit_filled_quantity']} / {row['filled_quantity']} 口\n"
+        f"剩餘部位：{remaining} 口\n"
+        f"進場均價：{price(entry)}\n平倉均價：<b>{price(exit_price)}</b>\n"
+        f"每口價差（未扣費）：{points}\n"
+        f"出場原因：{escape(str(reason))}\n"
+        f"委託編號：{escape(str(row.get('exit_trade_id') or '待券商回報'))}"
     )
 
 

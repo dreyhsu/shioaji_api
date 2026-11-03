@@ -242,6 +242,7 @@ def test_schema_migration_enables_existing_orders_idempotently(tmp_path):
     assert row['breakeven_enabled'] == 1 and row['risk_revision'] == 0
     assert row['breakeven_triggered_at'] is None and row['contract_tick'] == 1
     assert row['breakeven_trigger_points'] is None and row['breakeven_offset_points'] is None
+    assert row['avg_exit_price'] is None
     conn.close()
 
 

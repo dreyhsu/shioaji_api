@@ -56,6 +56,7 @@ use conda env tss
 - Dashboard 使用 `Idempotency-Key`，瀏覽器保留未確認的指令 ID；逾時查原結果，同一操作重試沿用 ID。讀取 API 不觸發登入、同步委託或保證金查詢；關閉 Dashboard 不停止 trade。
 - trade 跟隨行情排程登入／登出；收盤後停止新增委託，盡可能保存狀態但不自動平倉／撤單。排程外 API 仍常駐。非預期重連沿用 `trading_reconnect_enabled` 閘門；登出結果僅作稽核，不阻擋後續登入。
 - `logs/trade_events.jsonl` 由 monitor 一併彙整，與 tick／kbar 一樣保留原始 session 時間。完整操作與限制見 `doc/independent_trade.md`；舊計畫的最後 10 秒 tick 參考價／額外價差補單尚未具備，不能宣稱已實作。
+- trade 對本服務管理的進場／平倉委託，在券商確認成交口數增加並成功持久化後發送 Telegram；部分成交分次通知，依委託 ID、進出場階段與累計口數去重，重啟不重發。沿用 `telegram_enabled`／`--no-telegram`，Mock 停用。出場均價必須使用券商回報的 `avg_exit_price`，不能冒充為觸發價；通知背景傳送失敗不阻斷交易，暫停期間成交不補發。
 
 ## 模式、整體啟動與 Dashboard（2026-11-01）
 

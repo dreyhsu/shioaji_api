@@ -148,7 +148,67 @@ def test_only_new_entry_fills_notify_and_paused_fills_are_not_replayed(fake_serv
     service._persist_trade_state(result["id"], entry=entry)
     assert len(messages) == 2 and "3 / 3 口" in messages[-1]
     service._persist_trade_state(result["id"], exit_trade=entry)
+    assert len(messages) == 3 and '平倉成交' in messages[-1]
+
+
+@pytest.mark.parametrize('action', ['Buy', 'Sell'])
+def test_exit_fills_notify_after_persistence_and_skip_paused_or_duplicate_fills(fake_service, monkeypatch, action):
+    service, api, _ = fake_service
+    import telegram_notify as tg
+    messages = []
+    monkeypatch.setattr(tg, 'send_message', lambda message: messages.append(message) or True)
+    alerts = service.entry_notifier.config.path
+    alerts.write_text('{"telegram_enabled": true}')
+    result = service.place_order(dict(confirmed=True, simulation=True, contract_code='TMF202611',
+        action=action, quantity=3, price=46270, price_type='LMT', order_type='ROD'))
+    entry = api.trades[0]
+    entry.status.status = 'Filled'
+    entry.status.deal_quantity = 3
+    entry.status.deals = [SimpleNamespace(quantity=3, price=46270)]
+    service._persist_trade_state(result['id'], entry=entry)
+    exit_trade = FakeTrade('exit-1')
+    with db.session(service.db_path) as conn:
+        conn.execute("UPDATE managed_orders SET exit_trade_id='exit-1', trigger_reason='stop' WHERE id=?", (result['id'],))
+        conn.commit()
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    assert len(messages) == 1  # no exit message for submission alone
+    exit_trade.status.deal_quantity = 1
+    exit_trade.status.deals = [SimpleNamespace(quantity=1, price=46275)]
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    assert '部分平倉成交' in messages[-1] and '剩餘部位：2 口' in messages[-1]
+    assert service._active_order(result['id'])['avg_exit_price'] == 46275
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
     assert len(messages) == 2
+    alerts.write_text('{"telegram_enabled": false}')
+    exit_trade.status.deal_quantity = 2
+    exit_trade.status.deals = []  # quantity can arrive before the confirmed average
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    assert service._active_order(result['id'])['avg_exit_price'] is None
+    alerts.write_text('{"telegram_enabled": true}')
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    assert len(messages) == 2  # paused fills are not replayed
+    exit_trade.status.status = 'Filled'
+    exit_trade.status.deal_quantity = 3
+    exit_trade.status.deals = [SimpleNamespace(quantity=2, price=46280), SimpleNamespace(quantity=1, price=46295)]
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    row = service._active_order(result['id'])
+    assert not row['active'] and row['avg_exit_price'] == 46285
+    assert len(messages) == 3 and '剩餘部位：0 口' in messages[-1]
+    assert '46,285.00' in messages[-1]
+    service._persist_trade_state(result['id'], exit_trade=exit_trade)
+    assert len(messages) == 3
+
+
+def test_exit_price_never_falls_back_to_order_or_modified_price():
+    trade = FakeTrade('exit-1', status='Filled')
+    trade.status.deal_quantity = 1
+    trade.order.price = 46000
+    trade.status.modified_price = 46100
+    assert trading._fill_summary(trade, confirmed_price_only=True) == (1, None)
+    trade.status.deals = [SimpleNamespace(quantity=1, price=0)]
+    assert trading._fill_summary(trade, confirmed_price_only=True) == (1, None)
+    trade.status.deals = [SimpleNamespace(quantity=1, price=46200)]
+    assert trading._fill_summary(trade, confirmed_price_only=True) == (1, 46200)
 
 
 def test_simulation_order_and_margin_are_exposed(fake_service):

@@ -179,6 +179,30 @@ def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
     assert r.service.orders()[0]['trigger_reason'] == 'target'
 
 
+def test_independent_trade_notifies_confirmed_open_and_close(rig, monkeypatch):
+    r = rig
+    import telegram_notify as tg
+    messages = []
+    monkeypatch.setattr(tg, 'send_message', lambda message: messages.append(message) or True)
+    notifier = r.service.entry_notifier
+    notifier.enabled = True
+    notifier.config.path = r.path.parent / 'fill-alerts.json'
+    notifier.config.path.write_text('{"telegram_enabled": true}')
+    notifier.dispatch = lambda task: task()
+    request(r)
+    r.runtime.step()
+    r.runtime.step()
+    assert len(messages) == 1 and '進場成交' in messages[0]
+    r.update('2026-10-30 09:03:03', close=21000)
+    r.runtime.step()
+    r.runtime.step()
+    assert len(messages) == 2 and '平倉成交' in messages[1]
+    order = r.service.orders()[0]
+    assert not order['active'] and order['avg_exit_price'] is not None
+    r.runtime.step()
+    assert len(messages) == 2
+
+
 def test_accepted_order_with_lost_response_is_never_resubmitted(rig):
     r = rig
     original = r.broker.place_order

@@ -99,3 +99,54 @@ def test_html_is_escaped_and_curve_and_missing_price_are_explicit():
     assert "&lt;TMF&gt;" in message and "a&amp;b" in message
     assert "待券商回報" in message and "停利：曲線停利" in message
     assert tg.FOOTER not in message
+
+
+@pytest.mark.parametrize('action,direction,label', [('Buy', 1, '多單賣出'), ('Sell', -1, '空單買回')])
+def test_exit_partial_full_messages_and_restart_deduplication(notifier, action, direction, label):
+    notifier, messages = notifier
+    row = order(action=action, filled_quantity=3, exit_filled_quantity=1,
+                avg_exit_price=25000.5 + direction * 25, exit_trade_id='exit-1', trigger_reason='target')
+    notifier.notify(row)
+    notifier.notify_exit(row)
+    notifier.notify_exit(row)
+    restarted = EntryNotifier(notifier.db_path, alerts_path=notifier.config.path, dispatch=lambda task: task())
+    restarted.notify_exit(row)
+    restarted.notify_exit({**row, 'exit_filled_quantity': 3})
+    assert len(messages) == 3  # entry, partial exit, final exit
+    assert f'{label}部分平倉成交' in messages[1]
+    assert '剩餘部位：2 口' in messages[1]
+    assert '3 / 3 口' in messages[2] and '剩餘部位：0 口' in messages[2]
+    assert '部分平倉' not in messages[2]
+    assert '+25.00 點' in messages[2] and '固定停利' in messages[2]
+    assert 'Asia/Taipei' in messages[2]
+    with db.session(notifier.db_path) as conn:
+        alerts = db.load_alerts(conn, 'TMFR1')
+    assert list(alerts.kind).count('exit_fill') == 2
+    assert all(alerts.ok == 1)
+
+
+def test_exit_unfilled_disabled_and_failed_delivery(notifier, monkeypatch):
+    notifier, messages = notifier
+    row = order(exit_filled_quantity=1, avg_exit_price=None, exit_trade_id='exit-1')
+    notifier.notify_exit({**row, 'exit_filled_quantity': 0})
+    notifier.enabled = False
+    notifier.notify_exit(row)
+    notifier.enabled = True
+    notifier.config.path.write_text('{"telegram_enabled": false}')
+    notifier.notify_exit(row)
+    assert not messages
+    notifier.config.path.write_text('{"telegram_enabled": true}')
+    monkeypatch.setattr(tg, 'send_message', lambda message: False)
+    notifier.notify_exit(row)
+    notifier.notify_exit(row)
+    with db.session(notifier.db_path) as conn:
+        alerts = db.load_alerts(conn, 'TMFR1')
+    assert len(alerts) == 1 and alerts.iloc[0]['ok'] == 0
+
+
+def test_exit_unknown_prices_and_identifiers_are_not_fabricated():
+    message = tg.format_exit_fill(order(contract_code='<TMF>', exit_trade_id='a&b',
+        exit_filled_quantity=1, avg_exit_price=None, trigger_reason='<manual>'))
+    assert '&lt;TMF&gt;' in message and 'a&amp;b' in message and '&lt;manual&gt;' in message
+    assert '平倉均價：<b>待券商回報</b>' in message
+    assert '每口價差（未扣費）：待券商回報' in message
