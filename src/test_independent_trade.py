@@ -18,6 +18,7 @@ from test_market_fetchers import calendar
 from trade import create_app, TradeRuntime, Command
 from trade_client import TradeClient, command_id
 from trade_service import IndependentTradingService
+from trade_service import _pending_minute_indices
 
 pytestmark = pytest.mark.integration
 
@@ -115,6 +116,25 @@ def test_reads_enqueue_and_duplicate_ids_do_not_login_or_submit(rig):
     assert request(r, payload=changed).status_code == 409
 
 
+def test_read_endpoints_never_initialize_schema_or_write(rig, monkeypatch):
+    r = rig
+    assert request(r).status_code == 202
+    def forbidden(*args, **kwargs):
+        raise AssertionError('read endpoint must not initialize schema')
+    monkeypatch.setattr(db, 'init_schema', forbidden)
+    assert r.client.get('/api/snapshot').status_code == 200
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'accepted'
+    assert not r.apis
+    import sqlite3
+    with db.read_session(r.path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            conn.execute("UPDATE trade_commands SET state='failed'")
+    with pytest.raises(sqlite3.OperationalError):
+        with db.read_session(r.path.parent / 'must-not-create.db'):
+            pass
+    assert not (r.path.parent / 'must-not-create.db').exists()
+
+
 def test_stale_monitor_data_blocks_entry_without_quote_subscription(rig):
     r = rig
     r.health['TMFR1'].publish(state='degraded', bars={'ready': False})
@@ -177,6 +197,50 @@ def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
     r.runtime.step()
     assert len(r.broker.trades) == 2
     assert r.service.orders()[0]['trigger_reason'] == 'target'
+
+
+@pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, action, direction):
+    import trendline as tl
+    r = rig
+    minutes = sb.add_sessions(pd.DataFrame([dict(minute_start=stamp, open=20000, high=20000, low=20000,
+        close=20000, volume=1, amount=20000)
+        for stamp in pd.date_range('2026-10-30 08:45', '2026-10-30 10:46', freq='min')]))
+    with db.session(r.path) as conn:
+        for code in ('TMFR1', 'TMF209912'):
+            db.upsert_minute_bars(conn, code, minutes)
+        source = tl.source_bars(minutes, timeframe)
+        anchors = [{'time': int(stamp.value // 10**9), 'price': 20000}
+                   for stamp in source['hour_start' if timeframe == '1h' else 'timestamp'].iloc[:3]]
+        curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe=timeframe)
+    r.update('2026-10-30 10:47:03', signal_close=20000 + direction)
+    assert request(r, payload=dict(contract_code='TMF209912', action=action, quantity=1,
+        price=0, price_type='MKT', order_type='IOC', simulation=True, confirmed=True)).status_code == 202
+    r.runtime.step()
+    r.runtime.step()
+    order = r.service.orders()[0]
+    response = r.client.post('/api/commands', json=dict(id='risk-curve', name='update_risk', target=order['id'],
+        payload=dict(curve_id=curve_id, stop_price=order['stop_price'], target_price=None,
+                     breakeven_enabled=False, risk_revision=order['risk_revision'])))
+    assert response.status_code == 202
+    r.runtime.step()
+    command = r.client.get('/api/commands/risk-curve').json()
+    assert command['state'] == 'succeeded', command
+    assert command['result']['curve_timeframe'] == timeframe
+    assert command['result']['target_price'] is None
+    assert len(r.broker.trades) == 1
+    r.update('2026-10-30 10:48:03', signal_close=20000 + direction, tick=20000 - direction)
+    r.runtime.step()
+    assert len(r.broker.trades) == 1  # tick alone cannot trigger curve profit taking
+    r.update('2026-10-30 10:49:03', signal_close=20000 - direction)
+    r.runtime.step()
+    r.runtime.step()
+    closed = r.service.orders()[0]
+    assert len(r.broker.trades) == 2
+    assert closed['trigger_reason'] == 'curve' and closed['exit_status'] == 'Filled'
+    assert closed['exit_filled_quantity'] == 1 and not closed['active']
+    assert closed['curve_timeframe'] == timeframe and r.broker.position == 0
 
 
 def test_independent_trade_notifies_confirmed_open_and_close(rig, monkeypatch):
@@ -247,6 +311,44 @@ def test_snapshot_requests_never_trigger_broker_synchronization(rig):
     r.broker.margin = forbidden
     for _ in range(3):
         assert r.client.get('/api/snapshot').status_code == 200
+
+
+def test_session_down_skips_margin_and_finishes_queued_commands_without_relogin(rig):
+    r = rig
+    r.runtime.step()
+    r.service._session_down.set()
+    r.mono[0] += 61  # margin refresh is due on the same cycle as the disconnect
+    request(r)
+    r.runtime.step()
+    result = r.client.get('/api/commands/order-1').json()
+    assert result['state'] == 'failed'
+    assert '恢復中' in result['result']['detail']
+    assert len(r.apis) == 1 and not r.broker.trades
+    events = [json.loads(line) for line in (r.path.parent / 'logs' / 'trade_events.jsonl').read_text().splitlines()]
+    assert not any(event['event'] == 'trade_cycle_failed' for event in events)
+    status = r.client.get('/api/snapshot').json()['status']
+    assert status['session_present'] and not status['broker_ready']
+    assert 'session_down' in status['error'] and '自動重連已停用' in status['error']
+
+
+def test_snapshot_age_is_checked_even_with_a_fresh_heartbeat(rig):
+    r = rig
+    r.runtime.step()
+    r.now[0] += pd.Timedelta(seconds=r.service.health_settings.heartbeat_seconds + 1)
+    r.service._publish_health(state='healthy')
+    status = r.client.get('/api/snapshot').json()['status']
+    assert not status['connected'] and not status['broker_ready']
+    assert '快照已過期' in status['error']
+    assert not status['protection']['fixed_exit']
+
+
+def test_fresh_snapshot_reports_worker_failure_instead_of_expiry(rig):
+    r = rig
+    r.runtime.step()
+    r.service._publish_health(state='failed', error={'kind': 'other', 'type': 'ValueError'})
+    status = r.client.get('/api/snapshot').json()['status']
+    assert not status['connected']
+    assert '背景工作失敗' in status['error'] and '已過期' not in status['error']
 
 
 def test_restart_preserves_unknown_processing_command(rig):
@@ -349,6 +451,136 @@ def test_curve_modification_cancels_old_armed_version(rig):
     r.update('2026-10-30 09:04:03', close=20001)
     r.runtime.step()
     assert r.service.curve_entry.snapshot()['state'] == 'cancelled'
+    assert not r.broker.trades
+
+
+def test_15m_curve_can_arm_and_trigger_on_adjacent_closed_minutes(rig):
+    r = rig
+    r.update('2026-10-30 09:17:03', close=19999)
+    with db.session(r.path) as conn:
+        for code in ('TMFR1', 'TMF209912'):
+            bars = pd.DataFrame([dict(minute_start=at, open=19999, high=19999, low=19999,
+                close=19999, volume=1, amount=19999)
+                for at in pd.date_range('2026-10-30 08:45', '2026-10-30 09:16', freq='min')])
+            db.upsert_minute_bars(conn, code, sb.add_sessions(bars))
+        curve = db.insert_trendline(conn, 'TMFR1', [
+            dict(time=int(pd.Timestamp(stamp).timestamp()), price=20000)
+            for stamp in ('2026-10-30 08:45', '2026-10-30 09:00', '2026-10-30 09:15')],
+            kind='curve', timeframe='15m')
+    response = request(r, identity='arm-15m', name='arm_curve', payload=dict(curve_id=curve,
+        contract_code='TMF209912', quantity=1, simulation=True, confirmed=True, action='Buy'))
+    assert response.status_code == 202
+    r.runtime.step()
+    assert r.client.get('/api/commands/arm-15m').json()['result']['timeframe'] == '15m'
+    r.update('2026-10-30 09:18:03', close=19999)
+    r.runtime.step()
+    assert not r.broker.trades
+    r.update('2026-10-30 09:19:03', close=20001)
+    r.runtime.step()
+    assert len(r.broker.trades) == 1
+    assert r.service.curve_entry.snapshot()['state'] == 'triggered'
+
+
+def test_pending_minute_selection_skips_large_history_and_keeps_order(monkeypatch):
+    stamps = pd.date_range('2026-09-01', periods=50000, freq='min')
+    closed = pd.DataFrame({'minute_start': stamps})
+    # Selecting pending work must not revisit 50,000 old per-row Series.
+    monkeypatch.setattr(pd.DataFrame, 'iloc', property(lambda self: pytest.fail('selector scanned rows')))
+    assert _pending_minute_indices(closed, str(stamps[-5]), str(stamps[-4])) == [49997, 49998, 49999]
+    assert _pending_minute_indices(closed, str(stamps[-1]), str(stamps[-1])) == []
+    assert _pending_minute_indices(closed, str(stamps[-2]), None) == [49998, 49999]
+
+
+def test_closed_price_uses_only_latest_closed_row_without_loading_history(rig, monkeypatch):
+    r = rig
+    r.runtime.step()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('latest close must not load historical frame')
+    monkeypatch.setattr(db, 'load_minute_bars', forbidden)
+    assert r.service.closed_price({'contract_code': 'TMF209912'}) == 20000
+    with db.session(r.path) as conn:
+        # An unfinished bar must not become a risk reference.
+        bars = pd.DataFrame([dict(minute_start=r.now[0].floor('min'), open=22000, high=22000,
+            low=22000, close=22000, volume=1, amount=22000)])
+        db.upsert_minute_bars(conn, 'TMF209912', sb.add_sessions(bars))
+    assert r.service.closed_price({'contract_code': 'TMF209912'}) == 20000
+    assert r.service.closed_price({'contract_code': 'TMF209912', 'created_at': '2026-10-30 09:02:00'}) is None
+
+
+def test_order_at_minute_boundary_uses_monitor_valid_previous_close(rig):
+    r = rig
+    # The 09:01 close is current at 09:02:03. At 09:03:01, the 09:02
+    # aggregate is still waiting for the configured 2-second close delay.
+    r.runtime.step()
+    r.update('2026-10-30 09:03:01')
+    with db.session(r.path) as conn:
+        conn.execute("DELETE FROM minute_bars WHERE minute_start='2026-10-30 09:02:00'")
+        conn.commit()
+    for publisher in r.health.values():
+        publisher.publish(state='healthy', bars=dict(ready=True, last_minute_start='2026-10-30 09:01:00'))
+    assert r.service.closed_price({'contract_code': 'TMF209912'}) == 20000
+    request(r, identity='boundary-order')
+    r.runtime.step()
+    assert r.client.get('/api/commands/boundary-order').json()['state'] == 'succeeded'
+    assert len(r.broker.trades) == 1
+    assert r.service.snapshot()['status']['contract_bars_ready']['TMF209912']
+
+
+@pytest.mark.parametrize('failure', ['quote', 'bars'])
+def test_manual_order_reports_specific_market_failure_without_broker_submit(rig, failure):
+    r = rig
+    r.runtime.step()
+    if failure == 'quote':
+        # Quotes expire, while the bars are still fresh.
+        r.now[0] += pd.Timedelta(seconds=11)
+        r.mono[0] += 11
+    else:
+        r.health['TMF209912'].publish(state='degraded', bars={'ready': False})
+    request(r, identity='specific-failure')
+    r.runtime.step()
+    result = r.client.get('/api/commands/specific-failure').json()
+    assert result['state'] == 'failed'
+    assert ('即時報價' if failure == 'quote' else 'monitor 或已收定') in result['result']['detail']
+    assert not r.broker.trades
+
+
+def test_old_closed_bars_still_block_even_with_fresh_tick_and_heartbeat(rig):
+    r = rig
+    r.runtime.step()
+    r.update('2026-10-30 09:06:04')
+    with db.session(r.path) as conn:
+        conn.execute("DELETE FROM minute_bars WHERE minute_start>'2026-10-30 09:01:00'")
+        conn.commit()
+    for publisher in r.health.values():
+        publisher.publish(state='healthy', bars=dict(ready=True, last_minute_start='2026-10-30 09:01:00'))
+    assert r.service.closed_price({'contract_code': 'TMF209912'}) is None
+    request(r, identity='old-bars')
+    r.runtime.step()
+    assert r.client.get('/api/commands/old-bars').json()['state'] == 'failed'
+    assert not r.broker.trades
+
+
+def test_curve_entry_checks_only_new_minutes_with_full_geometry(rig, monkeypatch):
+    r = rig
+    arm_curve(r, price=21000)
+    r.update('2026-10-30 09:03:03', close=19999)
+    r.update('2026-10-30 09:04:03', close=19999)
+    seen = []
+    import trade_service
+    def crossed(frame, *args):
+        seen.append(frame.copy())
+        return False
+    monkeypatch.setattr(trade_service, 'crossed_curve', crossed)
+    r.runtime.step()
+    assert len(seen) == 1
+    assert seen[0].minute_start.min() == pd.Timestamp('2026-10-30 08:55')
+    assert seen[0].minute_start.max() == pd.Timestamp('2026-10-30 09:03')
+    r.runtime.step()
+    assert len(seen) == 1  # no repeated calculation when no minute arrived
+    r.update('2026-10-30 09:05:03', close=19999)
+    r.runtime.step()
+    entry = r.service.curve_entry.snapshot()
+    assert entry['last_checked_minute'] == '2026-10-30 09:04:00'
     assert not r.broker.trades
 
 

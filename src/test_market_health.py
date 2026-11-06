@@ -86,6 +86,40 @@ def test_lag_uses_seconds_and_opening_grace_does_not_certify_old_data():
     assert not result["ready"] and result["opening_grace"]
 
 
+@pytest.mark.parametrize('lag', [180, 90.5])
+def test_cached_validation_matches_uncached_across_time_boundaries(lag):
+    calendar = mh.SessionCalendar(calendar_document())
+    frame = bars('2026-10-28 04:53', '2026-10-28 04:57')
+    cache = mh.BarValidationCache()
+    # Includes lag expiry inside a minute, new closed minutes, session end,
+    # backward clock movement, a corrected frame and a changed calendar.
+    for stamp in ['04:58:00', '04:59:30', '04:59:30.500', '04:59:31',
+                  '04:59:59', '05:00:00', '05:01:00', '04:58:00']:
+        now = pd.Timestamp(f'2026-10-28 {stamp}')
+        options = dict(since='2026-10-28 04:53', lag_seconds=lag,
+                       pending_repair_minutes=[pd.Timestamp('2026-10-28 04:58')])
+        assert cache.validate(frame, now, calendar, **options) == mh.validate_bars(frame, now, calendar, **options)
+    for updated_frame, updated_calendar in [(bars('2026-10-28 04:53', '2026-10-28 04:59'), calendar),
+                                             (frame, mh.SessionCalendar())]:
+        assert cache.validate(updated_frame, now, updated_calendar, **options) == mh.validate_bars(updated_frame, now, updated_calendar, **options)
+
+
+def test_validation_cache_reuses_history_but_updates_lag_each_second(monkeypatch):
+    calendar = mh.SessionCalendar(calendar_document())
+    frame = bars('2026-10-27 19:00', '2026-10-27 19:06')
+    cache = mh.BarValidationCache()
+    calls = []
+    original = calendar.expected_minutes
+    def expected(*args):
+        calls.append(args)
+        return original(*args)
+    monkeypatch.setattr(calendar, 'expected_minutes', expected)
+    results = [cache.validate(frame, f'2026-10-27 19:09:{second:02}', calendar, since='2026-10-27 19:00')
+               for second in range(10)]
+    assert len(calls) == 1
+    assert results[0]['lag_seconds'] == 120 and results[-1]['lag_seconds'] == 129
+
+
 def test_unknown_or_expired_calendar_never_certifies_recovery():
     frame = bars("2026-10-27 19:00", "2026-10-27 19:09")
     assert not mh.validate_bars(frame, "2026-10-27 19:10", mh.SessionCalendar(), since="2026-10-27 19:00")["ready"]

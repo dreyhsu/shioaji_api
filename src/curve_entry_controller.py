@@ -66,7 +66,7 @@ class CurveEntryController:
             closed = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now]
             if (curve is None or curve["timeframe"] not in tl.TIMEFRAME_MINUTES
                     or not tl.anchor_indices(tl.source_bars(closed, curve["timeframe"]), curve["anchors"], "curve")):
-                raise ValueError("請選擇已保存、有效的 1m／5m／1h 曲線")
+                raise ValueError("請選擇已保存、有效的 1m／5m／15m／1h 曲線")
             service.subscribe_contract(contract_code)
             try:
                 with db.session(service.db_path) as conn:

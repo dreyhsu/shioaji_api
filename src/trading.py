@@ -713,7 +713,7 @@ class TradingService:
         return crossed_exit(row["action"], price, float(row["stop_price"]), target)
 
     def _curve_close_break(self, row: dict) -> str | None:
-        """Evaluate completed 1m closes against the saved 1h curve."""
+        """Evaluate completed 1m closes in the saved curve source timeframe."""
         if not self._curve_data_ready():
             return "curve_unavailable"
         cache_key = (
@@ -725,7 +725,7 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
+                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
                 (int(row["curve_id"]), row["code"]),
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
@@ -734,7 +734,7 @@ class TradingService:
             return "curve_unavailable"
 
         now = pd.Timestamp(self._now())
-        minutes = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now]
+        minutes = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now].reset_index(drop=True)
         if len(minutes) < 2:
             self._curve_break_cache[cache_key] = (time.monotonic(), "curve_unavailable")
             return "curve_unavailable"
@@ -758,28 +758,18 @@ class TradingService:
             self._curve_break_cache[cache_key] = (time.monotonic(), None)
             return None
 
-        hourly = sb.minute_bars_to_hourly(minutes)
-        points = tl.anchor_indices(hourly, json.loads(curve["anchors"]), "curve")
+        timeframe = curve['timeframe']
+        source = tl.source_bars(minutes, timeframe)
+        anchors = json.loads(curve['anchors'])
+        points = tl.anchor_indices(source, anchors, "curve")
         if not points:
             self._curve_break_cache[cache_key] = (time.monotonic(), "curve_unavailable")
             return "curve_unavailable"
 
-        def value_at_minute(stamp: pd.Timestamp) -> float | None:
-            bucket = sb.hour_start_of(stamp)
-            if bucket is None:
-                return None
-            starts = pd.to_datetime(hourly["hour_start"])
-            indices = hourly.index[starts == bucket]
-            if len(indices) == 0:
-                return None
-            index = int(indices[0])
-            fraction = (stamp - bucket).total_seconds() / 3600.0
-            return tl.value_at(points, index + fraction, "curve")
-
-        eligible = [
-            index for index, stamp in enumerate(minutes["minute_start"])
-            if pd.Timestamp(stamp) >= check_from
-        ]
+        eligible = minutes.index[minutes['minute_start'] >= check_from].tolist()
+        positions = sorted({position for index in eligible if index > 0 for position in (index - 1, index)})
+        projected = tl.values_at_times(source, anchors, minutes.iloc[positions]['minute_start'], timeframe=timeframe)
+        values = dict(zip(positions, projected))
         result = None
         for index in eligible:
             if index == 0:
@@ -787,9 +777,8 @@ class TradingService:
             previous, current = minutes.iloc[index - 1], minutes.iloc[index]
             if pd.Timestamp(current["minute_start"]) - pd.Timestamp(previous["minute_start"]) != pd.Timedelta(minutes=1):
                 continue
-            previous_curve = value_at_minute(pd.Timestamp(previous["minute_start"]))
-            current_curve = value_at_minute(pd.Timestamp(current["minute_start"]))
-            if previous_curve is None or current_curve is None:
+            previous_curve, current_curve = values[index - 1], values[index]
+            if not math.isfinite(previous_curve) or not math.isfinite(current_curve):
                 result = "curve_unavailable"
                 continue
             if crossed_curve_close(
@@ -808,21 +797,18 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
+                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
                 cache_key,
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
         if curve is None or minutes.empty:
             self._curve_cache[cache_key] = (time.monotonic(), None)
             return None
-        hourly = sb.minute_bars_to_hourly(minutes)
-        points = tl.anchor_indices(hourly, json.loads(curve["anchors"]), "curve")
-        # Match the fractional hour used by the 1m crossing evaluator.
+        source = tl.source_bars(minutes, curve['timeframe'])
+        # Use the same fractional source-bar geometry as the chart and signals.
         stamp = pd.Timestamp(minutes.iloc[-1]["minute_start"])
-        bucket = sb.hour_start_of(stamp)
-        fraction = 0 if bucket is None else (stamp - bucket).total_seconds() / 3600.0
-        value = None if not points else tl.value_at(points, len(hourly) - 1 + fraction, "curve")
-        result = None if value is None else float(value)
+        value = tl.values_at_times(source, json.loads(curve['anchors']), [stamp], timeframe=curve['timeframe']).iloc[0]
+        result = None if not math.isfinite(value) else float(value)
         self._curve_cache[cache_key] = (time.monotonic(), result)
         return result
 
@@ -1010,7 +996,7 @@ class TradingService:
                 with db.session(self.db_path) as conn:
                     conn.execute(
                         "UPDATE managed_orders SET error = ?, updated_at = ? WHERE id = ?",
-                        ("1 小時曲線或已收盤 1 分 K 資料暫不可用；曲線停利暫停，固定停損仍監控", self._now().isoformat(sep=" "), row["id"]),
+                        ("停利曲線或已收盤 1 分 K 資料暫不可用；曲線停利暫停，固定停損仍監控", self._now().isoformat(sep=" "), row["id"]),
                     )
                     conn.commit()
 
@@ -1193,7 +1179,7 @@ class TradingService:
         if curve_id is not None:
             with db.session(self.db_path) as conn:
                 curve = conn.execute(
-                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
+                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
                     (int(curve_id), self.code),
                 ).fetchone()
             if curve is None:
@@ -1312,10 +1298,10 @@ class TradingService:
                 raise ValueError("多單 stop 須低於 target；空單 stop 須高於 target")
         else:
             with db.session(self.db_path) as conn:
-                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
+                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
                                      (curve_id, row["code"])).fetchone()
             if curve is None:
-                raise ValueError("選用的 1 小時曲線不存在或已刪除")
+                raise ValueError("選用的停利曲線不存在或已刪除")
         # Disabling and loosening require separate saves. A stale editor can never
         # silently remove protection that was installed by a tick callback.
         if row.get("breakeven_enabled") and row.get("breakeven_triggered_at"):
@@ -1380,7 +1366,7 @@ class TradingService:
             raise ValueError("選用曲線目前無法計算")
         with db.session(self.db_path) as conn:
             record = conn.execute(
-                "SELECT anchors FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND timeframe = '1h' AND enabled = 1",
+                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
                 (row["curve_id"], row["code"]),
             ).fetchone()
             if record is None:
@@ -1471,6 +1457,12 @@ class TradingService:
             "error", "created_at", "updated_at",
         )}
         item.update(self._order_breakeven_settings(row))
+        item['curve_timeframe'] = None
+        if row.get('curve_id') is not None:
+            with db.read_session(self.db_path) as conn:
+                curve = conn.execute('SELECT timeframe FROM trendlines WHERE id=? AND code=?',
+                                     (row['curve_id'], row['code'])).fetchone()
+            item['curve_timeframe'] = curve['timeframe'] if curve else None
         item["curve_price"] = self._curve_value(row) if row.get("curve_id") is not None else None
         entry = row.get("avg_fill_price") or row.get("price")
         item["default_stop_price"] = item["default_target_price"] = None

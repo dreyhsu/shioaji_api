@@ -16,19 +16,21 @@ command_id = ContextVar('trade_command_id', default=None)
 
 
 class TradeClient:
-    def __init__(self, db_path, code, *, url='http://127.0.0.1:8766', mode='simulation', timeout=10):
+    def __init__(self, db_path, code, *, url='http://127.0.0.1:8766', mode='simulation', timeout=10,
+                 request_timeout=8):
         parsed = urlparse(url)
         if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', '::1', 'localhost'} or parsed.username or parsed.password or parsed.path not in {'', '/'}:
             raise ValueError('trade URL 必須是本機 HTTP 位址')
         self.db_path, self.code = Path(db_path), code
         self.url, self.mode, self.timeout = url.rstrip('/'), mode, timeout
+        self.request_timeout = request_timeout
         self.curve_entry = CurveClient(self)
 
     def _request(self, path, payload=None):
         request = Request(self.url + path, data=None if payload is None else json.dumps(payload).encode(),
                           headers={'Content-Type': 'application/json'})
         try:
-            with urlopen(request, timeout=2) as response:
+            with urlopen(request, timeout=self.request_timeout) as response:
                 return json.load(response)
         except HTTPError as error:
             try:
@@ -37,7 +39,9 @@ class TradeClient:
                 detail = 'trade API 拒絕請求'
             raise HTTPException(error.code, detail) from None
         except (URLError, TimeoutError, OSError) as error:
-            raise HTTPException(503, 'trade 服務無法連線；請核對原指令結果，勿另建指令重送') from error
+            timed_out = isinstance(error, TimeoutError) or isinstance(getattr(error, 'reason', None), TimeoutError)
+            detail = 'trade API 回應逾時' if timed_out else '暫時無法連線至 trade 本機 API'
+            raise HTTPException(504 if timed_out else 503, detail) from error
 
     def _snapshot(self):
         result = self._request('/api/snapshot')
@@ -81,11 +85,23 @@ class TradeClient:
         if not identity:
             raise HTTPException(400, '交易請求必須提供 Idempotency-Key')
         self._snapshot()  # verify DB/code/mode before accepting any action
-        result = self._request('/api/commands', dict(id=identity, name=name, target=target, payload=payload or {}))
+        try:
+            result = self._request('/api/commands', dict(id=identity, name=name, target=target, payload=payload or {}))
+        except HTTPException as error:
+            if error.status_code not in {502, 503, 504}:
+                raise
+            # A lost POST response is ambiguous. Query this ID; never POST again.
+            result = {'state': 'accepted'}
         deadline = time.monotonic() + self.timeout
         while result['state'] in {'accepted', 'processing'} and time.monotonic() < deadline:
             time.sleep(.1)
-            result = self.command(identity)
+            try:
+                result = self.command(identity)
+            except HTTPException as error:
+                if error.status_code not in {404, 502, 503, 504}:
+                    raise
+                # A transient read failure says nothing about command execution.
+                continue
         if result['state'] == 'succeeded':
             return result['result']
         if result['state'] in {'accepted', 'processing', 'unknown'}:

@@ -16,9 +16,10 @@ tuned from ``config/alerts.json``:
 * ``trendline_break_below_up``   -- close below a *rising* line.  Once per line.
 * ``trendline_break_above_down`` -- close above a *falling* line.  Once per line.
 
-A line's value and slope are read at the newest hourly bar (normally the forming
-one), the same bar-index maths the chart draws with, so past its end point a
-line carries on along its end tangent.
+A line's value and slope are read at the newest bar of its saved source
+timeframe (normally the forming one), using the chart's bar-index maths. Past
+its end point a line carries on along its end tangent. Rules still run on
+closed 1-minute candles, including for 5m, 15m and 1h drawings.
 
 This module only decides; throttling (the cooldown and the once-per-line rule)
 lives in ``monitor.send_rule`` because it needs the alert history in the DB.
@@ -221,7 +222,7 @@ def _exit_rules(code, close, prev_close, minute_start, boxes, config: AlertConfi
 
 
 def line_now(hourly: pd.DataFrame, line: dict) -> tuple[float, float] | None:
-    """``(value, slope_per_bar)`` of a drawn line at the newest hourly bar."""
+    """``(value, slope_per_bar)`` at the newest source-timeframe bar."""
     if hourly is None or len(hourly) < 2:
         return None
     kind = line.get("kind") or "line"
@@ -240,13 +241,20 @@ def line_now(hourly: pd.DataFrame, line: dict) -> tuple[float, float] | None:
     return float(value), float(value - previous)
 
 
-def _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config) -> list[Candidate]:
+def _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config,
+                     minute_bars=None) -> list[Candidate]:
     out = []
+    sources = {"1h": hourly}
     for line in trendlines or []:
-        if line.get("timeframe", "1h") != "1h":
+        timeframe = line.get("timeframe", "1h")
+        if timeframe not in tl.TIMEFRAME_MINUTES:
             continue
+        if timeframe not in sources:
+            if minute_bars is None or minute_bars.empty:
+                continue
+            sources[timeframe] = tl.source_bars(minute_bars, timeframe)
         kind = line.get("kind") or "line"
-        now = line_now(hourly, line)
+        now = line_now(sources[timeframe], line)
         if now is None:
             continue
         value, slope = now
@@ -268,6 +276,7 @@ def _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, 
                         line_value=value,
                         slope=slope,
                         minute_start=minute_start,
+                        timeframe=timeframe,
                     ),
                 )
             )
@@ -313,6 +322,7 @@ def evaluate(
     trendlines: list[dict],
     hourly_atr: float | None,
     config: AlertConfig,
+    minute_bars: pd.DataFrame | None = None,
 ) -> list[Candidate]:
     """Every rule the newest minute satisfies, before any throttling.
 
@@ -329,5 +339,6 @@ def evaluate(
         out += _box_rules(code, close, minute_start, side, boxes.get(side), config)
     prev_close = None if prev_minute_bar is None else float(prev_minute_bar["close"])
     out += _exit_rules(code, close, prev_close, minute_start, boxes, config)
-    out += _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config)
+    out += _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config,
+                            minute_bars=minute_bars)
     return out

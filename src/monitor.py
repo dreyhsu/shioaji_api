@@ -217,6 +217,7 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
         boxes={side: snr.current_box(state.boxes, side) for side in SIDES},
         prev_minute_bar=bars.iloc[-2] if len(bars) >= 2 else None,
         hourly=state.hourly,
+        minute_bars=bars,
         trendlines=db.load_trendlines(conn, config.code),
         hourly_atr=state.hourly_atr,
         config=alerts,
@@ -478,6 +479,12 @@ class MonitorRuntime:
         self.last_fetch = float('-inf')
         self.last_frame = None
         self.last_state = None
+        self._source_token = self._source_raw = self._source_frame = self._source_minute = None
+        self._applied_frame = None
+        self._applied_rows = {}
+        self._validation_bars = self._validation_version = None
+        self._validator = mh.BarValidationCache()
+        self._calendar_token = self._cached_calendar = None
         self.signals_ready = False
         self.ready_since = None
         self.audit_path = Path(config.db_path).resolve().parent / 'logs' / 'monitor.log'
@@ -547,14 +554,30 @@ class MonitorRuntime:
                         if inserted:
                             records.append(record)
                     offset = stream.tell()
-            self.conn.execute('INSERT OR REPLACE INTO monitor_event_offsets VALUES (?,?)', (key, offset))
-            self.conn.commit()
-            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.audit_path.open('a', encoding='utf-8') as output:
-                for record in records:
-                    text = json.dumps(record, ensure_ascii=False)
-                    output.write(text + '\n')
-                    log(text)
+            if saved is None or saved[0] != offset:
+                self.conn.execute('INSERT OR REPLACE INTO monitor_event_offsets VALUES (?,?)', (key, offset))
+                self.conn.commit()
+            if records:
+                self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.audit_path.open('a', encoding='utf-8') as output:
+                    for record in records:
+                        text = json.dumps(record, ensure_ascii=False)
+                        output.write(text + '\n')
+                        log(text)
+
+    def _load_calendar(self):
+        if self.calendar is not None:
+            return self.calendar
+        path = Path(self.settings.calendar_path)
+        try:
+            stat = path.stat()
+            token = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            token = None
+        if token is None or token != self._calendar_token or self._cached_calendar is None:
+            self._cached_calendar = mh.SessionCalendar.load(path)
+            self._calendar_token = token
+        return self._cached_calendar
 
     def _read_source(self, now):
         import sqlite3
@@ -572,15 +595,34 @@ class MonitorRuntime:
                                   (self.config.code, mh.iso(self.since)))
                 self.conn.commit()
                 self.origin_pending = False
-            records = source.execute('''SELECT * FROM market_stream_bars
-                WHERE code=? AND mode=? AND minute_start>=? ORDER BY minute_start, source''',
-                (self.config.code, self.config.mode, mh.iso(self.since))).fetchall()
+            versioned = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='market_bar_versions'").fetchone()
+            token = None
+            if versioned:
+                identity = source.execute('SELECT identity FROM market_storage_identity WHERE singleton=1').fetchone()[0]
+                revision = source.execute('SELECT revision FROM market_bar_versions WHERE code=? AND mode=?',
+                                          (self.config.code, self.config.mode)).fetchone()
+                token = (str(path), identity, revision[0] if revision else 0, self.since)
+            # A bar-specific revision is essential: SQLite data_version also changes
+            # on every quote update. Legacy sources remain correct via full reads.
+            reload = token is None or token != self._source_token or self._source_raw is None
+            if reload:
+                records = source.execute('''SELECT * FROM market_stream_bars
+                    WHERE code=? AND mode=? AND minute_start>=? ORDER BY minute_start, source''',
+                    (self.config.code, self.config.mode, mh.iso(self.since))).fetchall()
             quotes = source.execute('SELECT * FROM market_latest_quotes WHERE mode=?',
                                     (self.config.mode,)).fetchall()
-        frame = pd.DataFrame([dict(row) for row in records])
+        minute = now.floor('min')
+        if not reload and minute == self._source_minute:
+            return self._source_frame, quotes
+        if reload:
+            raw = pd.DataFrame([dict(row) for row in records])
+            if not raw.empty:
+                raw['minute_start'] = pd.to_datetime(raw['minute_start'])
+        else:
+            raw = self._source_raw
+        frame = raw
         self.incomplete_stream_minutes = []
         if not frame.empty:
-            frame['minute_start'] = pd.to_datetime(frame['minute_start'])
             broker_minutes = set(frame.loc[(frame['source'] == 'broker') & (frame['complete'] == 1), 'minute_start'])
             self.incomplete_stream_minutes = [stamp for stamp in frame.loc[
                 (frame['source'] == 'stream') & (frame['complete'] == 0), 'minute_start']
@@ -590,7 +632,32 @@ class MonitorRuntime:
             # Broker revisions always supersede local tick aggregates.
             frame = frame.sort_values('source', ascending=False).drop_duplicates('minute_start', keep='last')
             frame = frame.sort_values('minute_start')
+        self._source_token, self._source_raw = token, raw
+        self._source_frame, self._source_minute = frame, minute
         return frame, quotes
+
+    def _sync_bars(self, fresh):
+        """Stage only changed minutes; acknowledge the frame after the DB commit."""
+        if fresh is self._applied_frame:
+            return self._applied_rows
+        columns = ('source', 'open', 'high', 'low', 'close', 'volume', 'amount')
+        rows = {mh.iso(row.minute_start): tuple(getattr(row, key) for key in columns)
+                for row in fresh.itertuples()}
+        # A late invalidation can retract an older tick minute. A time watermark
+        # alone would miss both this case and historical broker corrections.
+        imported = self.conn.execute("SELECT minute_start FROM monitor_bar_sources WHERE code=? AND source='stream'",
+                                     (self.config.code,)).fetchall()
+        for row in imported:
+            if row[0] not in rows:
+                self.conn.execute('DELETE FROM minute_bars WHERE code=? AND minute_start=?', (self.config.code, row[0]))
+                self.conn.execute('DELETE FROM monitor_bar_sources WHERE code=? AND minute_start=?', (self.config.code, row[0]))
+        changed = [self._applied_rows.get(stamp) != values for stamp, values in rows.items()]
+        if any(changed):
+            delta = fresh.loc[changed]
+            db.upsert_minute_bars(self.conn, self.config.code, sb.add_sessions(delta), commit=False)
+            self.conn.executemany('INSERT OR REPLACE INTO monitor_bar_sources VALUES (?,?,?)',
+                [(self.config.code, mh.iso(row.minute_start), row.source) for row in delta.itertuples()])
+        return rows
 
     def _stream_readiness(self, frame, quotes, now):
         """Allow a complete live tail once broker history reaches its start."""
@@ -633,40 +700,31 @@ class MonitorRuntime:
             self._audit_events()  # audit survives even when the acquisition DB is unavailable
             if self.monotonic() - self.last_fetch < self.config.poll_seconds:
                 return
-            calendar = self.calendar or mh.SessionCalendar.load(self.settings.calendar_path)
+            calendar = self._load_calendar()
             fresh, quotes = self._read_source(now)
             # Routine work does not invalidate the last completed validation.
             # Consumers bound its age and the duration of this operation.
             self.publisher.publish(operation='derive', operation_started=mh.iso(now))
-            # Remove previously imported candidates invalidated by a late tick or reconnect.
-            valid = set() if fresh.empty else set(fresh['minute_start'].map(mh.iso))
-            imported = self.conn.execute('SELECT minute_start FROM monitor_bar_sources WHERE code=? AND source=\'stream\'',
-                                         (self.config.code,)).fetchall()
-            for row in imported:
-                if row[0] not in valid:
-                    self.conn.execute('DELETE FROM minute_bars WHERE code=? AND minute_start=?',
-                                      (self.config.code, row[0]))
-                    self.conn.execute('DELETE FROM monitor_bar_sources WHERE code=? AND minute_start=?',
-                                      (self.config.code, row[0]))
-            if not fresh.empty:
-                db.upsert_minute_bars(self.conn, self.config.code, sb.add_sessions(fresh), commit=False)
-                self.conn.executemany('INSERT OR REPLACE INTO monitor_bar_sources VALUES (?,?,?)',
-                    [(self.config.code, mh.iso(row.minute_start), row.source) for row in fresh.itertuples()])
+            applied_rows = self._sync_bars(fresh)
             self.conn.executemany('''INSERT OR REPLACE INTO market_latest_quotes
                 VALUES (?,?,?,?,?,?,?,?)''', [tuple(row) for row in quotes])
             self.conn.commit()
-            bars = db.load_minute_bars(self.conn, self.config.code, since=mh.iso(self.since))
-            validation = mh.validate_bars(bars, now, calendar, since=self.since,
+            self._applied_frame, self._applied_rows = fresh, applied_rows
+            version = (db.chart_versions(self.conn, self.config.code)[0], self.since)
+            if version != self._validation_version:
+                self._validation_bars = db.load_minute_bars(self.conn, self.config.code, since=mh.iso(self.since))
+                self._validation_version = version
+            validation = self._validator.validate(self._validation_bars, now, calendar, since=self.since,
                                            lag_seconds=self.settings.bar_lag_seconds,
                                            pending_repair_minutes=self.incomplete_stream_minutes)
             unverified = self.conn.execute("SELECT COUNT(*) FROM monitor_bar_sources WHERE code=? AND source='stream'",
                                            (self.config.code,)).fetchone()[0]
             stream_ready, stream_error = self._stream_readiness(fresh, quotes, now)
             ready = validation['ready'] and stream_ready
-            if self.last_frame is None or not fresh.equals(self.last_frame) or (ready and not self.signals_ready):
+            if self.last_frame is None or (fresh is not self.last_frame and not fresh.equals(self.last_frame)) or (ready and not self.signals_ready):
                 self.last_state = run_cycle(None, None, self.conn, self.config, self.watchers, self.recorder,
                                            self.alerts, fresh=pd.DataFrame(), allow_signals=ready)
-                self.last_frame = fresh.copy()
+            self.last_frame = fresh
             self.signals_ready = ready
             state = self.last_state
             self.last_fetch = self.monotonic()

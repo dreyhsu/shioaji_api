@@ -22,25 +22,85 @@
   let entryEnabled = false;
   let refreshing = false;
   let lastTradeStatusAt = 0;
+  let pendingCommandResolution = null;
+
+  async function resolvePendingCommand(pending) {
+    const status = await fetchRead('/api/trading/commands/' + encodeURIComponent(pending.id));
+    if (status.status === 404) return false;
+    if (!status.ok) return null;
+    const command = await status.json();
+    if (!['succeeded', 'failed'].includes(command.state)) return null;
+    return new Response(JSON.stringify(command.result || {}), {
+      status: command.http_status || (command.state === 'succeeded' ? 200 : 422),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  function clearPendingCommand(identity) {
+    const key = 'shioaji-trade-pending';
+    const current = JSON.parse(sessionStorage.getItem(key) || 'null');
+    if (current?.id === identity) sessionStorage.removeItem(key);
+  }
 
   async function tradeFetch(url, options) {
     const key = 'shioaji-trade-pending';
     const fingerprint = JSON.stringify([url, options.method, options.body || '']);
     let pending = JSON.parse(sessionStorage.getItem(key) || 'null');
-    if (pending && pending.fingerprint !== fingerprint) {
-      const status = await fetchRead('/api/trading/commands/' + encodeURIComponent(pending.id));
-      if (status.ok) {
-        const command = await status.json();
-        if (['succeeded', 'failed'].includes(command.state)) sessionStorage.removeItem(key);
+    if (pending) {
+      const resolved = await resolvePendingCommand(pending).catch(() => null);
+      if (resolved) {
+        clearPendingCommand(pending.id);
+        if (pending.fingerprint === fingerprint) return resolved;
+        throw new Error(`上一個指令 ${pending.id} 已確認完成；請核對畫面後再進行其他操作。`);
       }
-      throw new Error(`請先核對上一個交易指令 ${pending.id} 的結果，再進行其他操作。`);
+      if (resolved !== false || pending.fingerprint !== fingerprint) {
+        throw new Error(`指令 ${pending.id} 結果待確認，系統只查詢原指令，不重新送出。`);
+      }
+      // Only an explicit retry with the same input and a confirmed missing
+      // ledger record may submit again, always retaining this original ID.
     }
     pending ||= { id: crypto.randomUUID(), fingerprint };
     sessionStorage.setItem(key, JSON.stringify(pending));
-    const response = await fetch(url, { ...options,
-      headers: { ...(options.headers || {}), 'Idempotency-Key': pending.id } });
-    if (response.ok || [400, 404, 409, 422].includes(response.status)) sessionStorage.removeItem(key);
+    let response;
+    try {
+      response = await fetch(url, { ...options,
+        headers: { ...(options.headers || {}), 'Idempotency-Key': pending.id } });
+    } catch (error) {
+      const resolved = await resolvePendingCommand(pending).catch(() => null);
+      if (resolved) { clearPendingCommand(pending.id); return resolved; }
+      throw new Error(`指令 ${pending.id} 回應中斷，結果待確認；系統會查詢原指令。`);
+    }
+    if ([502, 503, 504].includes(response.status)) {
+      const resolved = await resolvePendingCommand(pending).catch(() => null);
+      if (resolved) { clearPendingCommand(pending.id); return resolved; }
+      throw new Error(`指令 ${pending.id} 回應較慢，結果待確認；系統會查詢原指令。`);
+    }
+    if (response.ok || [400, 404, 409, 422].includes(response.status)) clearPendingCommand(pending.id);
     return response;
+  }
+
+  async function refreshPendingCommand() {
+    if (pendingCommandResolution) return;
+    const key = 'shioaji-trade-pending';
+    const pending = JSON.parse(sessionStorage.getItem(key) || 'null');
+    if (!pending) return;
+    pendingCommandResolution = pending.id;
+    try {
+      const resolved = await resolvePendingCommand(pending);
+      if (!resolved) return;
+      const current = JSON.parse(sessionStorage.getItem(key) || 'null');
+      if (current?.id !== pending.id) return;
+      sessionStorage.removeItem(key);
+      const result = await resolved.json();
+      const text = resolved.ok ? '原交易指令已確認成功。' :
+        `原交易指令未成功：${result.detail?.message || result.detail || '請核對狀態'}`;
+      if (pending.fingerprint.includes('/api/trading/curve-entry')) $('entry-message').textContent = text;
+      else message(text, !resolved.ok);
+    } catch (error) {
+      // Retain the original ID through outages; regular refresh will query again.
+    } finally {
+      pendingCommandResolution = null;
+    }
   }
 
   async function fetchRead(url) {
@@ -93,7 +153,8 @@
     const displayPrice = info.market_quotes ? selectedQuote?.price : info.last_quote;
     const displayTime = info.market_quotes ? selectedQuote?.at : info.last_quote_at;
     connection.textContent = info.connected
-      ? (quoteReady ? `行情連線 · ${number(displayPrice)} · ${displayTime || ''}` : '帳戶已連線，等待即時行情 tick')
+      ? (quoteReady ? `行情連線 · ${number(displayPrice)} · ${displayTime || ''}`
+        : displayTime ? `帳戶已連線，行情快照過舊 · 最後資料 ${displayTime}` : '帳戶已連線，等待 monitor 行情資料')
       : (info.error || '尚未連線');
     connection.className = 'trade-connection ' + (info.connected && quoteReady ? 'ok' : 'bad');
     const protection = info.protection;
@@ -132,7 +193,7 @@
   }
 
   function exitCurves() {
-    return state.curves.filter((curve) => (curve.timeframe || '1h') === '1h');
+    return state.curves.filter((curve) => curve.kind === 'curve' && ['1m', '5m', '15m', '1h'].includes(curve.timeframe || '1h'));
   }
 
   async function loadCurves() {
@@ -151,7 +212,7 @@
       if (exitCurves().some((line) => String(line.id) === previous)) select.value = previous;
       const entrySelect = $('entry-curve');
       const entryPrevious = entrySelect.value;
-      entrySelect.replaceChildren(new Option('選擇手動保存的 1m／5m／1h 曲線', ''));
+      entrySelect.replaceChildren(new Option('選擇手動保存的 1m／5m／15m／1h 曲線', ''));
       for (const line of lines) entrySelect.add(new Option(curveLabel(line), String(line.id)));
       if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
       curvesListKey = listKey;
@@ -287,6 +348,7 @@
     const stop = Number(values.stop_price);
     const target = Number(values.target_price);
     return { ...order, ...values, risk_status: orderStatus(order), risk_editable: canManageCurve(order) && !riskSaving.has(order.id),
+      curve_timeframe: state.curves.find((curve) => Number(curve.id) === Number(values.curve_id))?.timeframe || order.curve_timeframe,
       stop_price: values.stop_price !== '' && Number.isFinite(stop) && stop > 0 ? stop : order.stop_price,
       target_price: values.curve_id ? null : values.target_price !== '' && Number.isFinite(target) && target > 0 ? target : order.target_price,
       curve_price: curvePrice(values.curve_id, order) };
@@ -479,7 +541,7 @@
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
       return `<div class="managed-order ${selected ? 'selected' : ''}" data-order-id="${escapeHtml(order.id)}" tabindex="0">
         <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${filled}/${order.quantity} 口</b><br>
-          <span class="managed-order-sub">${entryLabel} ${number(entry)} · 停損 ${number(order.stop_price)} · ${order.curve_id ? '1h 曲線；1m 收盤穿越停利' : `固定停利 ${number(order.target_price)}`}</span>
+          <span class="managed-order-sub">${entryLabel} ${number(entry)} · 停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} 曲線；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}</span>
         </div><span class="order-status ${order.active ? 'active' : ''}">${escapeHtml(orderStatus(order))}</span>${actionMarkup}</div>`;
     }).join('');
     list.querySelectorAll('[data-order-id]').forEach((item) => {
@@ -656,7 +718,7 @@
     const side = action === 'Buy' ? '多單' : '空單';
     const stop = entry && atr ? entry - (action === 'Buy' ? 1 : -1) * 2 * atr : null;
     const target = entry && atr ? entry + (action === 'Buy' ? 1 : -1) * 2 * atr : null;
-    const summary = `環境：${simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? '1h 曲線，1m K 收盤穿越觸發' : number(target)}\n\n確認送單？`;
+    const summary = `環境：${simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? `${state.curves.find((curve) => Number(curve.id) === curveId)?.timeframe || ''} 曲線，1m K 收盤穿越觸發` : number(target)}\n\n確認送單？`;
     if (!await confirmOperation(summary)) return;
     busy = true;
     $('trade-submit').disabled = true;
@@ -759,7 +821,9 @@
   }).catch(() => {});
   loadCurves().catch((error) => message(error.message, true));
   refreshTrading();
+  refreshPendingCommand();
   setInterval(() => {
+    refreshPendingCommand();
     if (lastTradeStatusAt && Date.now() - lastTradeStatusAt > 15000) {
       state.connected = state.entryReady = false;
       $('trade-connection').textContent = '交易狀態更新逾時';

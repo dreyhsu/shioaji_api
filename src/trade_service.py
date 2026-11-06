@@ -47,6 +47,14 @@ class OrderSession:
         return self.api.cancel_order(*args, **kwargs)
 
 
+def _pending_minute_indices(closed, check_from, watermark):
+    """Select work without constructing a pandas Series for every old minute."""
+    pending = closed['minute_start'] >= pd.Timestamp(check_from)
+    if watermark:
+        pending &= closed['minute_start'] > pd.Timestamp(watermark)
+    return [index for index in closed.index[pending] if index > 0]
+
+
 class ClosedMinuteEntry(CurveEntryController):
     """Consume adjacent completed minutes once; never replay expired entries."""
     def check(self):
@@ -73,15 +81,13 @@ class ClosedMinuteEntry(CurveEntryController):
                 return
             minutes = db.load_minute_bars(conn, service.code)
         now = pd.Timestamp(service._now())
-        closed = minutes[minutes['minute_start'] + pd.Timedelta(minutes=1) <= now]
+        closed = minutes[minutes['minute_start'] + pd.Timedelta(minutes=1) <= now].reset_index(drop=True)
         contract = service._find_contract(entry['contract_code'])
         if service._fresh_risk_quote({'contract_code': str(contract.code)}) is None:
             return
         watermark = entry.get('last_checked_minute')
-        for index in range(1, len(closed)):
+        for index in _pending_minute_indices(closed, entry['check_from'], watermark):
             stamp = pd.Timestamp(closed.iloc[index]['minute_start'])
-            if stamp < pd.Timestamp(entry['check_from']) or watermark and stamp <= pd.Timestamp(watermark):
-                continue
             elapsed = (now - stamp - pd.Timedelta(minutes=1)).total_seconds()
             if elapsed > 60:
                 self._update(entry['id'], last_checked_minute=mh.iso(stamp), error='訊號已超過收盤後 60 秒，略過')
@@ -266,7 +272,7 @@ class IndependentTradingService(TradingService):
 
     def load_quotes(self):
         mode = 'simulation' if self.simulation else 'production'
-        with db.session(self.db_path) as conn:
+        with db.read_session(self.db_path) as conn:
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='market_latest_quotes'").fetchone()
             rows = conn.execute('SELECT * FROM market_latest_quotes WHERE mode=?', (mode,)).fetchall() if exists else []
         self._quotes.clear()
@@ -326,16 +332,19 @@ class IndependentTradingService(TradingService):
                                    mode='simulation' if self.simulation else 'production')
         if not ready:
             return None
-        with db.session(self.db_path) as conn:
-            bars = db.load_minute_bars(conn, code)
-        bars = bars[bars['minute_start'] + pd.Timedelta(minutes=1) <= pd.Timestamp(self._now())]
-        if bars.empty:
+        cutoff = pd.Timestamp(self._now()).floor('min') - pd.Timedelta(minutes=1)
+        with db.read_session(self.db_path) as conn:
+            last = conn.execute('SELECT minute_start, close FROM minute_bars WHERE code=? AND minute_start<=? '
+                                'ORDER BY minute_start DESC LIMIT 1', (code, mh.iso(cutoff))).fetchone()
+        if last is None:
             return None
-        last = bars.iloc[-1]
-        if (pd.Timestamp(self._now()) - last['minute_start'] - pd.Timedelta(minutes=1)).total_seconds() > 60:
+        minute = pd.Timestamp(last['minute_start'])
+        # Share the monitor's freshness budget. A separate 60s cutoff falsely
+        # rejects the previous complete bar during the configured close delay.
+        if (pd.Timestamp(self._now()) - minute - pd.Timedelta(minutes=1)).total_seconds() > self.health_settings.bar_lag_seconds:
             return None
         # A position cannot react to a candle completed before it was entered.
-        if row.get('created_at') and last['minute_start'] + pd.Timedelta(minutes=1) <= pd.Timestamp(row['created_at']):
+        if row.get('created_at') and minute + pd.Timedelta(minutes=1) <= pd.Timestamp(row['created_at']):
             return None
         return float(last['close'])
 
@@ -387,8 +396,13 @@ class IndependentTradingService(TradingService):
         self.load_quotes()
         contract = self._find_contract(request['contract_code'])
         self._subscribe(contract)
-        if self._fresh_risk_quote({'contract_code': str(contract.code)}) is None:
-            raise ValueError('月份合約的新鮮報價或已驗證收定 1 分 K 尚未就緒')
+        reference = {'contract_code': str(contract.code)}
+        if super()._fresh_risk_quote(reference) is None:
+            raise ValueError(f'月份合約 {contract.code} 的即時報價缺少或已過期（行情／接收時間須在 '
+                             f'{self.health_settings.tick_stale_seconds:g} 秒內）')
+        if self.closed_price(reference) is None:
+            raise ValueError(f'月份合約 {contract.code} 的 monitor 或已收定 1 分 K 尚未就緒（K 棒時效上限 '
+                             f'{self.health_settings.bar_lag_seconds:g} 秒）')
         return super().place_order(request)
 
     def contracts(self):

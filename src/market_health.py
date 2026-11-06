@@ -156,8 +156,8 @@ class SessionCalendar:
         return set(pieces) - self.empty_minutes
 
 
-def validate_bars(bars, now, calendar, *, since, lag_seconds=180, pending_repair_minutes=()):
-    now, since = pd.Timestamp(now), pd.Timestamp(since)
+def _bar_validation_facts(bars, now, calendar, since, lag_seconds, pending_repair_minutes):
+    """History-sized work; facts change only with data or minute/maturity boundaries."""
     stamps = set(pd.to_datetime(bars["minute_start"])) if not bars.empty else set()
     closed = sorted(stamp for stamp in stamps if stamp + pd.Timedelta(minutes=1) <= now)
     latest = closed[-1] if closed else None
@@ -174,6 +174,13 @@ def validate_bars(bars, now, calendar, *, since, lag_seconds=180, pending_repair
     pending_repair = sorted((expected - stamps) & set(pd.to_datetime(list(pending_repair_minutes))))
     blocking_missing = sorted(set(missing) - set(pending_repair))
     expected_latest = max(expected) if expected else None
+    return dict(latest=latest, expected=bool(expected), expected_latest=expected_latest,
+                missing=missing, pending_repair=pending_repair, blocking_missing=blocking_missing,
+                future_count=sum(stamp > now for stamp in stamps))
+
+
+def _bar_validation_result(facts, now, calendar, since, lag_seconds):
+    latest, expected_latest = facts['latest'], facts['expected_latest']
     active = calendar.active(now)
     lag = (None if latest is None or expected_latest is None else
            max(0, ((now - pd.Timedelta(minutes=1) if active else expected_latest) - latest).total_seconds()))
@@ -181,18 +188,42 @@ def validate_bars(bars, now, calendar, *, since, lag_seconds=180, pending_repair
     opening_grace = (current_start is not None and (latest is None or latest < current_start)
                      and (now - current_start).total_seconds() <= lag_seconds + 60)
     covered = calendar.covered(now) and calendar.covered(since)
-    future_count = sum(stamp > now for stamp in stamps)
-    ready = (covered and not blocking_missing and not future_count and not opening_grace
-             and (not expected or latest is not None and lag is not None and lag <= lag_seconds))
+    ready = (covered and not facts['blocking_missing'] and not facts['future_count'] and not opening_grace
+             and (not facts['expected'] or latest is not None and lag is not None and lag <= lag_seconds))
     return {"ready": ready, "calendar_verified": covered, "calendar_error": calendar.error,
             "active_session": active, "opening_grace": opening_grace, "last_minute_start": iso(latest),
             "expected_minute_start": iso(expected_latest), "lag_seconds": lag,
-            "missing_count": len(missing), "missing_sample": [iso(stamp) for stamp in missing[:20]],
-            "blocking_missing_count": len(blocking_missing),
-            "pending_repair_count": len(pending_repair),
-            "pending_repair_sample": [iso(stamp) for stamp in pending_repair[:20]],
-            "future_count": future_count,
+            "missing_count": len(facts['missing']), "missing_sample": [iso(stamp) for stamp in facts['missing'][:20]],
+            "blocking_missing_count": len(facts['blocking_missing']),
+            "pending_repair_count": len(facts['pending_repair']),
+            "pending_repair_sample": [iso(stamp) for stamp in facts['pending_repair'][:20]],
+            "future_count": facts['future_count'],
             "validation_since": iso(since)}
+
+
+def validate_bars(bars, now, calendar, *, since, lag_seconds=180, pending_repair_minutes=()):
+    now, since = pd.Timestamp(now), pd.Timestamp(since)
+    facts = _bar_validation_facts(bars, now, calendar, since, lag_seconds, pending_repair_minutes)
+    return _bar_validation_result(facts, now, calendar, since, lag_seconds)
+
+
+class BarValidationCache:
+    """Reuse historical checks, but recompute time-sensitive readiness on every call.
+
+    Callers replace the bars frame/calendar when their contents change. Non-integral
+    lag budgets have a separate maturity boundary; caching by minute alone is unsafe.
+    """
+    def __init__(self):
+        self.bars = self.calendar = self.key = self.facts = None
+
+    def validate(self, bars, now, calendar, *, since, lag_seconds=180, pending_repair_minutes=()):
+        now, since = pd.Timestamp(now), pd.Timestamp(since)
+        key = (since, now.floor('min'), (now - pd.Timedelta(seconds=lag_seconds)).floor('min'),
+               lag_seconds, tuple(pending_repair_minutes))
+        if bars is not self.bars or calendar is not self.calendar or key != self.key:
+            facts = _bar_validation_facts(bars, now, calendar, since, lag_seconds, pending_repair_minutes)
+            self.bars, self.calendar, self.key, self.facts = bars, calendar, key, facts
+        return _bar_validation_result(self.facts, now, calendar, since, lag_seconds)
 
 
 def iso(value):

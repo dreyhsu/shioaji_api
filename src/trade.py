@@ -120,7 +120,7 @@ class TradeRuntime:
         return self.command(command.id)
 
     def command(self, command_id):
-        with db.session(self.service.db_path) as conn:
+        with db.read_session(self.service.db_path) as conn:
             row = conn.execute('SELECT * FROM trade_commands WHERE id=? AND code=? AND mode=?',
                                (command_id, self.service.code, self.mode)).fetchone()
         if row is None:
@@ -290,7 +290,7 @@ def create_app(service=None, *, start_loop=True, **service_options):
     @app.get('/api/snapshot')
     def snapshot():
         runtime = app.state.runtime
-        with db.session(runtime.service.db_path) as conn:
+        with db.read_session(runtime.service.db_path) as conn:
             row = conn.execute('SELECT * FROM trade_snapshots WHERE code=? AND mode=?',
                                (runtime.service.code, runtime.mode)).fetchone()
         result = json.loads(row['document'])

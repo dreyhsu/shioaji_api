@@ -28,6 +28,7 @@ use conda env tss
 
 - 目前交易規則以 **1 分 K 收定後** 判斷執行；不能擅自改成 tick 碰線即進場。獨立 trade 共用既有交易與曲線計算邏輯，逐一處理未判斷的相鄰已收盤分鐘。
 - Dashboard 保存曲線於共用 DB `trendlines`（控制點、商品、週期、啟用狀態）；進場啟用狀態與委託執行狀態由 trade 維護。畫線／保存本身不等於啟用進場。
+- Dashboard 支援 1m／5m／15m／1h 圖畫曲線並保存來源週期；各週期曲線皆可用於突破進場與逐單選擇的曲線停利，仍依相鄰已收定 1 分 K 判斷，幾何沿用曲線來源週期。直線維持 1h；預設固定風控的 ATR 仍使用 1h。
 - Dashboard 必須將 order／啟用／取消需求送給獨立 trade API，不在 Dashboard 程序內下單。指令須有持久化唯一 ID；逾時查狀態，不盲目重送。正式／模擬模式使用 `TradeClient`，不得回退為 Dashboard 內嵌券商連線；僅設定檔選擇的 Mock／注入測試保留原來離線交易引擎。
 - fetcher 預設寫 `data/market_fetchers.db` 的 `market_*` 資料表；monitor 透過 `--fetcher-db` 唯讀取得來源，透過 `--db` 寫統一資料庫（預設 `data/tmf.db`）。Dashboard／未來 trade 使用同一個統一 DB；不要直接跳過 monitor 讀 acquisition DB 作策略判斷。
 - monitor 僅匯入已收盤完整 K 棒，歷史 broker 資料優先於 tick 候選；晚到 tick／中斷造成失效的候選須撤回。來源與 simulation／production 綁定於統一 DB，同一 DB 不可切換來源或模式混用；最新價保留原始行情與接收時間。
@@ -48,7 +49,9 @@ use conda env tss
 
 - `trade.py` 為 loopback 常駐 API（預設 8766），所有券商 I/O 由單一背景執行緒依序執行；API 查詢僅讀背景快照。不得多 worker／reload 啟動多個登入。
 - `trade_service.py` 是既有 `TradingService` 的獨立程序適配層，不註冊行情 callback、不訂閱 tick、不抓歷史資料；`trading.py` 保留離線回放與既有委託／部位邏輯。
+- 曲線檢查先篩出尚未判斷的收定分鐘，不得每輪用 `iloc` 掃描全歷史而阻塞 trade 的行情快照；保留完整曲線來源幾何及逐一相鄰分鐘判斷。最新合約收盤價使用索引讀取最後已收定分鐘，不因查價載入全歷史。tick fetcher 持續接收行情不代表 trade 快照必然新鮮，兩者時間須分別檢查。
 - 自動進出場、固定停損／停利、保本均以已驗證收定 1 分 K 判斷。曲線使用 TMFR1，固定價格風控使用實際月份合約；兩者必須各有 monitor 健康狀態與共用 DB 資料，不將連續合約價格冒充月份合約價格。手動委託通過驗證後執行。
+- 月份合約收定 K 的時效沿用 monitor 的 `HealthSettings.bar_lag_seconds`，不得另外寫死 60 秒，造成收盤後正常 2 秒彙整／同步延遲期間誤拒單。報價新鮮度仍獨立檢查；曲線進場訊號的收盤後 60 秒有效期不變。
 - 2026-11-03：Dashboard 停損／停利調整區可逐單保存 `breakeven_trigger_points`（浮盈觸發點數）及 `breakeven_offset_points`（保留獲利點數）；未個別設定時沿用共用設定，預設 100／5。參數經 trade 持久化指令與風控版本檢查更新，不影響其他單。保本已觸發後，調高觸發點數不解除保護，調低保留點數不自動放寬既有 stop。
 - tick／kbar fetcher 的 `--codes` 須同時包含訊號商品與實際月份合約；kbar 支援多個合約共用同一 session、獨立回補游標。每個代碼用一個無券商連線的 monitor，寫入同一統一 DB。先啟動 fetcher，再啟動 monitor／trade。
 - trade 的「訂閱」指令只更新本機關注清單，尚未動態調整 fetcher 訂閱；換月須更新 fetcher／monitor 代碼。不可為每個月份合約額外建立一個券商 session。

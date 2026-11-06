@@ -47,10 +47,13 @@ TMFR1 曲線與實際月份合約有不同價格，不能互相當作固定停�
 ## 交易判斷
 
 - 自動曲線進場使用 DB 的相鄰已收盤 1 分 K。逐一處理未判斷分鐘，monitor 暫時 `checking` 不重設進場起點。超過收盤後 60 秒的進場訊號略過；新鮮 TMFR1 報價還須位於突破側。停用或修改曲線會取消舊啟用版本，送單前再次核對版本。
+- 曲線檢查先向量篩選 `check_from`／`last_checked_minute` 後尚未判斷的分鐘，再逐一處理；完整歷史仍供原曲線幾何計算使用。不能每輪以 pandas `iloc` 逐列掃描全部歷史而拖慢 tick 快照。最新月份合約收盤參考價以索引查詢最後一根已收定分鐘，不載入整段歷史；報價從統一 DB 唯讀取得，trade 不訂閱 tick、不繞過 monitor。
 - 目前沒有完整逐筆歷史可驗證「收盤前最後 10 秒的實際合約參考價」，因此未實作舊計畫中的額外價差補單模式；不宣稱已完成該項補單條件。
 - 固定停損／停利與保本改用月份合約最新已驗證收定 1 分 K，曲線出場使用 TMFR1 的相鄰收定分鐘。tick 只用於新鮮度與參考價檢查，不單靠觸價執行自動交易。新成交部位不回用進場前已收定的分鐘；不合成缺少的 K 棒。
+- 曲線停利可逐單選擇已保存的 1m／5m／15m／1h 曲線，沿用該曲線來源週期的控制點與投影；多單向下、空單向上穿越時出場，仍以相鄰收定 1 分 K 判斷。Dashboard 及 trade 均接受各週期曲線，固定停損與 1h ATR 預設不變。
 - Dashboard 選取已成交且可編輯的委託後，可在停損／停利調整區設定該筆的「浮盈觸發點數」與「保留獲利點數」，與保本開關、stop／target 一起儲存。兩者接受非負有限數字；未個別設定時沿用 `config/trading.json` 的 100／5 預設，個別設定持久化於 `managed_orders.breakeven_trigger_points`／`breakeven_offset_points`，不影響其他單。浮盈須超過觸發點數才鎖定保護價，多空皆適用並依合約 tick 對齊。已觸發的保本不因提高觸發點數而解除，也不因調低保留點數而放寬既有 stop；提高保留點數可收緊保護價，可能立即出場時沿用確認流程。仍以收定 1 分 K 判斷，參數更新經唯一 ID 指令、風控版本檢查及單一 trade 背景執行緒執行。
 - 缺少合約收盤資料、報價過期、monitor 未就緒或券商部位／委託不一致時暫停相應動作。手動送單在指令核對與行情閘門通過後執行，無需另等下一根訊號；保存曲線本身不等於啟用交易。
+- 月份合約收定 K 的時效統一使用 `config/market_health.json` 的 `bar_lag_seconds`（目前 180 秒），trade 不另設 60 秒限制，以免每分鐘剛收盤、tick 彙整尚在等待 `bar_close_delay_seconds` 的正常發布期間誤拒單。新鮮報價仍遵守獨立的 `tick_stale_seconds`（目前 10 秒），monitor、日曆與部位核對閘門仍須通過；未收定 K 不使用。這與曲線進場訊號「收盤後超過 60 秒不追單」的規則不同，後者維持不變。手動下單失敗時分開提示「即時報價缺少／過期」或「monitor／收定 K 尚未就緒」。
 - 進場／出場沿用送單前持久化 claim；`submitting`／`unknown` 不在重啟或重連後自動重送。
 
 ## 指令與快照 API
@@ -65,6 +68,8 @@ trade 在券商確認進場或出場成交口數增加、且交易狀態成功�
 
 ### HTTP endpoints
 
+查詢快照及原指令結果使用 SQLite `mode=ro` 連線，不初始化 schema、不改 journal 設定、不建立缺少的 DB。schema 初始化／遷移由服務啟動處理，避免高頻讀取端點參與 schema 操作。
+
 | API | 用途 |
 |---|---|
 | `GET /api/snapshot` | 背景保存的 status、contracts、margin、orders；不查券商 |
@@ -77,6 +82,8 @@ POST 格式為 `{id, name, target, payload}`。支援 `place_order`、`arm_curve
 `trade_commands` 保存 `accepted → processing → succeeded / failed / unknown`。同 ID／同內容回傳原結果；同 ID／不同內容回傳 409。程序中斷遺留的 `processing` 改為 `unknown`，禁止自動重送；未處理的 `accepted` 可由新程序接續。結果不明的交易需人工核對券商及本機 claim，不能直接刪除紀錄解除保護。
 
 Dashboard 使用 `Idempotency-Key` 轉交指令 ID；瀏覽器在 sessionStorage 保留尚未確認的請求，逾時後重試沿用同 ID。存在未確認請求時阻止其他新操作，並提供指令 ID 供查詢。關閉 Dashboard 不會停止 trade 或取消已啟用的條件。
+
+Dashboard → trade 的單次 HTTP 逾時預設 8 秒（`TradeClient.request_timeout`），與等待指令完成的時間分開。傳輸逾時顯示「回應逾時」，不等同服務停止或指令失敗。送出指令的回覆遺失、或輪詢暫時失敗時，只 GET 查詢原指令 ID，不自動重新 POST。瀏覽器定期查詢 sessionStorage 的未確認指令；成功／失敗結果確認後清除該筆 pending，並更新曲線啟用提示。`accepted`／`processing`／`unknown` 或查詢中斷仍保留原 ID。僅使用者明確重試同一操作、且查詢確認原 ID 無紀錄（404）時，才可沿用原 ID 再送；不另建 ID 猜測重送。
 
 ## 離線驗證
 

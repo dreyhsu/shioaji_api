@@ -38,6 +38,36 @@ CREATE TABLE IF NOT EXISTS market_fetcher_progress (
     validation_since TEXT NOT NULL,
     PRIMARY KEY (role, code, mode)
 );
+CREATE TABLE IF NOT EXISTS market_storage_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1), identity TEXT NOT NULL
+);
+INSERT OR IGNORE INTO market_storage_identity VALUES (1, hex(randomblob(16)));
+CREATE TABLE IF NOT EXISTS market_bar_versions (
+    code TEXT NOT NULL, mode TEXT NOT NULL, revision INTEGER NOT NULL,
+    PRIMARY KEY (code, mode)
+);
+CREATE TRIGGER IF NOT EXISTS market_bar_version_insert AFTER INSERT ON market_stream_bars BEGIN
+    INSERT INTO market_bar_versions VALUES (NEW.code, NEW.mode, 1)
+    ON CONFLICT(code,mode) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS market_bar_version_delete AFTER DELETE ON market_stream_bars BEGIN
+    INSERT INTO market_bar_versions VALUES (OLD.code, OLD.mode, 1)
+    ON CONFLICT(code,mode) DO UPDATE SET revision=revision+1;
+END;
+CREATE TRIGGER IF NOT EXISTS market_bar_version_update AFTER UPDATE ON market_stream_bars
+WHEN OLD.open IS NOT NEW.open OR OLD.high IS NOT NEW.high OR OLD.low IS NOT NEW.low
+    OR OLD.close IS NOT NEW.close OR OLD.volume IS NOT NEW.volume OR OLD.amount IS NOT NEW.amount
+    OR OLD.complete IS NOT NEW.complete OR OLD.instance IS NOT NEW.instance
+    OR OLD.generation IS NOT NEW.generation
+    OR OLD.code IS NOT NEW.code OR OLD.mode IS NOT NEW.mode
+    OR OLD.minute_start IS NOT NEW.minute_start OR OLD.source IS NOT NEW.source
+BEGIN
+    INSERT INTO market_bar_versions SELECT OLD.code, OLD.mode, 1
+    WHERE OLD.code IS NOT NEW.code OR OLD.mode IS NOT NEW.mode
+    ON CONFLICT(code,mode) DO UPDATE SET revision=revision+1;
+    INSERT INTO market_bar_versions VALUES (NEW.code, NEW.mode, 1)
+    ON CONFLICT(code,mode) DO UPDATE SET revision=revision+1;
+END;
 """
 
 

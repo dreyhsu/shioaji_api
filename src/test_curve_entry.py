@@ -39,7 +39,7 @@ def test_directional_crossing(action, before, after, expected):
     assert crossed_curve(bars, anchors(), pd.Timestamp("2026-10-05 11:02"), action) is expected
 
 
-@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5), ("1h", 60)])
+@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60)])
 @pytest.mark.parametrize("action,before,after", [("Buy", 99, 101), ("Sell", 101, 99)])
 def test_source_timeframe_uses_closed_one_minute_crossing(timeframe, step, action, before, after):
     start = pd.Timestamp("2026-10-05 08:45")
@@ -66,7 +66,7 @@ def test_session_break_does_not_create_minute_curve_crossing(timeframe):
     assert not crossed_curve(bars, curve, pd.Timestamp("2026-10-05 15:01"), "Buy", timeframe)
 
 
-@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5)])
+@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5), ("15m", 15)])
 @pytest.mark.parametrize("action,sign", [("Buy", 1), ("Sell", -1)])
 def test_sloping_curve_uses_source_bar_fraction_at_each_minute(timeframe, step, action, sign):
     start = pd.Timestamp("2026-10-05 08:45")

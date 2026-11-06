@@ -284,7 +284,7 @@ def test_curve_round_trip(client):
     assert values[-9] == pytest.approx(20220)  # end tangent: +200 / 10 bars
 
 
-@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5)])
+@pytest.mark.parametrize("timeframe,step", [("1m", 1), ("5m", 5), ("15m", 15)])
 def test_minute_curve_geometry_projects_to_every_chart_and_current_price(client, timeframe, step):
     hourly = client.get("/api/chart?days=1").json()["bars"]
     start = hourly[-3]["time"]
@@ -314,7 +314,7 @@ def test_minute_curve_geometry_projects_to_every_chart_and_current_price(client,
     assert client.get("/api/trendlines").json() == []
 
 
-@pytest.mark.parametrize("kind,timeframe", [("curve", "15m"), ("curve", "2m"), ("line", "1m"), ("line", "5m")])
+@pytest.mark.parametrize("kind,timeframe", [("curve", "2m"), ("line", "1m"), ("line", "5m"), ("line", "15m")])
 def test_unsupported_drawing_timeframes_are_rejected(client, kind, timeframe):
     response = client.post("/api/trendlines", json={"kind": kind, "timeframe": timeframe,
         "anchors": [{"time": 100 + index * 60, "price": 20000} for index in range(3)]})

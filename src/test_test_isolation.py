@@ -22,3 +22,17 @@ def test_private_settings_and_real_database_are_not_used():
     assert not os.getenv("TELEGRAM_BOT_TOKEN")
     with pytest.raises(RuntimeError, match="temporary directory"):
         db.connect(db.DEFAULT_DB_PATH)
+
+
+def test_event_loop_socketpair_works_without_allowing_ordinary_connections():
+    import asyncio
+
+    async def local_work():
+        await asyncio.sleep(0)
+        return 42
+    assert asyncio.run(local_work()) == 42
+    with socket.socket() as sock:
+        with pytest.raises(RuntimeError, match='Offline tests'):
+            sock.connect(('127.0.0.1', 1))
+        with pytest.raises(RuntimeError, match='Offline tests'):
+            sock.connect_ex(('127.0.0.1', 1))

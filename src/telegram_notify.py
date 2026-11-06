@@ -196,16 +196,18 @@ def format_line_alert(
     line_value: float,
     slope: float,
     minute_start,
+    timeframe: str = "1h",
 ) -> str:
     """Price near a drawn line, or through a rising / falling one."""
     diff = price - line_value
     note = "（此線僅通知一次）" if event != "near" else ""
+    slope_unit = {"1m": "1 分棒", "5m": "5 分棒", "15m": "15 分棒", "1h": "小時棒"}[timeframe]
     return (
-        f"{LINE_EVENT[event]} <b>{code} {label}</b>{note}\n"
+        f"{LINE_EVENT[event]} <b>{code} {label} [{timeframe}]</b>{note}\n"
         f"{_stamp(minute_start)}\n\n"
         f"價格：<b>{price:,.0f}</b>（線值 {line_value:,.0f}，"
         f"{'高' if diff >= 0 else '低'} {abs(diff):,.0f}）\n"
-        f"線斜率：{slope:+,.1f} 點 / 小時棒\n\n"
+        f"線斜率：{slope:+,.1f} 點 / {slope_unit}\n\n"
         f"{FOOTER}"
     )
 

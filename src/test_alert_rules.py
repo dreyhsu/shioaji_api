@@ -10,6 +10,7 @@ import pytest
 
 import alert_rules as ar
 import dashboard
+import trendline as tl
 
 HOURS = pd.to_datetime(
     ["2026-10-08 15:00", "2026-10-08 16:00", "2026-10-08 17:00", "2026-10-08 18:00"]
@@ -35,7 +36,7 @@ def config(tmp_path):
     return ar.AlertConfig(tmp_path / "missing.json")  # all defaults
 
 
-def run(config, close, *, boxes=None, prev=None, trendlines=(), atr=None):
+def run(config, close, *, boxes=None, prev=None, trendlines=(), atr=None, minutes=None):
     return ar.evaluate(
         code="TMFR1",
         minute_bar={"minute_start": MINUTE, "close": close},
@@ -45,6 +46,7 @@ def run(config, close, *, boxes=None, prev=None, trendlines=(), atr=None):
         trendlines=list(trendlines),
         hourly_atr=atr,
         config=config,
+        minute_bars=minutes,
     )
 
 
@@ -105,10 +107,51 @@ def test_line_value_and_slope_at_the_newest_bar():
     assert ar.line_now(HOURLY, line(1, (100, 110))) == (pytest.approx(130.0), pytest.approx(10.0))
 
 
-@pytest.mark.parametrize("timeframe", ["1m", "5m"])
-def test_hourly_alerts_ignore_minute_drawings_even_with_hourly_anchors(config, timeframe):
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m"])
+def test_minute_drawings_require_their_source_data(config, timeframe):
     drawing = {**line(1, (100, 110)), "timeframe": timeframe}
     assert run(config, 90, trendlines=[drawing]) == []
+
+
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h"])
+@pytest.mark.parametrize("step, rule", [
+    (10, "trendline_break_below_up"), (-10, "trendline_break_above_down"),
+])
+def test_curve_alerts_use_each_saved_timeframe(config, timeframe, step, rule):
+    minutes = pd.DataFrame({"minute_start": pd.date_range(HOURS[0], MINUTE, freq="min")})
+    for column in ("open", "high", "low", "close", "volume"):
+        minutes[column] = 100.0
+    source = tl.source_bars(minutes, timeframe)
+    drawing = {
+        "id": 42, "kind": "curve", "timeframe": timeframe,
+        "anchors": [
+            {"time": dashboard._epoch(source.iloc[i]["timestamp"]), "price": 100 + step * i}
+            for i in range(3)
+        ],
+    }
+    # Collinear Bezier controls: extension is exactly one step per source bar.
+    value = 100 + step * (len(source) - 1)
+    close = value - (1 if step > 0 else -1)
+    hits = run(config, close, trendlines=[drawing], minutes=minutes)
+    assert rules(hits) == sorted(["trendline_near", rule])
+    breakout = next(hit for hit in hits if hit.rule == rule)
+    assert breakout.once and breakout.key == "line:42"
+    assert f"[{timeframe}]" in breakout.message
+    assert f"線值 {value:,.0f}" in breakout.message
+    unit = {"1m": "1 分棒", "5m": "5 分棒", "15m": "15 分棒", "1h": "小時棒"}[timeframe]
+    assert f"點 / {unit}" in breakout.message
+    # The opposite side of the curve earns no break or near alert.
+    assert run(config, value + (100 if step > 0 else -100),
+               trendlines=[drawing], minutes=minutes) == []
+
+
+def test_minute_curve_does_not_snap_anchors_to_hourly_bars(config):
+    minutes = pd.DataFrame({"minute_start": pd.date_range(HOURS[0], MINUTE, freq="min")})
+    for column in ("open", "high", "low", "close", "volume"):
+        minutes[column] = 100.0
+    drawing = {**line(1, (100, 110)), "timeframe": "15m"}
+    drawing["anchors"][1]["time"] += 60  # 16:01 is not a 15m source bar.
+    assert run(config, 0, trendlines=[drawing], minutes=minutes) == []
 
 
 def test_near_uses_points_or_atr(config):

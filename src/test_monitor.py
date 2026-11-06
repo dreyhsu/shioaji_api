@@ -389,3 +389,31 @@ def test_check_alerts_wires_box_rules(conn, config, alerts):
     monitor.check_alerts(conn, config, alerts, later)
     kinds = sorted(db.load_alerts(conn, "TMFR1")["kind"])
     assert kinds == ["box_in_out", "support_bottom_third"]
+
+
+@pytest.mark.parametrize("timeframe, interval", [("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60)])
+def test_check_alerts_sends_saved_curves_once_in_each_timeframe(
+    conn, config, alerts, monkeypatch, timeframe, interval,
+):
+    config.enable_telegram = True
+    messages = []
+    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    start = at("15:00")
+    line_id = db.insert_trendline(conn, config.code, [
+        {"time": int((start + pd.Timedelta(minutes=i * interval)).timestamp()), "price": 100 + i * 10}
+        for i in range(3)
+    ], kind="curve", timeframe=timeframe)
+    for minute, expected in [("17:00", 1), ("17:00", 0), ("17:01", 0)]:
+        state = make_state(50, 50, 50, boxes=[], minute=f"2026-10-08 {minute}")
+        state.minute_bars = pd.DataFrame({
+            "minute_start": pd.date_range(start, at(minute), freq="min"),
+        })
+        for column in ("open", "high", "low", "close", "volume"):
+            state.minute_bars[column] = 50.0
+        state.hourly = monitor.sb.minute_bars_to_hourly(state.minute_bars)
+        assert monitor.check_alerts(conn, config, alerts, state) == expected
+    assert len(messages) == 1
+    assert f"[{timeframe}]" in messages[0]
+    history = db.load_alerts(conn, config.code)
+    assert list(history["kind"]) == ["trendline_break_below_up"]
+    assert list(history["box_type"]) == [f"line:{line_id}"]

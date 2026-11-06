@@ -299,6 +299,129 @@ def test_restart_keeps_validation_origin_and_reprocesses_older_corrections(runti
     assert health(r)['state'] == 'healthy'
 
 
+def test_quote_only_polls_do_not_read_or_rewrite_history(runtime, monkeypatch):
+    r = runtime
+    r.put()
+    r.item.step()
+    queries = []
+    original_connect = sqlite3.connect
+    def traced_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        conn.set_trace_callback(queries.append)
+        return conn
+    monkeypatch.setattr(sqlite3, 'connect', traced_connect)
+    r.conn.set_trace_callback(queries.append)
+    for _ in range(5):
+        r.now[0] += pd.Timedelta(seconds=1)
+        r.mono[0] += 1
+        r.live()
+        r.item.step()
+        assert health(r)['state'] == 'healthy'
+        assert health(r)['cycle_completed_at'] == str(r.now[0])
+    sql = '\n'.join(queries).lower()
+    assert 'select * from market_stream_bars' not in sql
+    assert 'select * from minute_bars' not in sql
+    assert 'insert into minute_bars' not in sql
+    assert 'insert or replace into monitor_bar_sources' not in sql
+    assert 'delete from minute_bars' not in sql
+    assert r.conn.execute('SELECT quote_at FROM market_latest_quotes').fetchone()[0] == str(r.now[0])
+
+
+def test_new_bar_and_old_correction_write_only_changed_minutes(runtime, monkeypatch):
+    r = runtime
+    r.put()
+    r.item.step()
+    writes = []
+    original = db.upsert_minute_bars
+    def record(conn, code, bars, **kwargs):
+        if not bars.empty:
+            writes.extend(bars.minute_start)
+        return original(conn, code, bars, **kwargs)
+    monkeypatch.setattr(db, 'upsert_minute_bars', record)
+    r.now[0] += pd.Timedelta(minutes=1)
+    r.mono[0] += 1
+    r.put(bar_rows('2026-10-30 09:02', '2026-10-30 09:02'))
+    r.item.step()
+    assert writes == [pd.Timestamp('2026-10-30 09:02')]
+    writes.clear()
+    r.put(bar_rows('2026-10-30 09:00', '2026-10-30 09:00', price=21000))
+    r.mono[0] += 1
+    r.item.step()
+    assert writes == [pd.Timestamp('2026-10-30 09:00')]
+    assert db.load_minute_bars(r.conn, 'TMFR1').iloc[0]['close'] == 21000
+
+
+def test_cached_future_bar_becomes_importable_without_another_source_write(runtime):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:02'))
+    r.item.step()
+    assert db.last_minute_start(r.conn, 'TMFR1') == pd.Timestamp('2026-10-30 09:01')
+    r.now[0] = pd.Timestamp('2026-10-30 09:03:00')
+    r.mono[0] += 1
+    r.item.step()
+    assert db.last_minute_start(r.conn, 'TMFR1') == pd.Timestamp('2026-10-30 09:02')
+
+
+def test_idle_history_does_not_cache_readiness_forever(runtime):
+    r = runtime
+    r.put()
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    r.now[0] = pd.Timestamp('2026-10-30 09:05:01')
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'degraded'
+    assert health(r)['bars']['lag_seconds'] == 181
+    r.now[0] = pd.Timestamp('2026-10-30 09:06:01')
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['bars']['blocking_missing_count'] > 0
+
+
+def test_tick_health_and_generation_are_rechecked_without_bar_changes(runtime):
+    r = runtime
+    r.put(bar_rows(end='2026-10-30 09:00'))
+    r.put(bar_rows('2026-10-30 09:01', '2026-10-30 09:01'), source='stream')
+    r.live()
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    for changes, error in [(dict(state='stale'), 'tick_fetcher_unhealthy'),
+                           (dict(generation=2), 'tick_generation_changed')]:
+        r.mono[0] += 1
+        r.live(**changes)
+        r.item.step()
+        assert health(r)['stream_error'] == error
+
+
+def test_replaced_source_with_same_revision_is_not_hidden_by_cache(runtime):
+    r = runtime
+    r.put()
+    r.item.step()
+    # A replacement DB can have the same counter. Its identity must differ.
+    r.store.conn.execute("UPDATE market_storage_identity SET identity='replacement'")
+    r.store.conn.execute('DROP TRIGGER market_bar_version_update')
+    r.store.conn.execute('UPDATE market_stream_bars SET close=21000')
+    r.store.conn.commit()
+    r.mono[0] += 1
+    r.item.step()
+    assert db.load_minute_bars(r.conn, 'TMFR1').iloc[-1]['close'] == 21000
+
+
+def test_source_without_revision_tables_still_detects_old_corrections(runtime):
+    r = runtime
+    for name in ('insert', 'update', 'delete'):
+        r.store.conn.execute(f'DROP TRIGGER market_bar_version_{name}')
+    r.store.conn.execute('DROP TABLE market_bar_versions')
+    r.store.conn.commit()
+    r.put()
+    r.item.step()
+    r.put(bar_rows('2026-10-30 09:00', '2026-10-30 09:00', price=21000))
+    r.mono[0] += 1
+    r.item.step()
+    assert health(r)['state'] == 'healthy'
+    assert db.load_minute_bars(r.conn, 'TMFR1').iloc[0]['close'] == 21000
+
+
 def test_audit_deduplicates_restart_and_waits_for_complete_lines(runtime):
     r = runtime
     folder = r.config.fetcher_db.parent / 'logs'

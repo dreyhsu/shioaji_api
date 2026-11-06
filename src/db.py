@@ -18,6 +18,7 @@ Two UNIQUE constraints carry real logic rather than just hygiene:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -141,7 +142,7 @@ CREATE TABLE IF NOT EXISTS trendlines (
   label TEXT, color TEXT,
   anchors TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'line',
-  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h')),
+  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '15m', '1h')),
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
@@ -279,7 +280,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # EXISTS", so each one is applied only when missing.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("managed_orders", "avg_exit_price", "ALTER TABLE managed_orders ADD COLUMN avg_exit_price REAL"),
-    ("trendlines", "timeframe", "ALTER TABLE trendlines ADD COLUMN timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h'))"),
+    ("trendlines", "timeframe", "ALTER TABLE trendlines ADD COLUMN timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '15m', '1h'))"),
     ("curve_entries", "action", "ALTER TABLE curve_entries ADD COLUMN action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell'))"),
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
@@ -294,6 +295,38 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def _migrate_trendline_timeframes(conn):
+    """Widen the legacy CHECK atomically, preserving IDs and drawing metadata."""
+    legacy = r"\btimeframe\s+IN\s*\(\s*'1m'\s*,\s*'5m'\s*,\s*'1h'\s*\)"
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='trendlines'").fetchone()[0]
+    if not re.search(legacy, sql, re.I):
+        return
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        # Another service may have migrated while this connection waited.
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='trendlines'").fetchone()[0]
+        if not re.search(legacy, sql, re.I):
+            return
+        objects = conn.execute("SELECT sql FROM sqlite_master WHERE tbl_name='trendlines' "
+                               "AND type IN ('index','trigger') AND sql IS NOT NULL").fetchall()
+        sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='trendlines'").fetchone()
+        columns = ','.join('"' + row['name'].replace('"', '""') + '"'
+                           for row in conn.execute('PRAGMA table_info(trendlines)'))
+        widened = re.sub(legacy, "timeframe IN ('1m', '5m', '15m', '1h')", sql, flags=re.I)
+        widened, count = re.subn(r'^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:"trendlines"|trendlines)(?=\s*\()',
+                                r'\1trendlines_15m_migration', widened, count=1, flags=re.I)
+        if count != 1:
+            raise ValueError('unrecognized trendlines schema')
+        conn.execute(widened)
+        conn.execute(f'INSERT INTO trendlines_15m_migration ({columns}) SELECT {columns} FROM trendlines')
+        conn.execute('DROP TABLE trendlines')
+        conn.execute('ALTER TABLE trendlines_15m_migration RENAME TO trendlines')
+        for row in objects:
+            conn.execute(row['sql'])
+        if sequence:
+            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='trendlines'", (sequence[0],))
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     for table, column, statement in MIGRATIONS:
@@ -301,6 +334,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(statement)
     conn.commit()
+    _migrate_trendline_timeframes(conn)
+
+
+@contextmanager
+def read_session(path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
+    """Read an existing WAL database without schema setup or write pragmas."""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 @contextmanager

@@ -68,7 +68,7 @@ def test_migration_adds_the_source_column(conn):
 def test_trendline_timeframe_migration_preserves_old_drawings(tmp_path):
     connection = db.connect(tmp_path / "legacy-lines.db")
     legacy_schema = db.SCHEMA.replace(
-        "  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '1h')),\n", "")
+        "  timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '15m', '1h')),\n", "")
     connection.executescript(legacy_schema)
     connection.execute("INSERT INTO trendlines (code, anchors, kind, created_at) VALUES (?, ?, ?, ?)",
                        ("TMFR1", '[]', "curve", "2026-10-28 08:45"))
@@ -79,6 +79,53 @@ def test_trendline_timeframe_migration_preserves_old_drawings(tmp_path):
         db.insert_trendline(connection, "TMFR1", anchors, kind="curve", timeframe=timeframe)
     db.init_schema(connection)
     assert [line["timeframe"] for line in db.load_trendlines(connection, "TMFR1")] == ["1h", "1m", "5m"]
+    connection.close()
+
+
+def test_15m_migration_preserves_ids_references_triggers_and_sequence(tmp_path):
+    connection = db.connect(tmp_path / 'old-timeframe-check.db')
+    connection.executescript(db.SCHEMA.replace("('1m', '5m', '15m', '1h')", "('1m', '5m', '1h')"))
+    anchors = '[{"time":1,"price":100},{"time":2,"price":101},{"time":3,"price":102}]'
+    connection.execute("INSERT INTO trendlines (id,code,label,anchors,kind,timeframe,enabled,created_at) "
+                       "VALUES (5,'TMFR1','keep',?,'curve','5m',1,'2026-11-04')", (anchors,))
+    connection.execute("INSERT INTO trendlines (id,code,anchors,kind,created_at) VALUES (99,'TMFR1',?,'curve','old')", (anchors,))
+    connection.execute('DELETE FROM trendlines WHERE id=99')
+    connection.execute("INSERT INTO curve_entries (code,simulation,curve_id,contract_code,quantity,state,armed_at,check_from) "
+                       "VALUES ('TMFR1',1,5,'TMFK6',1,'armed','2026-11-04','2026-11-04')")
+    connection.commit()
+    versions = db.chart_versions(connection, 'TMFR1')
+    db.init_schema(connection)
+    db.init_schema(connection)
+    assert dict(connection.execute('SELECT * FROM trendlines WHERE id=5').fetchone())['anchors'] == anchors
+    assert connection.execute('SELECT curve_id,state FROM curve_entries').fetchone()[0] == 5
+    assert db.chart_versions(connection, 'TMFR1') == versions
+    new_id = db.insert_trendline(connection, 'TMFR1', json.loads(anchors), kind='curve', timeframe='15m')
+    assert new_id > 99
+    assert db.chart_versions(connection, 'TMFR1') != versions  # drawing trigger restored
+    assert connection.execute("SELECT name FROM sqlite_master WHERE name='idx_trendlines_code'").fetchone()
+    connection.close()
+
+
+def test_15m_migration_failure_rolls_back_original_table(tmp_path):
+    connection = db.connect(tmp_path / 'migration-rollback.db')
+    connection.executescript(db.SCHEMA.replace("('1m', '5m', '15m', '1h')", "('1m', '5m', '1h')"))
+    connection.execute("INSERT INTO trendlines (id,code,anchors,created_at) VALUES (7,'TMFR1','[]','old')")
+    connection.commit()
+    class FailingConnection:
+        def __enter__(self):
+            return connection.__enter__()
+        def __exit__(self, *args):
+            return connection.__exit__(*args)
+        def execute(self, sql, *args):
+            if sql.startswith('ALTER TABLE trendlines_15m_migration'):
+                raise RuntimeError('interrupted migration')
+            return connection.execute(sql, *args)
+    with pytest.raises(RuntimeError, match='interrupted'):
+        db._migrate_trendline_timeframes(FailingConnection())
+    assert connection.execute('SELECT id FROM trendlines').fetchone()[0] == 7
+    assert not connection.execute("SELECT name FROM sqlite_master WHERE name='trendlines_15m_migration'").fetchone()
+    db.init_schema(connection)
+    assert connection.execute('SELECT id FROM trendlines').fetchone()[0] == 7
     connection.close()
 
 

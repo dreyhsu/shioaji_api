@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 import dashboard
 import db
 import trading
+import session_bars as sb
+import trendline as tl
 from test_trading import fake_service  # shared offline SDK fixture
 
 
@@ -36,23 +38,71 @@ def save(service, order, **changes):
     return service.update_risk_settings(order["id"], **payload)
 
 
-@pytest.mark.parametrize("timeframe", ["1m", "5m"])
-def test_minute_curve_cannot_replace_hourly_profit_target(fake_service, timeframe):
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h"])
+def test_all_curve_timeframes_can_replace_and_adjust_profit_target(fake_service, timeframe):
     service, api, _ = fake_service
     order = filled(service, api)
+    minutes = pd.DataFrame([dict(minute_start=stamp, open=46270, high=46270, low=46270,
+                                close=46270, volume=1, amount=46270)
+                           for stamp in pd.date_range('2026-10-05 08:45', '2026-10-05 10:59', freq='min')])
+    minutes = sb.add_sessions(minutes)
+    source = tl.source_bars(minutes, timeframe)
+    stamps = source['hour_start' if timeframe == '1h' else 'timestamp'].iloc[[0, 1, 2]]
+    anchors = [{'time': int(stamp.value // 10**9), 'price': price}
+               for stamp, price in zip(stamps, (46240, 46290, 46270))]
     with db.session(service.db_path) as conn:
-        curve_id = db.insert_trendline(conn, service.code,
-            [{"time": int(pd.Timestamp(stamp).timestamp()), "price": 46270}
-             for stamp in ("2026-10-05 08:45", "2026-10-05 09:45", "2026-10-05 10:45")],
-            kind="curve", timeframe=timeframe)
-    with pytest.raises(ValueError, match="1 小時曲線"):
-        save(service, order, curve_id=curve_id)
-    with pytest.raises(ValueError, match="停利曲線"):
-        service.place_order({"confirmed": True, "simulation": True, "contract_code": "TMF202611",
-            "action": "Buy", "quantity": 1, "price": 46270, "price_type": "LMT", "order_type": "ROD",
-            "curve_id": curve_id})
-    assert service._curve_value({**order, "curve_id": curve_id}) is None
-    assert service._active_order(order["id"])["curve_id"] is None
+        db.upsert_minute_bars(conn, service.code, minutes)
+        curve_id = db.insert_trendline(conn, service.code, anchors, kind="curve", timeframe=timeframe)
+    changed = save(service, order, curve_id=curve_id)
+    expected = tl.values_at_times(source, anchors, [minutes.iloc[-1]['minute_start']], timeframe=timeframe).iloc[0]
+    assert changed['curve_id'] == curve_id and changed['curve_timeframe'] == timeframe
+    assert changed['target_price'] is None and changed['stop_price'] == order['stop_price']
+    assert changed['curve_price'] == pytest.approx(expected)
+    adjusted = service.update_curve(order['id'], expected + 20)
+    assert adjusted['curve_price'] == pytest.approx(expected + 20)
+    with db.session(service.db_path) as conn:
+        curve = next(item for item in db.load_trendlines(conn, service.code) if item['id'] == curve_id)
+    assert curve['timeframe'] == timeframe
+    assert [item['time'] for item in curve['anchors']] == [item['time'] for item in anchors]
+    assert [item['price'] for item in curve['anchors']] == [item['price'] + 20 for item in anchors]
+    placed = service.place_order({"confirmed": True, "simulation": True, "contract_code": "TMF202611",
+        "action": "Buy", "quantity": 1, "price": 46270, "price_type": "LMT", "order_type": "ROD",
+        "curve_id": curve_id})
+    assert placed['curve_id'] == curve_id and placed['curve_timeframe'] == timeframe
+    restored = save(service, adjusted, curve_id=None, target_price=47000)
+    assert restored['curve_id'] is None and restored['curve_timeframe'] is None
+    assert restored['target_price'] == 47000
+
+
+@pytest.mark.parametrize('timeframe,interval', [('1m', 1), ('5m', 5), ('15m', 15), ('1h', 60)])
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+def test_curve_exit_uses_source_geometry_and_adjacent_closed_minutes(fake_service, timeframe, interval, action, direction):
+    service, _, _ = fake_service
+    service._now = lambda: pd.Timestamp('2026-10-05 11:03:00')
+    stamps = pd.date_range('2026-10-05 08:45', '2026-10-05 11:02', freq='min')
+    # Beyond its end, this non-flat Bezier projects along control -> end.
+    levels = [120 + (index / interval - 2) * 5 for index in (136, 137)]
+    closes = [100] * (len(stamps) - 2) + [levels[0] + direction, levels[1] - direction]
+    minutes = sb.add_sessions(pd.DataFrame([dict(minute_start=stamp, open=close, high=close, low=close,
+        close=close, volume=1, amount=close) for stamp, close in zip(stamps, closes)]))
+    anchors = [{'time': int((stamps[0] + pd.Timedelta(minutes=interval * index)).value // 10**9), 'price': price}
+               for index, price in enumerate((100, 115, 120))]
+    with db.session(service.db_path) as conn:
+        db.upsert_minute_bars(conn, service.code, minutes)
+        curve_id = db.insert_trendline(conn, service.code, anchors, kind='curve', timeframe=timeframe)
+    row = dict(id='source-geometry', code=service.code, curve_id=curve_id,
+               curve_check_from='2026-10-05 11:02:00', action=action)
+    assert service._curve_value(row) == pytest.approx(levels[1])
+    assert service._curve_close_break(row) == 'curve'
+    service._curve_break_cache.clear()
+    service._now = lambda: pd.Timestamp('2026-10-05 11:02:59')
+    assert service._curve_close_break(row) is None  # last candle has not closed
+    service._now = lambda: pd.Timestamp('2026-10-05 11:03:00')
+    service._curve_break_cache.clear()
+    with db.session(service.db_path) as conn:
+        conn.execute("DELETE FROM minute_bars WHERE code=? AND minute_start='2026-10-05 11:01:00'", (service.code,))
+        conn.commit()
+    assert service._curve_close_break(row) is None  # no crossing across a missing minute
 
 
 @pytest.mark.parametrize("action,direction", [("Buy", 1), ("Sell", -1)])

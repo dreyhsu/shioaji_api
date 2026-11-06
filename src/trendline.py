@@ -41,7 +41,7 @@ def _anchor_stamp(epoch) -> pd.Timestamp:
 
 
 KINDS = ("line", "curve")
-TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "1h": 60}
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
 
 
 def source_bars(minutes: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:

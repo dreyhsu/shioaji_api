@@ -561,7 +561,7 @@ class TrendlineIn(BaseModel):
     color: str | None = Field(default=None, max_length=20)
     anchors: list[Anchor] = Field(min_length=2, max_length=20)
     kind: Literal["line", "curve"] = "line"
-    timeframe: Literal["1m", "5m", "1h"] = "1h"
+    timeframe: Literal["1m", "5m", "15m", "1h"] = "1h"
 
 
 def _invalidate_cache() -> None:

@@ -801,7 +801,7 @@ function setTradeOrder(order) {
     const basis = filled ? `持倉 ${tradeOrder.filled_quantity - Number(tradeOrder.exit_filled_quantity || 0)}/${tradeOrder.quantity} 口 · 成交均價` : '限價委託預覽 · 尚未成交';
     const curvePrice = tradeOrder.curve_price;
     const targetText = Number(tradeOrder.curve_id)
-      ? `1h 曲線停利 ${curvePrice === null || curvePrice === undefined ? '—' : Number(curvePrice).toLocaleString('en-US')}（1m 收盤穿越）`
+      ? `${tradeOrder.curve_timeframe || ''} 曲線停利 ${curvePrice === null || curvePrice === undefined ? '—' : Number(curvePrice).toLocaleString('en-US')}（1m 收盤穿越）`
       : `停利 ${target === null ? '—' : Number(target).toLocaleString('en-US')}`;
     range.textContent = `${tradeOrder.contract_code} ${tradeOrder.action === 'Buy' ? '多單' : '空單'} · ${basis} ${entry.toLocaleString('en-US')} · 停損 ${stop === null ? '—' : Number(stop).toLocaleString('en-US')} · ${targetText}`;
     range.classList.toggle('held', filled);
@@ -964,7 +964,7 @@ document.getElementById('recent').addEventListener('click', () => {
 });
 
 function canDraw(tool, frame) {
-  return frame === '1h' || (tool === 'curve' && ['1m', '5m'].includes(frame));
+  return frame === '1h' || (tool === 'curve' && ['1m', '5m', '15m'].includes(frame));
 }
 
 function updateTimeframeButtons(loading = false) {
@@ -980,7 +980,7 @@ function updateTimeframeButtons(loading = false) {
     const button = document.getElementById('draw-' + tool);
     button.disabled = loading || !canDraw(tool, timeframe);
     button.title = canDraw(tool, timeframe) ? ''
-      : tool === 'curve' ? '切換至 1m、5m 或 1h 畫曲線' : '切換至 1h 畫線';
+      : tool === 'curve' ? '切換至 1m、5m、15m 或 1h 畫曲線' : '切換至 1h 畫線';
   }
 }
 

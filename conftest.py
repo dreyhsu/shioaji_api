@@ -1,11 +1,45 @@
 """Default tests are offline, including collection; no private credentials."""
 from pathlib import Path
 import socket
+import sys
 import tempfile
 
 import pytest
 
 _guards = pytest.MonkeyPatch()
+_socket_connect = socket.socket.connect
+
+
+def _local_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+    """Windows asyncio needs a TCP self-pipe even for in-process HTTP tests.
+
+    Use the original connect only for this newly bound ephemeral listener. All
+    ordinary socket/network entry points remain blocked, including loopback.
+    """
+    if family not in (socket.AF_INET, socket.AF_INET6) or type != socket.SOCK_STREAM or proto != 0:
+        raise ValueError('offline socketpair requires IPv4/IPv6 TCP with protocol zero')
+    host = '127.0.0.1' if family == socket.AF_INET else '::1'
+    with socket.socket(family, type, proto) as listener:
+        listener.bind((host, 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        client = socket.socket(family, type, proto)
+        try:
+            client.setblocking(False)
+            try:
+                _socket_connect(client, listener.getsockname())
+            except (BlockingIOError, InterruptedError):
+                pass
+            client.setblocking(True)
+            server, _ = listener.accept()
+        except BaseException:
+            client.close()
+            raise
+    if server.getsockname() != client.getpeername() or client.getsockname() != server.getpeername():
+        server.close()
+        client.close()
+        raise ConnectionError('unexpected offline socketpair peer')
+    return server, client
 
 
 def _blocked(*args, **kwargs):
@@ -22,6 +56,8 @@ def pytest_configure(config):
                  "SHIOAJI_PERSON_ID", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         _guards.delenv(name, raising=False)
     _guards.setattr(shioaji, "Shioaji", _blocked)
+    if sys.platform == 'win32':
+        _guards.setattr(socket, 'socketpair', _local_socketpair)
     _guards.setattr(socket.socket, "connect", _blocked)
     _guards.setattr(socket.socket, "connect_ex", _blocked)
     _guards.setattr(socket, "create_connection", _blocked)
