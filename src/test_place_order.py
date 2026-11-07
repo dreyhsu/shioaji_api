@@ -15,6 +15,8 @@ def order():
 @pytest.mark.parametrize("action,price_type,order_type,expected", [
     ("Buy", "LMT", "ROD", 20000), ("Sell", "LMT", "IOC", 20000),
     ("Buy", "MKT", "IOC", 0), ("Sell", "MKP", "FOK", 0),
+    ("Buy", "LMT", "FOK", 20000), ("Sell", "MKT", "FOK", 0),
+    ("Buy", "MKP", "IOC", 0),
 ])
 def test_order_parameters_and_exactly_one_submission(order, action, price_type, order_type, expected):
     order = replace(order, action=action, price_type=price_type, order_type=order_type)
@@ -31,6 +33,8 @@ def test_order_parameters_and_exactly_one_submission(order, action, price_type, 
     {"quantity": 1.5}, {"quantity": True}, {"action": "hold"}, {"price": float("nan")},
     {"price": float("inf")}, {"price": -1}, {"price": 0}, {"contract_code": ""},
     {"price_type": "bad"}, {"order_type": "bad"}, {"price": "20000"},
+    {"price_type": "MKT", "order_type": "ROD"},
+    {"price_type": "MKP", "order_type": "ROD"},
 ])
 def test_invalid_inputs_never_submit(order, changes):
     broker = Mock()

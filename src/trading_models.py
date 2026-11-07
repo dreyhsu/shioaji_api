@@ -1,6 +1,7 @@
 """Shared request validation for Dashboard and the independent trade API."""
 from typing import Literal
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, StrictBool, model_validator
+from place_order import validate_futures_order_types
 
 class OrderIn(BaseModel):
     contract_code: str = Field(min_length=1, max_length=24)
@@ -12,6 +13,11 @@ class OrderIn(BaseModel):
     curve_id: int | None = None
     simulation: StrictBool
     confirmed: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_order_types(self):
+        validate_futures_order_types(self.price_type, self.order_type)
+        return self
 
 
 class TradeLevelsIn(BaseModel):

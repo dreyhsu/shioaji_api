@@ -116,6 +116,24 @@ def test_reads_enqueue_and_duplicate_ids_do_not_login_or_submit(rig):
     assert request(r, payload=changed).status_code == 409
 
 
+@pytest.mark.parametrize('price_type', ['MKT', 'MKP'])
+def test_market_rod_rejected_before_command_or_broker_access(rig, monkeypatch, price_type):
+    r = rig
+    payload = dict(contract_code='TMF209912', action='Buy', quantity=1, price=0,
+                   price_type=price_type, order_type='ROD', simulation=True, confirmed=True)
+    response = request(r, identity='invalid-rod', payload=payload)
+    assert response.status_code == 422 and 'IOC' in response.text
+    with db.read_session(r.path) as conn:
+        assert conn.execute('SELECT count(*) FROM trade_commands').fetchone()[0] == 0
+        assert conn.execute('SELECT count(*) FROM managed_orders').fetchone()[0] == 0
+
+    def forbidden():
+        raise AssertionError('invalid Dashboard order must not access the trade service')
+    monkeypatch.setattr(dashboard, '_trading_service', forbidden)
+    assert TestClient(dashboard.app).post('/api/trading/orders', json=payload).status_code == 422
+    assert not r.apis and not r.broker.trades
+
+
 def test_read_endpoints_never_initialize_schema_or_write(rig, monkeypatch):
     r = rig
     assert request(r).status_code == 202
@@ -376,8 +394,8 @@ def test_duplicate_trade_process_cannot_take_ownership(rig):
 def test_command_validation_rejects_invalid_mode_or_quantity_before_submission(rig):
     r = rig
     assert r.client.post('/api/commands', json={'id': 'bad', 'name': 'place_order', 'payload': {'quantity': True}}).status_code == 422
-    request(r, payload=dict(contract_code='TMF209912', action='Buy', quantity=1, price=0,
-        price_type='MKT', simulation=False, confirmed=True))
+    assert request(r, payload=dict(contract_code='TMF209912', action='Buy', quantity=1, price=0,
+        price_type='MKT', order_type='IOC', simulation=False, confirmed=True)).status_code == 202
     r.runtime.step()
     assert not r.broker.trades
 

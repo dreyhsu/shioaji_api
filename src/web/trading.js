@@ -699,6 +699,15 @@
     }
   }
 
+  function syncOrderType() {
+    const limit = $('trade-price-type').value === 'LMT';
+    const select = $('trade-order-type');
+    for (const option of select.options) {
+      option.disabled = option.value === 'ROD' && !limit;
+    }
+    select.value = limit ? 'ROD' : 'IOC';
+  }
+
   async function submitOrder() {
     if (busy) return;
     const simulation = state.simulation;
@@ -709,6 +718,10 @@
     const orderType = $('trade-order-type').value;
     const price = Number($('trade-price').value || 0);
     const curveId = $('trade-curve').value ? Number($('trade-curve').value) : null;
+    if (priceType !== 'LMT' && orderType === 'ROD') {
+      message('期貨市價／範圍市價不可搭配 ROD，請選擇 IOC 或 FOK。', true);
+      return;
+    }
     if (!contract || !Number.isInteger(quantity) || quantity < 1 || (priceType === 'LMT' && !(price > 0))) {
       message('請確認月份、口數與委託價格。', true);
       return;
@@ -744,7 +757,10 @@
     }
   }
 
-  $('trade-price-type').addEventListener('change', renderPreview);
+  $('trade-price-type').addEventListener('change', () => {
+    syncOrderType();
+    renderPreview();
+  });
   $('trade-contract').addEventListener('change', () => {
     state.price = null;
     state.entryReady = false;
@@ -813,6 +829,7 @@
     renderRiskEditor();
   });
 
+  syncOrderType();
   window.TradingUI = { updateRiskDraft, message, refreshOrders, refresh: refreshTrading, refreshCurves: loadCurves, confirm: confirmOperation };
   document.addEventListener('trendlines-changed', () => loadCurves().catch((error) => message(error.message, true)));
   fetchRead('/api/state').then((response) => response.json()).then((data) => {

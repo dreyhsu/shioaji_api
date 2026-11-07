@@ -45,6 +45,13 @@ class BrokerPort(Protocol):
     def submit_order(self, request: OrderRequest, context: OrderContext, price: float) -> OrderResult: ...
 
 
+def validate_futures_order_types(price_type: str, order_type: str) -> None:
+    if price_type not in {"LMT", "MKT", "MKP"} or order_type not in {"ROD", "IOC", "FOK"}:
+        raise ValueError("不支援的價格類別或委託條件")
+    if price_type in {"MKT", "MKP"} and order_type == "ROD":
+        raise ValueError("期貨市價／範圍市價不可搭配 ROD，請選擇 IOC 或 FOK")
+
+
 def validate_request(request: OrderRequest, simulation: bool) -> None:
     if request.confirmed is not True:
         raise ValueError("送單前必須確認委託摘要")
@@ -56,8 +63,7 @@ def validate_request(request: OrderRequest, simulation: bool) -> None:
         raise ValueError("請選擇買進或賣出")
     if isinstance(request.quantity, bool) or not isinstance(request.quantity, int) or not 1 <= request.quantity <= 100:
         raise ValueError("口數必須為 1 到 100 的整數")
-    if request.price_type not in {"LMT", "MKT", "MKP"} or request.order_type not in {"ROD", "IOC", "FOK"}:
-        raise ValueError("不支援的價格類別或委託條件")
+    validate_futures_order_types(request.price_type, request.order_type)
     try:
         valid = not isinstance(request.price, bool) and math.isfinite(request.price) and request.price >= 0
     except TypeError:
