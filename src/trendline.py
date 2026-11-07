@@ -30,6 +30,7 @@ Zero shioaji dependency, like ``patterns.py``.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pandas as pd
 
@@ -161,4 +162,20 @@ def line_values(hourly: pd.DataFrame, anchors: list[dict], kind: str = "line") -
     for position in range(points[0][0], len(hourly)):
         out.iloc[position] = value_at(points, position, kind)
     return out
+
+
+def projection(bars: pd.DataFrame, line: dict) -> dict | None:
+    """Terminal tangent and reference angle in the saved source bar geometry."""
+    reference = line.get("angle_reference_points_per_bar")
+    if line.get("kind") != "curve" or reference is None:
+        return None
+    if not math.isfinite(reference) or reference <= 0:
+        return None
+    points = anchor_indices(bars, line["anchors"], "curve")
+    if not points:
+        return None
+    (_, _), (x1, y1), (x2, y2) = points
+    slope = (y2 - y1) / (x2 - x1)
+    return {"slope_per_bar": slope,
+            "reference_angle_degrees": math.degrees(math.atan(slope / reference))}
 

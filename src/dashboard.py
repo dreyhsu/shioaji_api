@@ -504,6 +504,9 @@ def api_chart(
         # Share the hourly view's cutoff so the same historical boxes remain visible.
         visible = bars[bars["timestamp"] >= data["visible"]["timestamp"].iloc[0]].reset_index(drop=True)
         data = {**data, "chart_bars": bars, "visible": visible}
+    series = _series_payload(data)
+    lines = [{**line, "projection": tl.projection(data['drawing_bars'][line.get('timeframe', '1h')], line)}
+             for line in data.get('trendlines') or []]
     return {
         "code": code,
         "timeframe": timeframe,
@@ -511,8 +514,8 @@ def api_chart(
         "bars": _bars_payload(data),
         "boxes": _boxes_payload(data),
         "gaps": _gaps_payload(data),
-        "series": _series_payload(data),
-        "trendlines": data.get("trendlines") or [],
+        "series": series,
+        "trendlines": lines,
     }
 
 
@@ -562,6 +565,7 @@ class TrendlineIn(BaseModel):
     anchors: list[Anchor] = Field(min_length=2, max_length=20)
     kind: Literal["line", "curve"] = "line"
     timeframe: Literal["1m", "5m", "15m", "1h"] = "1h"
+    angle_reference_points_per_bar: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 def _invalidate_cache() -> None:
@@ -583,6 +587,7 @@ def api_trendlines(code: str | None = None) -> list[dict]:
             timeframe = line['timeframe']
             if timeframe not in sources:
                 sources[timeframe] = tl.source_bars(_minutes(data), timeframe)
+            line['projection'] = tl.projection(sources[timeframe], line)
             value = tl.values_at_times(sources[timeframe], line['anchors'],
                 [pd.Timestamp(data['last_minute']['minute_start'])], timeframe=timeframe).iloc[0]
             line['curve_price'] = float(value) if pd.notna(value) else None
@@ -600,9 +605,12 @@ def api_create_trendline(body: TrendlineIn) -> dict:
         raise HTTPException(status_code=422, detail="a curve takes exactly 3 anchors")
     if body.kind == "line" and body.timeframe != "1h":
         raise HTTPException(status_code=422, detail="straight lines require timeframe=1h")
+    if body.angle_reference_points_per_bar is not None and body.kind != "curve":
+        raise HTTPException(status_code=422, detail="reference angle requires a curve")
     with db.session(CONFIG["db_path"]) as conn:
         line_id = db.insert_trendline(
-            conn, code, anchors, label=body.label, color=body.color, kind=body.kind, timeframe=body.timeframe
+            conn, code, anchors, label=body.label, color=body.color, kind=body.kind, timeframe=body.timeframe,
+            angle_reference_points_per_bar=body.angle_reference_points_per_bar,
         )
     _invalidate_cache()
     return {"id": line_id}

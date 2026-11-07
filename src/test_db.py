@@ -47,6 +47,25 @@ def test_schema_is_idempotent(tmp_path):
         connection.close()
 
 
+def test_angle_reference_migration_preserves_drawings_and_sequence(tmp_path):
+    connection = db.connect(tmp_path / 'legacy-auto-angle.db')
+    connection.executescript(db.SCHEMA.replace('  angle_reference_points_per_bar REAL,\n', ''))
+    connection.execute("INSERT INTO trendlines (id,code,anchors,kind,created_at) VALUES (41,'TMFR1','[]','curve','old')")
+    connection.commit()
+    versions = db.chart_versions(connection, 'TMFR1')
+    for _ in range(2):
+        db.init_schema(connection)
+    line = db.load_trendlines(connection, 'TMFR1')[0]
+    assert line['id'] == 41 and line['angle_reference_points_per_bar'] is None
+    assert db.chart_versions(connection, 'TMFR1') == versions
+    new_id = db.insert_trendline(connection, 'TMFR1', [{'time': i, 'price': i} for i in range(3)],
+        kind='curve', timeframe='15m', angle_reference_points_per_bar=2.5)
+    assert new_id > 41
+    assert db.load_trendlines(connection, 'TMFR1')[-1]['angle_reference_points_per_bar'] == 2.5
+    assert db.chart_versions(connection, 'TMFR1') != versions
+    connection.close()
+
+
 def test_curve_entry_direction_migrates_existing_rows(tmp_path):
     connection = db.connect(tmp_path / "legacy.db")
     legacy_schema = db.SCHEMA.replace("  action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell')),\n", "")

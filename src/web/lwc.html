@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=curve-hover-1">
+  <link rel="stylesheet" href="/static/style.css?v=auto-curve-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -104,7 +104,7 @@
       <div id="curve-panel" role="tabpanel" aria-labelledby="curve-tab" hidden>
         <p class="trade-muted entry-help">保存 1m／5m／15m／1h 曲線後，統一等待相鄰已收盤 1 分 K 穿越曲線，僅進場一次。成交後預設停損、停利各 2 倍 1h ATR；進場曲線不會自動套用為停利曲線。啟用後若要變更設定，請先取消再重新啟用。</p>
         <label class="trade-field">進場曲線
-          <select id="entry-curve"><option value="">先在 1m／5m／15m／1h 圖手動畫曲線</option></select>
+          <select id="entry-curve"><option value="">先在 1m／5m／15m／1h 圖繪製或自動產生並儲存曲線</option></select>
         </label>
         <div class="trade-field">
           <span>突破方向</span>
@@ -156,6 +156,9 @@
         </div>
         <button type="button" id="draw-line">畫線</button>
         <button type="button" id="draw-curve">曲線</button>
+        <button type="button" id="draw-auto-curve" aria-pressed="false" disabled>自動曲線</button>
+        <button type="button" id="auto-curve-save" hidden>儲存曲線</button>
+        <button type="button" id="auto-curve-cancel" hidden>取消</button>
         <button type="button" id="draw-done" hidden>完成</button>
         <button type="button" id="recent" title="顯示最近 120 根 K 棒">最近</button>
         <button type="button" id="fit">全部</button>
@@ -177,6 +180,7 @@
     <div id="legend-ohlc" class="legend-ohlc"></div>
     <div id="trendlines" class="trendline-list"></div>
     <div id="draw-hint" class="draw-hint" hidden></div>
+    <div id="auto-curve-hint" class="draw-hint" role="status" aria-live="polite" hidden></div>
     <div id="chart"><div id="curve-tooltip" class="curve-tooltip" role="tooltip" hidden></div></div>
   </section>
 
@@ -203,8 +207,10 @@
   <script src="/static/boxes_primitive.js?v=gap-2"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
   <script src="/static/curve_hover.js?v=1"></script>
-  <script src="/static/lwc_app.js?v=multiframe-exit-4"></script>
-  <script src="/static/trading.js?v=order-type-auto-7"></script>
-  <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
+  <script src="/static/auto_curve.js?v=2"></script>
+  <script src="/static/auto_curve_tool.js?v=1"></script>
+  <script src="/static/lwc_app.js?v=auto-curve-1"></script>
+  <script src="/static/trading.js?v=auto-curve-1"></script>
+  <script src="/static/mock_replay.js?v=auto-curve-1"></script>
 </body>
 </html>

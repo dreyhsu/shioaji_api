@@ -1,5 +1,6 @@
 """Configuration and supervisor lifecycle without broker/network access."""
 import json
+import errno
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -45,6 +46,33 @@ def test_bad_runtime_configuration_is_rejected(tmp_path, values):
 def test_bad_dashboard_configuration_is_rejected(values):
     with pytest.raises(ValidationError):
         DashboardConfig.model_validate(values)
+
+
+@pytest.mark.parametrize('platform', ['posix', 'nt'])
+@pytest.mark.parametrize('active_listener', [False, True])
+def test_port_check_allows_posix_restart_but_rejects_active_listener(monkeypatch, platform, active_listener):
+    import service_launcher as launcher
+    options = []
+    class Probe:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def setsockopt(self, level, option, value):
+            options.append((level, option, value))
+        def bind(self, address):
+            assert address == ('127.0.0.1', 8765)
+            if active_listener or (platform == 'posix' and not options):
+                raise OSError(errno.EADDRINUSE, 'address in use')
+    monkeypatch.setattr(launcher.socket, 'socket', lambda *args: Probe())
+    # Replace only the module's platform view, not Python's shared os module.
+    monkeypatch.setattr(launcher, 'os', NS(name=platform))
+    if active_listener:
+        with pytest.raises(ValueError, match='8765 已被使用'):
+            launcher.check_port('127.0.0.1', 8765)
+    else:
+        launcher.check_port('127.0.0.1', 8765)
+    assert bool(options) == (platform == 'posix')
 
 
 def test_mock_has_only_dashboard_and_live_plan_shares_sessions(tmp_path):

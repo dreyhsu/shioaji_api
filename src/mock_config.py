@@ -24,6 +24,7 @@ class MarketConfig(Settings):
     decline_points_per_minute: float = Field(default=0.8, gt=0)
     rebound_points_per_minute: float = Field(default=2, gt=0)
     pullback_points_per_minute: float = Field(default=2, gt=0)
+    trend_curvature: float = Field(default=0, ge=-0.9, le=0.9)
     wave_amplitude: float = Field(default=0.6, ge=0)
     wave_scale_minutes: float = Field(default=7, gt=0)
     wick_points: float = Field(default=2, ge=0)

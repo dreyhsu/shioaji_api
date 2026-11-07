@@ -1,8 +1,14 @@
 import math
+import json
+import shutil
+import subprocess
+from pathlib import Path
 
 import pandas as pd
+import pytest
 from mock_market_data import v_shape_bars
-from mock_config import MarketConfig
+from mock_config import MarketConfig, MockConfig, ReplayConfig
+import session_bars as sb
 
 
 def test_scenario_is_deterministic_session_aligned_and_v_shaped():
@@ -46,3 +52,87 @@ def test_long_scenario_is_not_limited_to_twelve_calendar_days():
     assert len(bars) == 16600
     assert bars.minute_start.iloc[-1] > pd.Timestamp(settings.start_time) + pd.Timedelta(days=12)
     assert bars.minute_start.is_unique and bars.minute_start.is_monotonic_increasing
+
+
+@pytest.mark.parametrize('curvature', [-0.9, 0.65, 0.9])
+def test_curved_trend_preserves_phase_endpoints_and_price_bounds(curvature):
+    settings = MarketConfig(wave_amplitude=0, trend_curvature=curvature)
+    bars = v_shape_bars(settings)
+    bottom = settings.start_price - settings.decline_minutes * settings.decline_points_per_minute
+    peak = bottom + settings.rebound_minutes * settings.rebound_points_per_minute
+    assert bars.close.iloc[0] == settings.start_price
+    assert bars.close.iloc[settings.decline_minutes] == bottom
+    assert bars.close.iloc[settings.decline_minutes + settings.rebound_minutes] == peak
+    assert bars.close.iloc[:settings.decline_minutes + 1].is_monotonic_decreasing
+    assert bars.close.iloc[settings.decline_minutes:settings.decline_minutes + settings.rebound_minutes + 1].is_monotonic_increasing
+    assert bars.close.iloc[settings.decline_minutes + settings.rebound_minutes:].is_monotonic_decreasing
+    midpoint = settings.decline_minutes // 2
+    linear = settings.start_price - midpoint * settings.decline_points_per_minute
+    assert abs(bars.close.iloc[midpoint] - linear) > 400
+
+
+def demo_config():
+    # Fixed test input: a user's chosen replay cursor must not remove the rising
+    # phase from this two-direction fitting regression.
+    return MockConfig(market=MarketConfig(trend_curvature=.65, wave_amplitude=100, wave_scale_minutes=15),
+                      replay=ReplayConfig(start_bar=4020))
+
+
+def test_configured_replay_shows_curved_swings_in_both_directions_on_15m():
+    config = demo_config()
+    minutes = v_shape_bars(config.market)
+    pd.testing.assert_frame_equal(minutes, v_shape_bars(config.market))
+    bars = sb.minute_bars_to_interval(minutes.iloc[:config.warmup_minutes], 15).tail(120)
+    turn = minutes.iloc[config.market.decline_minutes].minute_start
+    for rising, phase in [(False, bars[bars.timestamp < turn]), (True, bars[bars.timestamp >= turn])]:
+        assert len(phase) >= 20
+        changes = phase.close.diff().dropna()
+        assert (changes > 0).sum() >= 5 and (changes < 0).sum() >= 5
+        assert (phase.close.iloc[-1] > phase.close.iloc[0]) == rising
+        # Same two-neighbor pivot definition used by the chart fitter, without
+        # counting synthetic phase-boundary extrema.
+        for field, comparison in [('low', min), ('high', max)]:
+            prices = phase[field].tolist()
+            pivots = [i for i in range(2, len(prices) - 2)
+                      if prices[i] == comparison(prices[i - 2:i + 3])]
+            assert len(pivots) >= 3, (rising, field, pivots)
+            # Successive extrema follow a changing slope rather than a straight
+            # envelope; the overlay curve therefore has something real to fit.
+            slopes = [(prices[b] - prices[a]) / (b - a) for a, b in zip(pivots, pivots[1:])]
+            assert max(slopes) - min(slopes) > 0.5
+
+
+def test_chart_auto_curve_can_fit_both_configured_15m_trends():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node required to verify the chart fitter against Mock candles')
+    config = demo_config()
+    minutes = v_shape_bars(config.market)
+    bars = sb.minute_bars_to_interval(minutes.iloc[:config.warmup_minutes], 15).tail(120)
+    turn = minutes.iloc[config.market.decline_minutes].minute_start
+    phases = []
+    for phase in (bars[bars.timestamp < turn], bars[bars.timestamp >= turn]):
+        phases.append([{'time': int(row.timestamp.value // 10**9),
+                        'open': row.open, 'high': row.high, 'low': row.low, 'close': row.close}
+                       for row in phase.itertuples(index=False)])
+    script = """
+const fit = require(process.argv[1]);
+const frames = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+console.log(JSON.stringify(frames.map(bars => {
+  const result = fit.fit(bars, {i:0,price:Math.min(...bars.map(b=>b.low))-1},
+    {i:bars.length-1,price:Math.max(...bars.map(b=>b.high))+1}, '15m', bars.at(-1).time+900);
+  const [a,b,c] = result.points;
+  return {direction:result.direction,samples:result.samples.length,
+    initial:(b.price-a.price)/(b.i-a.i),terminal:fit.slope(result.points),
+    bend:(c.price-b.price)/(c.i-b.i)-(b.price-a.price)/(b.i-a.i)};
+})));
+"""
+    result = subprocess.run([node, '-e', script, str(Path(__file__).parent / 'web' / 'auto_curve.js')],
+        input=json.dumps(phases), capture_output=True, text=True, check=True)
+    fits = json.loads(result.stdout)
+    assert [fit['direction'] for fit in fits] == ['down', 'up']
+    for sign, fit in zip((-1, 1), fits):
+        assert fit['samples'] >= 3
+        assert sign * fit['initial'] >= -1e-8
+        assert sign * fit['terminal'] >= -1e-8
+        assert sign * fit['bend'] >= -1e-8

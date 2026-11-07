@@ -29,14 +29,21 @@ def v_shape_bars(settings: MarketConfig | None = None) -> pd.DataFrame:
     frame = pd.concat(chunks, ignore_index=True).iloc[:count].copy()
     bottom = settings.start_price - settings.decline_minutes * settings.decline_points_per_minute
     peak = bottom + settings.rebound_minutes * settings.rebound_points_per_minute
+
+    def distance(elapsed, duration, rate):
+        # A bounded quadratic easing preserves phase endpoints and direction.
+        # Zero keeps the original deterministic linear scenario exactly intact.
+        return rate * elapsed * (1 + settings.trend_curvature * (1 - elapsed / duration))
+
     closes = []
     for index in range(count):
         if index < settings.decline_minutes:
-            value = settings.start_price - settings.decline_points_per_minute * index
+            value = settings.start_price - distance(index, settings.decline_minutes, settings.decline_points_per_minute)
         elif index < settings.decline_minutes + settings.rebound_minutes:
-            value = bottom + settings.rebound_points_per_minute * (index - settings.decline_minutes)
+            value = bottom + distance(index - settings.decline_minutes, settings.rebound_minutes, settings.rebound_points_per_minute)
         else:
-            value = peak - settings.pullback_points_per_minute * (index - settings.decline_minutes - settings.rebound_minutes)
+            value = peak - distance(index - settings.decline_minutes - settings.rebound_minutes,
+                                    settings.pullback_minutes, settings.pullback_points_per_minute)
         closes.append(round(value + settings.wave_amplitude * math.sin(index / settings.wave_scale_minutes)))
     frame["close"] = closes
     frame["open"] = frame["close"].shift(1).fillna(frame["close"].iloc[0])

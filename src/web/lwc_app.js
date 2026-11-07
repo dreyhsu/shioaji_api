@@ -47,6 +47,9 @@ let gaps = null;
 let framed = false;
 const indicators = new Map(); // name -> { series, spec }
 let lastBars = [];
+let barIndices = new Map();
+let chartGeneratedEpoch = 0;
+let autoCurve = null;
 let tradeOrder = null;
 let pnlPrimitive = null;
 let tradePnlHovered = false;
@@ -166,6 +169,24 @@ function initChart() {
   pnlPrimitive = new PnlPrimitive();
   candles.attachPrimitive(pnlPrimitive);
 
+  autoCurve = new AutoCurveTool({
+    element: document.getElementById('chart'), chart, candles,
+    button: document.getElementById('draw-auto-curve'),
+    saveButton: document.getElementById('auto-curve-save'),
+    cancelButton: document.getElementById('auto-curve-cancel'),
+    hint: document.getElementById('auto-curve-hint'),
+    available: () => !switchingTimeframe && displayedTimeframe === timeframe
+      && !boxDrag.hit && !tradeLevelDrag.part && lastBars.length >= 3,
+    snapshot: () => ({bars: lastBars, timeframe: displayedTimeframe, now: chartGeneratedEpoch}),
+    beforeStart: () => { setDrawing(null); hideCurveHover(); },
+    afterEnd: () => refresh(),
+    save: async body => {
+      if (CODE) body.code = CODE;
+      await persistTrendline(body);
+      document.dispatchEvent(new Event('trendlines-changed'));
+    },
+  });
+
   chart.subscribeCrosshairMove(onCrosshairMove);
   listenForCurveHover(document.getElementById('chart'));
   chart.timeScale().subscribeVisibleLogicalRangeChange(hideCurveHover);
@@ -281,12 +302,13 @@ function onCrosshairMove(param) {
 // ----------------------------------------------------------- curve identity
 function hideCurveHover() {
   document.getElementById('curve-tooltip').hidden = true;
+  autoCurve?.showProjection(null);
 }
 
 function listenForCurveHover(element) {
   element.addEventListener('pointermove', event => {
     const tooltip = document.getElementById('curve-tooltip');
-    if (draw.kind || boxDrag.hit || tradeLevelDrag.part || switchingTimeframe || event.buttons) {
+    if (draw.kind || autoCurve?.active || boxDrag.hit || tradeLevelDrag.part || switchingTimeframe || event.buttons) {
       hideCurveHover();
       return;
     }
@@ -306,6 +328,8 @@ function listenForCurveHover(element) {
     if (!closest) { hideCurveHover(); return; }
     const curve = closest.curve;
     tooltip.textContent = `${curve.label || '曲線'} · [${curve.timeframe || '1h'}] · #${curve.id}`;
+    if (curve.projection) tooltip.textContent += ' · ' + AutoCurve.label(curve.projection, curve.timeframe);
+    autoCurve?.showProjection(curve);
     tooltip.hidden = false;
     tooltip.style.left = Math.max(0, Math.min(point.x + 14, element.clientWidth - tooltip.offsetWidth - 6)) + 'px';
     tooltip.style.top = Math.max(0, Math.min(point.y + 14, chart.panes()[PANE_PRICE].getHeight() - tooltip.offsetHeight - 6)) + 'px';
@@ -352,6 +376,8 @@ const HINTS = {
 };
 
 function setDrawing(kind) {
+  if (kind && autoCurve?.busy) return;
+  if (kind) autoCurve?.cancel();
   hideCurveHover();
   if (kind && (switchingTimeframe || displayedTimeframe !== timeframe
     || !canDraw(kind, timeframe))) return;
@@ -388,8 +414,7 @@ function bezierAt(p0, p1, p2, x) {
 }
 
 function barIndex(time) {
-  for (let i = lastBars.length - 1; i >= 0; i--) if (lastBars[i].time === time) return i;
-  return -1;
+  return barIndices.get(time) ?? -1;
 }
 
 // [start, control, end] in bar-index form, or null if the control is not
@@ -533,18 +558,24 @@ async function saveDrawing() {
   if (!enough) return;
   const body = { kind: draw.kind, anchors: draw.anchors, timeframe: displayedTimeframe };
   if (CODE) body.code = CODE;
-  const response = await fetch('/api/trendlines', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    alert('儲存失敗：' + response.status);
+  try {
+    await persistTrendline(body);
+  } catch (error) {
+    alert('儲存失敗：' + error.message);
     return;
   }
   setDrawing(null);
   document.dispatchEvent(new Event('trendlines-changed'));
   refresh();
+}
+
+async function persistTrendline(body) {
+  const response = await fetch('/api/trendlines', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(String(response.status));
 }
 
 async function deleteTrendline(id) {
@@ -603,7 +634,7 @@ const MIN_BOX_HEIGHT = 1;
 const boxDrag = { hit: null, startY: 0, startTop: 0, startBottom: 0, moved: false, autoScale: true };
 
 function boxHitAt(el, event) {
-  if (draw.kind) return null; // drawing a trendline owns the clicks
+  if (draw.kind || autoCurve?.active) return null; // drawing tools own the clicks
   const rect = el.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -835,7 +866,7 @@ function setTradeHoverVisibility(hovered) {
 }
 
 function tradeLineHit(el, event) {
-  if (!tradeOrder?.risk_editable || draw.kind || boxDrag.hit) return null;
+  if (!tradeOrder?.risk_editable || draw.kind || autoCurve?.active || boxDrag.hit) return null;
   const rect = el.getBoundingClientRect();
   const y = event.clientY - rect.top;
   if (y < 0 || y > chart.panes()[PANE_PRICE].getHeight()) return null;
@@ -918,7 +949,15 @@ function listenForTradeLevelEdits(el) {
   }, true);
 }
 
-window.SNRChart = { setTradeOrder, refresh: () => refresh() };
+window.SNRChart = {
+  setTradeOrder, refresh: () => refresh(),
+  prepareReplayReset: () => {
+    if (autoCurve?.busy) return false;
+    autoCurve?.cancel();
+    setDrawing(null);
+    return true;
+  },
+};
 
 function boxKey(box) {
   const body = { box_type: box.box_type, created_time: box.created_time };
@@ -982,15 +1021,17 @@ function updateTimeframeButtons(loading = false) {
     button.title = canDraw(tool, timeframe) ? ''
       : tool === 'curve' ? '切換至 1m、5m、15m 或 1h 畫曲線' : '切換至 1h 畫線';
   }
+  document.getElementById('draw-auto-curve').disabled = loading || lastBars.length < 3 || !!autoCurve?.busy;
 }
 
 async function selectTimeframe(next) {
   hideCurveHover();
   if (!chart) return;
-  if (next === timeframe || boxDrag.hit) return;
+  if (next === timeframe || boxDrag.hit || autoCurve?.busy) return;
   const previous = timeframe;
   timeframe = next;
   switchingTimeframe = true;
+  autoCurve?.cancel();
   setDrawing(null);
   updateTimeframeButtons(true);
   try {
@@ -1014,7 +1055,7 @@ for (const button of document.querySelectorAll('[data-timeframe]')) {
 
 // ---------------------------------------------------------------- refresh loop
 async function refreshChart() {
-  if (!chart) return 0;
+  if (!chart || autoCurve?.active) return lastBars.length;
   const request = ++chartRequest;
   const query = ['timeframe=' + timeframe];
   if (CODE) query.push('code=' + encodeURIComponent(CODE));
@@ -1024,10 +1065,14 @@ async function refreshChart() {
   if (!response.ok) throw new Error('chart ' + response.status);
   const payload = await response.json();
   if (request !== chartRequest) return;
+  if (autoCurve?.active) return lastBars.length;
 
   const switched = displayedTimeframe !== payload.timeframe;
   displayedTimeframe = payload.timeframe;
   lastBars = payload.bars || [];
+  barIndices = new Map(lastBars.map((bar, index) => [bar.time, index]));
+  // Match the chart's naive Taipei-as-UTC convention, including in Mock replay.
+  chartGeneratedEpoch = Date.parse(payload.generated_at.replace(' ', 'T').slice(0, 23) + 'Z') / 1000;
   // A full setData keeps barSpacing and the visible window -- it is not a view
   // reset -- and when bars are appended the library either follows the newest
   // bar (if you are parked at the right edge) or compensates the scroll so the
@@ -1059,6 +1104,7 @@ async function refreshChart() {
     frameInitialViewport(lastBars.length);
     framed = true;
   }
+  updateTimeframeButtons(switchingTimeframe);
   return lastBars.length;
 }
 

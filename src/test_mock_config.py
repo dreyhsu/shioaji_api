@@ -25,6 +25,8 @@ def test_partial_config_defaults_and_path_independent_of_working_directory(tmp_p
     {"market": {"decline_minutes": True}},
     {"market": {"rebound_minutes": 1.5}},
     {"market": {"wave_scale_minutes": 0}},
+    {"market": {"trend_curvature": 0.91}},
+    {"market": {"trend_curvature": -0.91}},
     {"market": {"volume_cycle_minutes": 0}},
     {"market": {"start_price": 10}},
     {"market": {"pullback_minutes": 100000}},
