@@ -100,6 +100,16 @@ async def _lifespan(_app):
 app = FastAPI(title="TMF S/R monitor", lifespan=_lifespan)
 app.include_router(mock_router)
 
+# Keep calendar configuration and replay locking separate from chart loading.
+def _pnl_context():
+    runtime = getattr(app.state, 'mock_runtime', None)
+    return dict(db_path=CONFIG['db_path'], mode='mock' if runtime is not None else CONFIG.get('mode', 'simulation'),
+                now=_dashboard_now, lock=runtime.lock if runtime is not None else None)
+
+
+from pnl_calendar import create_router as create_pnl_router
+app.include_router(create_pnl_router(_pnl_context))
+
 @app.middleware('http')
 async def trading_identity(request: Request, call_next):
     token = command_id.set(request.headers.get('Idempotency-Key'))

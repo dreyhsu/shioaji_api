@@ -328,7 +328,9 @@ def _migrate_trendline_timeframes(conn):
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
+    from pnl_calendar import SCHEMA as PNL_SCHEMA
     conn.executescript(SCHEMA)
+    conn.executescript(PNL_SCHEMA)
     for table, column, statement in MIGRATIONS:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:

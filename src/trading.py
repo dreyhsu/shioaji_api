@@ -29,6 +29,7 @@ from place_order import OrderRequest, OrderContext, validate_request, place_orde
 from shioaji_order_adapter import ShioajiOrderAdapter
 from curve_entry_controller import CurveEntryController
 from entry_notify import EntryNotifier
+import pnl_calendar
 from alert_rules import DEFAULT_CONFIG_PATH as DEFAULT_ALERTS_PATH
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -447,6 +448,7 @@ class TradingService:
                 for trade in self._api.list_trades()
                 if _trade_id(trade)
             }
+            self._sync_pnl_history(trades)
             self._sync_ok = True
             self._last_order_sync_at = mh.iso(self._now())
             if not self._reconcile_required:
@@ -603,6 +605,49 @@ class TradingService:
             self._recovery.success()
             self._connect_error = None
 
+    def _save_pnl(self, conn, row, *, entry=None, exit_trade=None):
+        # Reporting failure must not roll back a broker-confirmed order state or
+        # interrupt exit protection. The reader detects absent/incomplete fills.
+        conn.execute('SAVEPOINT pnl_write')
+        try:
+            try:
+                contract = self._find_contract(row['contract_code'])
+                multiplier = _value(contract, 'multiplier')
+                currency = _enum_text(_value(contract, 'currency', _value(contract, 'quote_ccy', '')))
+            except Exception:
+                multiplier, currency = None, None
+            pnl_calendar.save_fills(conn, row, entry=entry, exit_trade=exit_trade,
+                multiplier=multiplier, currency=currency, observed_at=self._now().isoformat())
+        except Exception as error:
+            conn.execute('ROLLBACK TO pnl_write')
+            print(f'[PnL] 成交明細保存失敗：{type(error).__name__}')
+        finally:
+            conn.execute('RELEASE pnl_write')
+
+    def _sync_pnl_history(self, trades):
+        """Recover closed orders from the same trade cache, without broker queries."""
+        ids = list(trades)
+        if not ids:
+            return
+        try:
+            with db.session(self.db_path) as conn:
+                for start in range(0, len(ids), 200):
+                    batch = ids[start:start + 200]
+                    placeholders = ','.join('?' for _ in batch)
+                    # Look up current broker IDs by index rather than scanning
+                    # all historical closed orders on every trading cycle.
+                    rows = conn.execute(f'''SELECT * FROM managed_orders
+                        WHERE entry_trade_id IN ({placeholders}) UNION SELECT * FROM managed_orders
+                        WHERE exit_trade_id IN ({placeholders})''', (*batch, *batch)).fetchall()
+                    for row in rows:
+                        if row['active'] or row['code'] != self.code or row['simulation'] != int(self.simulation):
+                            continue
+                        self._save_pnl(conn, dict(row), entry=trades.get(row['entry_trade_id']),
+                                       exit_trade=trades.get(row['exit_trade_id']))
+                conn.commit()
+        except Exception as error:
+            print(f'[PnL] 歷史成交明細保存失敗：{type(error).__name__}')
+
     @risk_locked
     def _persist_trade_state(self, row_id: str, *, entry=None, exit_trade=None) -> None:
         original = self._active_order(row_id)
@@ -663,6 +708,7 @@ class TradingService:
                 f"UPDATE managed_orders SET {assignments} WHERE id = ?",
                 (*updates.values(), row_id),
             )
+            self._save_pnl(conn, {**original, **updates}, entry=entry, exit_trade=exit_trade)
             conn.commit()
 
         if new_fill:

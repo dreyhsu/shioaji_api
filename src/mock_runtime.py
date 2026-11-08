@@ -105,7 +105,7 @@ class MockRuntime:
             self.service.close()
             # This path was created by this runtime and cannot be a user database.
             with db.session(self.db_path) as conn:
-                for table in ("curve_entries", "managed_orders", "trendlines", "minute_bars"):
+                for table in ("pnl_fills", "pnl_order_metadata", "curve_entries", "managed_orders", "trendlines", "minute_bars"):
                     conn.execute(f"DELETE FROM {table}")
                 conn.commit()
             self._initialize()

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>損益月曆 · TMF</title>
+  <link rel="stylesheet" href="/static/pnl_calendar/style.css">
+  <script src="/static/pnl_calendar/calendar.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="topbar">
+      <a class="back" href="/">← 交易 Dashboard</a>
+      <div class="top-actions"><span id="mode" class="badge">讀取模式…</span><button id="refresh" type="button">↻ 重新整理</button></div>
+    </header>
+    <section class="heading">
+      <div><p class="eyebrow">TRADING JOURNAL</p></div>
+      <label class="contract-label">月份合約<select id="contract"><option value="">全部合約</option></select></label>
+    </section>
+    <section class="stats" aria-label="當月統計">
+      <article><span>本月已實現毛損益</span><strong id="total">—</strong><small>TWD · 未扣手續費及交易稅</small></article>
+      <article><span>平倉訂單</span><strong id="orders">—</strong><small>當月原始訂單去重</small></article>
+      <article><span>平倉口數</span><strong id="quantity">—</strong><small>只計已成交的平倉</small></article>
+    </section>
+    <section class="calendar-card" aria-labelledby="month-title">
+      <div class="calendar-toolbar">
+        <div class="month-controls"><h2 id="month-title">—</h2><button id="previous" type="button" aria-label="上一月">‹</button><button id="next" type="button" aria-label="下一月">›</button><button id="today" type="button">本月</button></div>
+        <div class="legend"><span><i class="profit-dot"></i>獲利</span><span><i class="loss-dot"></i>虧損</span><span><i class="flat-dot"></i>損益為零</span></div>
+      </div>
+      <div id="message" class="message" role="status" aria-live="polite">載入損益資料…</div>
+      <div class="calendar-scroll"><div class="weekdays" aria-hidden="true"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div><div id="calendar" class="calendar" aria-label="每日平倉損益" aria-busy="true"></div></div>
+      <footer><span>台北實際平倉日期 · 本系統管理交易</span><span id="updated">尚未更新</span></footer>
+    </section>
+    <p class="note">分批平倉分次認列；每日筆數依原始訂單去重，因此每日筆數相加可能高於月筆數。未平倉浮動損益不計入。</p>
+    <section id="detail" class="detail-card" hidden aria-labelledby="detail-title">
+      <div class="detail-heading"><div><p class="eyebrow">DAILY FILLS</p><h2 id="detail-title">當日平倉明細</h2></div><button id="close-detail" type="button">收起明細</button></div>
+      <p id="detail-summary" role="status"></p>
+      <div class="table-scroll"><table><thead><tr><th>台北平倉時間</th><th>訂單 ID</th><th>合約</th><th>方向</th><th>口數</th><th>進場均價</th><th>平倉價</th><th>毛損益 TWD</th></tr></thead><tbody id="fills"></tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>

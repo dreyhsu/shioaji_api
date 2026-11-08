@@ -28,7 +28,8 @@ class MockBroker:
         self.clock = clock
         self.settings = settings if settings is not None else load_mock_config().broker
         self.contract = NS(code=f"{root}_MOCK", symbol=f"{root}209912", target_code=f"{root}_MOCK",
-                           delivery_month="209912", delivery_date="2099/12/31", name="離線 Mock 期貨", tick=1)
+                           delivery_month="209912", delivery_date="2099/12/31", name="離線 Mock 期貨", tick=1,
+                           multiplier=10, currency="TWD")
         self.Contracts = NS(Futures=NS(**{root: [self.contract]}))
         self.futopt_account = NS(account_id="OFFLINE-MOCK")
         self.trades = []
@@ -66,7 +67,8 @@ class MockBroker:
                     return
             status.status = "Filled"
             status.deal_quantity = order.quantity
-            status.deals = [NS(quantity=order.quantity, price=self.price)]
+            status.deals = [NS(seq=f"{order.id}-fill-1", quantity=order.quantity,
+                               price=self.price, datetime=self.clock())]
             status.average_price = self.price
             self.position += order.quantity * (1 if action == "Buy" else -1)
         elif _text(order.order_type) in {"IOC", "FOK"}:
