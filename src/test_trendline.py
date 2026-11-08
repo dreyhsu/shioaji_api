@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-import json
-import shutil
-import subprocess
-from pathlib import Path
 
 import dashboard
 import trendline as tl
@@ -89,29 +85,4 @@ def test_curve_needs_exactly_three_anchors():
     assert tl.anchor_indices(frame, two, "curve") is None
     three = two + [anchor(HOURS[4], 3)]
     assert tl.anchor_indices(frame, three, "curve") == [(0, 1.0), (2, 2.0), (4, 3.0)]
-
-
-def test_browser_auto_fit_and_python_trading_geometry_agree():
-    node = shutil.which('node')
-    if node is None:
-        pytest.skip('Node required for browser/Python geometry parity')
-    module = Path(__file__).parent / 'web' / 'auto_curve.js'
-    script = """
-const fit = require(process.argv[1]);
-const bars = Array.from({length:32}, (_,i) => {
-  const low = 100 + .2*i + .01*i*i + [4,2,0,2,4][i%5];
-  return {time: 100000+i*900, low, high:low+10, close:low+5};
-});
-const result = fit.fit(bars,{i:0,price:0},{i:31,price:1000},'15m',Infinity);
-console.log(JSON.stringify({bars,points:result.points,projection:fit.projection(result.points,2),
-  values:Array.from({length:40},(_,i)=>fit.value(result.points,i))}));
-"""
-    result = subprocess.run([node, '-e', script, str(module)], capture_output=True, text=True, check=True)
-    payload = json.loads(result.stdout)
-    points = [(point['i'], point['price']) for point in payload['points']]
-    for i, value in enumerate(payload['values']):
-        assert tl.value_at(points, i, 'curve') == pytest.approx(value, abs=1e-8)
-    frame = pd.DataFrame({'timestamp': pd.to_datetime([b['time'] for b in payload['bars']], unit='s')})
-    line = {'kind': 'curve', 'anchors': payload['points'], 'angle_reference_points_per_bar': 2}
-    assert tl.projection(frame, line) == pytest.approx(payload['projection'])
 

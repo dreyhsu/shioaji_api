@@ -64,44 +64,6 @@ def test_epoch_reads_a_naive_taipei_stamp_as_utc():
     assert pd.Timestamp(1786351500, unit="s").strftime("%H:%M") == "08:45"
 
 
-def test_auto_curve_reference_round_trip_and_source_projection(client):
-    bars = client.get('/api/chart?timeframe=15m').json()['bars']
-    chosen = bars[-31:-1]
-    anchors = [{'time': chosen[i]['time'], 'price': price} for i, price in [(0, 20000), (14, 20010), (29, 20040)]]
-    body = {'kind': 'curve', 'timeframe': '15m', 'anchors': anchors, 'angle_reference_points_per_bar': 2}
-    response = client.post('/api/trendlines', json=body)
-    assert response.status_code == 200
-    line_id = response.json()['id']
-    dashboard._LOAD_CACHE.clear()  # Also exercise persistence rather than request-local state.
-    for timeframe in ('1m', '5m', '15m', '1h'):
-        payload = client.get('/api/chart', params={'timeframe': timeframe}).json()
-        curve = next(line for line in payload['trendlines'] if line['id'] == line_id)
-        assert curve['angle_reference_points_per_bar'] == 2
-        assert curve['anchors'] == anchors
-        assert curve['projection']['slope_per_bar'] == pytest.approx(2)
-        assert curve['projection']['reference_angle_degrees'] == pytest.approx(45)
-    curve = client.get('/api/trendlines').json()[0]
-    assert curve['projection']['reference_angle_degrees'] == pytest.approx(45)
-    with db.read_session(dashboard.CONFIG['db_path']) as conn:
-        assert conn.execute('SELECT COUNT(*) FROM curve_entries').fetchone()[0] == 0
-        assert conn.execute('SELECT COUNT(*) FROM managed_orders').fetchone()[0] == 0
-
-
-def test_reference_angle_validation_and_legacy_default(client):
-    anchors = [{'time': 100 + i * 60, 'price': 100 + i} for i in range(3)]
-    for reference in (0, -1):
-        response = client.post('/api/trendlines', json={'kind': 'curve', 'anchors': anchors,
-            'angle_reference_points_per_bar': reference})
-        assert response.status_code == 422
-    assert client.post('/api/trendlines', json={'anchors': anchors,
-        'angle_reference_points_per_bar': 1}).status_code == 422
-    assert client.post('/api/trendlines', json={'kind': 'curve', 'anchors': anchors}).status_code == 200
-    assert client.get('/api/trendlines').json()[0]['angle_reference_points_per_bar'] is None
-    for reference in (float('inf'), float('nan')):
-        with pytest.raises(ValueError):
-            dashboard.TrendlineIn(kind='curve', anchors=anchors, angle_reference_points_per_bar=reference)
-
-
 def test_bars_are_ascending_and_unique(client):
     bars = client.get("/api/chart").json()["bars"]
     assert bars

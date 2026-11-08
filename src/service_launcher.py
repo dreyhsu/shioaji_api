@@ -54,11 +54,6 @@ def service_plan(config, ui, path):
 def check_port(host, port):
     family = socket.AF_INET6 if ':' in host else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as sock:
-        # Match uvicorn's POSIX restart behavior: a closed connection in
-        # TIME_WAIT is not a running service. Active listeners still block bind.
-        # Windows SO_REUSEADDR can share an active listener, so never use it there.
-        if os.name != 'nt':
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
         except OSError as error:

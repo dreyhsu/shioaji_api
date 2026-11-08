@@ -7,8 +7,6 @@ from fastapi.testclient import TestClient
 import dashboard
 import db
 import session_bars as sb
-import trendline as tl
-import alert_rules as ar
 from mock_config import MockConfig
 from mock_runtime import MockRuntime
 
@@ -223,72 +221,6 @@ def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_pr
         "entry_count": len(runtime.broker.trades), "position": runtime.broker.position,
         "entry_state": entry["state"], "triggered_at": entry["triggered_at"],
     }))
-
-
-@pytest.mark.parametrize('timeframe,step', [('1m', 1), ('5m', 5), ('15m', 15), ('1h', 60)])
-@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
-def test_auto_curve_uses_manual_alert_entry_and_exit_pipeline(replay, timeframe, step, action, direction):
-    runtime, client = replay
-    runtime.service.settings_path.write_text('{"auto_entry_enabled": true, "auto_exit_enabled": true}')
-    minutes = runtime.bars.iloc[:runtime.cursor]
-    source = tl.source_bars(minutes, timeframe)
-    previous = minutes.iloc[-1]
-    fraction = (previous.minute_start - source.iloc[-1].timestamp) / pd.Timedelta(minutes=step)
-    slope = -direction * .5
-    end_price = runtime.broker.price + direction - slope * fraction
-    anchors = [{'time': dashboard._epoch(source.iloc[i].timestamp),
-                'price': end_price + slope * (i - len(source) + 1)}
-               for i in range(len(source) - 3, len(source))]
-    response = client.post('/api/trendlines', json={'kind': 'curve', 'timeframe': timeframe,
-        'anchors': anchors, 'angle_reference_points_per_bar': 2})
-    assert response.status_code == 200
-    curve_id = response.json()['id']
-    assert runtime.entry is None and not runtime.broker.trades
-    armed = client.post('/api/trading/curve-entry', json={'curve_id': curve_id,
-        'contract_code': 'TMF209912', 'quantity': 1, 'action': action, 'simulation': True, 'confirmed': True})
-    assert armed.status_code == 200, armed.text
-    assert armed.json()['timeframe'] == timeframe
-    assert not runtime.broker.trades
-
-    def publish_crossing(sign):
-        minute = runtime.bars.iloc[runtime.cursor].minute_start
-        with db.read_session(runtime.db_path) as conn:
-            stored = db.load_minute_bars(conn, runtime.code)
-        geometry = tl.source_bars(pd.concat([stored, runtime.bars.iloc[runtime.cursor:runtime.cursor + 1]]), timeframe)
-        level = tl.values_at_times(geometry, anchors, [minute], timeframe=timeframe).iloc[0]
-        price = round(level + sign * 5)
-        runtime.bars.loc[runtime.cursor, ['open', 'high', 'low', 'close']] = [price, price + 2, price - 2, price]
-        runtime.advance(1)
-        return price
-
-    publish_crossing(direction)
-    assert runtime.entry['state'] == 'triggered'
-    assert len(runtime.broker.trades) == 1
-    entry = runtime.service._active_order(runtime.entry['order_id'])
-    assert entry['action'] == action and entry['filled_quantity'] == 1
-    runtime.sync()
-    assert len(runtime.broker.trades) == 1  # Consumed entry signal cannot resubmit.
-
-    # Generate the same Telegram candidates as a manual curve, without sending.
-    with db.read_session(runtime.db_path) as conn:
-        stored = db.load_minute_bars(conn, runtime.code)
-        auto = next(line for line in db.load_trendlines(conn, runtime.code) if line['id'] == curve_id)
-    context = dict(code=runtime.code, minute_bar=stored.iloc[-1], boxes={},
-        hourly=sb.minute_bars_to_hourly(stored), config=ar.AlertConfig(runtime.db_path.parent / 'alerts.json'),
-        minute_bars=stored, hourly_atr=None)
-    hits = ar.evaluate(trendlines=[auto], **context)
-    manual = {key: value for key, value in auto.items() if key != 'angle_reference_points_per_bar'}
-    assert hits == ar.evaluate(trendlines=[manual], **context)
-    rule = 'trendline_break_above_down' if direction == 1 else 'trendline_break_below_up'
-    assert any(hit.rule == rule and hit.once and f'[{timeframe}]' in hit.message for hit in hits)
-
-    selected = client.put(f"/api/trading/orders/{entry['id']}/curve-selection", json={'curve_id': curve_id})
-    assert selected.status_code == 200, selected.text
-    publish_crossing(-direction)
-    closed = runtime.service._active_order(entry['id'])
-    assert closed['trigger_reason'] == 'curve'
-    assert closed['exit_status'] == 'Filled' and not closed['active']
-    assert runtime.broker.position == 0 and len(runtime.broker.trades) == 2
 
 
 def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, record_property):

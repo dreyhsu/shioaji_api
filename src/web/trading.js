@@ -212,7 +212,7 @@
       if (exitCurves().some((line) => String(line.id) === previous)) select.value = previous;
       const entrySelect = $('entry-curve');
       const entryPrevious = entrySelect.value;
-      entrySelect.replaceChildren(new Option('選擇已儲存的 1m／5m／15m／1h 曲線（手動／自動）', ''));
+      entrySelect.replaceChildren(new Option('選擇手動保存的 1m／5m／15m／1h 曲線', ''));
       for (const line of lines) entrySelect.add(new Option(curveLabel(line), String(line.id)));
       if (lines.some((line) => String(line.id) === entryPrevious)) entrySelect.value = entryPrevious;
       curvesListKey = listKey;

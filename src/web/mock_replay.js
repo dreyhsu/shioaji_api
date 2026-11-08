@@ -78,10 +78,6 @@
     request('/api/mock/control', { action: 'step', steps: Number(button.dataset.mockStep) }))));
   $('mock-reset').addEventListener('click', async () => {
     if (!await window.TradingUI.confirm('清除本次 Mock 委託、曲線與進場設定，從設定的回放起點重新開始？')) return;
-    if (window.SNRChart?.prepareReplayReset?.() === false) {
-      message('曲線儲存中，請完成後再重設', true);
-      return;
-    }
     run(async () => {
       await request('/api/mock/control', { action: 'reset', confirmed: true });
       await window.TradingUI?.refreshCurves();

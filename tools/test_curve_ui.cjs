@@ -24,7 +24,6 @@ function element() {
   get('timeframes').querySelectorAll = () => [];
   const saved = [], events = [];
   const chart = { timeframe: '1m', displayedTimeframe: '1m', switchingTimeframe: false,
-    autoCurve: null, lastBars: [1, 2, 3],
     draw: { kind: null, anchors: [] }, CODE: 'TMFR1', updateHint() {}, refresh() {}, hideCurveHover() {},
     chart: { removeSeries() {} }, Event: class { constructor(type) { this.type = type; } },
     document: { getElementById: get, dispatchEvent: (event) => events.push(event.type) },
