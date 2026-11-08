@@ -143,6 +143,8 @@ body {
 .chart-tools button:focus-visible { outline: 2px solid #f5c542; outline-offset: 2px; }
 .draw-hint { padding: 0 2px 4px; font-size: 12px; color: #f5c542; }
 .draw-hint[hidden] { display: none; }
+#curve-draft-handles { position: absolute; top: 0; left: 0; z-index: 3; pointer-events: none; overflow: hidden; }
+#curve-draft-handles circle { fill: #1a1c23; stroke: #f5c542; stroke-width: 2; }
 .trendline-list { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 2px 4px; font-size: 12px; color: var(--muted); }
 .trendline-list:empty { display: none; }
 .trendline-list .tl { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 4px 1px 7px; }

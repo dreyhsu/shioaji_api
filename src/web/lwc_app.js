@@ -338,16 +338,19 @@ function frameInitialViewport(barCount) {
 // Two tools:
 //   line  -- 2 clicks = straight line, more = polyline; 完成 / Enter saves.
 //   curve -- TradingView's Curve: click start, click end, then move the mouse to
-//            bend it toward a control point and click to save.  The control must
+//            bend it toward a control point and click to place it. Enter saves
+//            after optional handle/body drags. The control must
 //            sit between start and end in time (keeps one value per bar).
-const draw = { kind: null, anchors: [], hover: null, preview: null, frame: 0 };
+const draw = { kind: null, anchors: [], hover: null, preview: null, frame: 0,
+  overlayFrame: 0, drag: null, saving: false, revision: 0, sampled: [] };
 const TRENDLINE_COLOR = '#f5c542';
 const HINTS = {
   line: '畫線模式：點 K 棒放錨點（2 點 = 直線，3+ 點 = 折線），按「完成」或 Enter 儲存 · Esc 取消',
   curve: [
     '曲線模式：點起點',
     '曲線模式：點終點',
-    '曲線模式：移動滑鼠拉彎曲線，點一下儲存（控制點須在起點與終點之間）· Esc 取消',
+    '曲線模式：移動滑鼠拉彎曲線，點一下放置彎曲點（須在起點與終點之間）· Esc 取消',
+    '拖曳端點／彎曲點調整形狀，拖曳曲線整體移動 · Enter 儲存 · Esc 取消',
   ],
 };
 
@@ -355,9 +358,17 @@ function setDrawing(kind) {
   hideCurveHover();
   if (kind && (switchingTimeframe || displayedTimeframe !== timeframe
     || !canDraw(kind, timeframe))) return;
+  finishCurveDrag(false);
+  if (draw.frame) cancelAnimationFrame(draw.frame);
+  if (draw.overlayFrame) cancelAnimationFrame(draw.overlayFrame);
+  draw.frame = draw.overlayFrame = 0;
+  draw.revision++;
   draw.kind = kind;
   draw.anchors = [];
+  draw.sampled = [];
   draw.hover = null;
+  document.getElementById('curve-draft-handles').replaceChildren();
+  document.getElementById('chart').style.cursor = '';
   if (draw.preview) {
     chart.removeSeries(draw.preview);
     draw.preview = null;
@@ -374,7 +385,7 @@ function updateHint() {
   const el = document.getElementById('draw-hint');
   el.hidden = !draw.kind;
   if (draw.kind === 'line') el.textContent = HINTS.line;
-  else if (draw.kind === 'curve') el.textContent = HINTS.curve[Math.min(draw.anchors.length, 2)];
+  else if (draw.kind === 'curve') el.textContent = draw.saving ? '曲線儲存中…' : HINTS.curve[Math.min(draw.anchors.length, 3)];
 }
 
 // Mirrors trendline._bezier_at, so the preview is the shape that will be saved.
@@ -446,9 +457,94 @@ function renderPreview() {
       PANE_PRICE,
     );
   }
-  draw.preview.setData(previewData());
+  draw.sampled = previewData();
+  draw.preview.setData(draw.sampled);
+  if (draw.kind === 'curve' && draw.anchors.length === 3 && !draw.overlayFrame) {
+    draw.overlayFrame = requestAnimationFrame(renderCurveHandles);
+  }
   document.getElementById('draw-done').hidden = !(draw.kind === 'line' && draw.anchors.length >= 2);
   updateHint();
+}
+
+// A pointer-transparent SVG follows the chart's current transforms, including
+// price-axis changes and pane resizing (which don't emit time-range events).
+function renderCurveHandles() {
+  draw.overlayFrame = 0;
+  const overlay = document.getElementById('curve-draft-handles');
+  overlay.replaceChildren();
+  if (draw.kind !== 'curve' || draw.anchors.length !== 3) return;
+  overlay.style.width = chart.timeScale().width() + 'px';
+  overlay.style.height = chart.panes()[PANE_PRICE].getHeight() + 'px';
+  for (const anchor of draw.anchors) {
+    const x = chart.timeScale().timeToCoordinate(anchor.time);
+    const y = candles.priceToCoordinate(anchor.price);
+    if (x === null || y === null) continue;
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('cx', x);
+    circle.setAttribute('cy', y);
+    circle.setAttribute('r', 5);
+    overlay.appendChild(circle);
+  }
+  draw.overlayFrame = requestAnimationFrame(renderCurveHandles);
+}
+
+function curveDraftHit(x, y) {
+  if (draw.kind !== 'curve' || draw.anchors.length !== 3 || draw.saving) return null;
+  if (x < 0 || x > chart.timeScale().width() || y < 0 || y > chart.panes()[PANE_PRICE].getHeight()) return null;
+  let nearest = null, distance = 8;
+  draw.anchors.forEach((anchor, index) => {
+    const ax = chart.timeScale().timeToCoordinate(anchor.time);
+    const ay = candles.priceToCoordinate(anchor.price);
+    if (ax === null || ay === null) return;
+    const gap = Math.hypot(x - ax, y - ay);
+    if (gap <= distance) { nearest = { index }; distance = gap; }
+  });
+  if (nearest) return nearest;
+  const data = draw.sampled;
+  const hit = CurveHover.hit([{ id: 0, data }], { x, y }, {
+    logical: chart.timeScale().coordinateToLogical(x) - barIndex(data[0].time),
+    tolerance: 8, barSpacing: chart.timeScale().options().barSpacing,
+    x: time => chart.timeScale().timeToCoordinate(time),
+    y: (_curve, price) => candles.priceToCoordinate(price),
+  });
+  return hit ? { index: null } : null;
+}
+
+function moveCurveDraft(x, y) {
+  const drag = draw.drag;
+  const logical = chart.timeScale().coordinateToLogical(x);
+  const price = candles.coordinateToPrice(y);
+  if (!drag || logical === null || price === null) return;
+  const indices = drag.anchors.map(anchor => barIndex(anchor.time));
+  if (indices.some(index => index < 0)) return;
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  const anchors = drag.anchors.map(anchor => ({ ...anchor }));
+  if (drag.index === null) {
+    const delta = clamp(Math.round(logical - drag.logical), -Math.min(...indices), lastBars.length - 1 - Math.max(...indices));
+    const shift = Math.round(price - drag.price);
+    anchors.forEach((anchor, i) => { anchor.time = lastBars[indices[i] + delta].time; anchor.price += shift; });
+  } else {
+    const i = drag.index;
+    let low = 0, high = lastBars.length - 1;
+    if (i === 2) { low = Math.min(indices[0], indices[1]) + 1; high = Math.max(indices[0], indices[1]) - 1; }
+    else if (indices[i] < indices[2]) high = indices[2] - 1;
+    else low = indices[2] + 1;
+    anchors[i] = { time: lastBars[clamp(Math.round(logical), low, high)].time, price: Math.round(price) };
+  }
+  draw.anchors = anchors;
+  renderPreview();
+}
+
+function finishCurveDrag(commit) {
+  const drag = draw.drag;
+  if (!drag) return;
+  draw.drag = null;
+  if (!commit) draw.anchors = drag.anchors;
+  if (drag.el.hasPointerCapture(drag.pointerId)) drag.el.releasePointerCapture(drag.pointerId);
+  chart.applyOptions({ handleScroll: drag.handleScroll, handleScale: drag.handleScale });
+  candles.priceScale().applyOptions({ autoScale: drag.autoScale });
+  drag.el.style.cursor = '';
+  renderPreview();
 }
 
 // Clicks come from raw pointer events, not chart.subscribeClick: the library
@@ -457,8 +553,60 @@ function renderPreview() {
 // A press that moves more than a few px is a pan, not a click.
 function listenForDrawClicks(el) {
   let down = null;
+  const position = event => {
+    const rect = el.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  };
+  el.addEventListener('pointerdown', event => {
+    if (draw.drag) { event.stopPropagation(); event.preventDefault(); return; }
+    if (event.button !== 0 || draw.saving) return;
+    const { x, y } = position(event);
+    const hit = curveDraftHit(x, y);
+    if (!hit) return;
+    event.stopPropagation();
+    event.preventDefault();
+    down = null;
+    const options = chart.options();
+    draw.drag = { ...hit, el, pointerId: event.pointerId,
+      anchors: draw.anchors.map(anchor => ({ ...anchor })),
+      logical: chart.timeScale().coordinateToLogical(x), price: candles.coordinateToPrice(y),
+      autoScale: candles.priceScale().options().autoScale,
+      handleScroll: { ...options.handleScroll }, handleScale: { ...options.handleScale } };
+    el.setPointerCapture(event.pointerId);
+    chart.applyOptions({ handleScroll: false, handleScale: false });
+    candles.priceScale().applyOptions({ autoScale: false });
+    el.style.cursor = 'grabbing';
+  }, true);
+  for (const type of ['mousedown', 'touchstart', 'dblclick']) {
+    el.addEventListener(type, event => {
+      if (draw.drag || (type === 'dblclick' && draw.kind === 'curve' && draw.anchors.length === 3)) event.stopPropagation();
+    }, true);
+  }
+  el.addEventListener('pointermove', event => {
+    const { x, y } = position(event);
+    if (draw.drag) {
+      if (event.pointerId !== draw.drag.pointerId) return;
+      event.stopPropagation();
+      moveCurveDraft(x, y);
+    } else if (draw.kind === 'curve' && draw.anchors.length === 3) {
+      el.style.cursor = curveDraftHit(x, y) ? 'grab' : '';
+    }
+  }, true);
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    el.addEventListener(type, event => {
+      if (type !== 'pointerup') down = null;
+      if (!draw.drag || event.pointerId !== draw.drag.pointerId) return;
+      down = null;
+      event.stopPropagation();
+      if (type === 'pointerup') {
+        const { x, y } = position(event);
+        moveCurveDraft(x, y);
+      }
+      finishCurveDrag(type === 'pointerup');
+    }, true);
+  }
   el.addEventListener('pointerdown', (event) => {
-    down = draw.kind && event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
+    down = draw.kind && !draw.saving && event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
   });
   el.addEventListener('pointerup', (event) => {
     if (!down) return;
@@ -490,18 +638,22 @@ function anchorFromParam(param) {
 }
 
 function onChartClick(anchor) {
-  if (!draw.kind || !anchor) return;
+  if (!draw.kind || !anchor || draw.saving) return;
 
   if (draw.kind === 'curve') {
+    if (draw.anchors.length === 3) return;
     if (draw.anchors.length < 2) {
       if (draw.anchors.length === 1 && draw.anchors[0].time === anchor.time) return;
+      // Three distinct candle slots are needed for the bend control.
+      if (draw.anchors.length === 1 && Math.abs(barIndex(draw.anchors[0].time) - barIndex(anchor.time)) < 2) return;
       draw.anchors.push(anchor);
       renderPreview();
       return;
     }
     if (!curvePoints([draw.anchors[0], draw.anchors[1], anchor])) return; // control out of range
     draw.anchors.push(anchor);
-    saveDrawing();
+    draw.hover = null;
+    renderPreview();
     return;
   }
 
@@ -530,21 +682,29 @@ function onDrawHover(param) {
 
 async function saveDrawing() {
   const enough = draw.kind === 'curve' ? draw.anchors.length === 3 : draw.anchors.length >= 2;
-  if (!enough) return;
+  if (!draw.kind || !enough || draw.saving || draw.drag) return;
+  if (draw.kind === 'curve' && !curvePoints(draw.anchors)) return;
   const body = { kind: draw.kind, anchors: draw.anchors, timeframe: displayedTimeframe };
   if (CODE) body.code = CODE;
-  const response = await fetch('/api/trendlines', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    alert('儲存失敗：' + response.status);
-    return;
+  const revision = draw.revision;
+  draw.saving = true;
+  updateHint();
+  try {
+    const response = await fetch('/api/trendlines', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(String(response.status));
+    if (draw.revision === revision) setDrawing(null);
+    document.dispatchEvent(new Event('trendlines-changed'));
+    refresh();
+  } catch (error) {
+    alert('儲存失敗：' + error.message);
+  } finally {
+    draw.saving = false;
+    updateHint();
   }
-  setDrawing(null);
-  document.dispatchEvent(new Event('trendlines-changed'));
-  refresh();
 }
 
 async function deleteTrendline(id) {
@@ -586,8 +746,9 @@ for (const tool of ['line', 'curve']) {
 document.getElementById('draw-done').addEventListener('click', saveDrawing);
 document.addEventListener('keydown', (event) => {
   if (!draw.kind) return;
-  if (event.key === 'Escape') setDrawing(null);
-  else if (event.key === 'Enter' && draw.kind === 'line') saveDrawing();
+  if (event.target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+  if (event.key === 'Escape') { event.preventDefault(); setDrawing(null); }
+  else if (event.key === 'Enter') { event.preventDefault(); if (!event.repeat) saveDrawing(); }
 });
 
 // ---------------------------------------------------------------- box edits
@@ -1014,7 +1175,7 @@ for (const button of document.querySelectorAll('[data-timeframe]')) {
 
 // ---------------------------------------------------------------- refresh loop
 async function refreshChart() {
-  if (!chart) return 0;
+  if (!chart || draw.drag) return 0;
   const request = ++chartRequest;
   const query = ['timeframe=' + timeframe];
   if (CODE) query.push('code=' + encodeURIComponent(CODE));
@@ -1023,11 +1184,19 @@ async function refreshChart() {
   if (request !== chartRequest) return;
   if (!response.ok) throw new Error('chart ' + response.status);
   const payload = await response.json();
-  if (request !== chartRequest) return;
+  if (request !== chartRequest || draw.drag) return;
 
   const switched = displayedTimeframe !== payload.timeframe;
   displayedTimeframe = payload.timeframe;
   lastBars = payload.bars || [];
+  if (draw.kind && draw.anchors.some(anchor => barIndex(anchor.time) < 0)) {
+    setDrawing(null);
+    const hint = document.getElementById('draw-hint');
+    hint.hidden = false;
+    hint.textContent = '歷史資料已變更，草稿錨點不在目前 K 棒內，請重新繪製。';
+  } else if (draw.kind && draw.anchors.length) {
+    renderPreview();
+  }
   // A full setData keeps barSpacing and the visible window -- it is not a view
   // reset -- and when bars are appended the library either follows the newest
   // bar (if you are parked at the right edge) or compensates the scroll so the

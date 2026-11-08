@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=curve-hover-1">
+  <link rel="stylesheet" href="/static/style.css?v=curve-draft-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -177,7 +177,7 @@
     <div id="legend-ohlc" class="legend-ohlc"></div>
     <div id="trendlines" class="trendline-list"></div>
     <div id="draw-hint" class="draw-hint" hidden></div>
-    <div id="chart"><div id="curve-tooltip" class="curve-tooltip" role="tooltip" hidden></div></div>
+    <div id="chart"><div id="curve-tooltip" class="curve-tooltip" role="tooltip" hidden></div><svg id="curve-draft-handles" aria-hidden="true"></svg></div>
   </section>
 
   <section class="tables">
@@ -203,7 +203,7 @@
   <script src="/static/boxes_primitive.js?v=gap-2"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
   <script src="/static/curve_hover.js?v=1"></script>
-  <script src="/static/lwc_app.js?v=multiframe-exit-4"></script>
+  <script src="/static/lwc_app.js?v=curve-draft-1"></script>
   <script src="/static/trading.js?v=order-type-auto-7"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>

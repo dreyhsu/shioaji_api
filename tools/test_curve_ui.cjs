@@ -11,6 +11,7 @@ function section(source, start, end) {
 }
 function element() {
   return { value: '', options: [], classList: { toggle() {} }, setAttribute() {},
+    style: {}, replaceChildren() {},
     replaceChildren(...options) { this.options = options; this.value = options[0]?.value || ''; },
     add(option) { this.options.push(option); } };
 }
@@ -24,7 +25,8 @@ function element() {
   get('timeframes').querySelectorAll = () => [];
   const saved = [], events = [];
   const chart = { timeframe: '1m', displayedTimeframe: '1m', switchingTimeframe: false,
-    draw: { kind: null, anchors: [] }, CODE: 'TMFR1', updateHint() {}, refresh() {}, hideCurveHover() {},
+    draw: { kind: null, anchors: [], revision: 0 }, CODE: 'TMFR1', updateHint() {}, refresh() {}, hideCurveHover() {},
+    finishCurveDrag() {}, curvePoints: anchors => anchors,
     chart: { removeSeries() {} }, Event: class { constructor(type) { this.type = type; } },
     document: { getElementById: get, dispatchEvent: (event) => events.push(event.type) },
     fetch: async (url, options) => { saved.push({ url, ...JSON.parse(options.body) }); return { ok: true }; },
