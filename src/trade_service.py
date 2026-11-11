@@ -57,6 +57,14 @@ def _pending_minute_indices(closed, check_from, watermark):
 
 class ClosedMinuteEntry(CurveEntryController):
     """Consume adjacent completed minutes once; never replay expired entries."""
+    @staticmethod
+    def _signature(curve):
+        # Preserve existing armed curve signatures across the upgrade.
+        fields = [curve['anchors'], curve['timeframe']]
+        if curve['kind'] != 'curve':
+            fields.append(curve['kind'])
+        return json.dumps(fields, sort_keys=True)
+
     def check(self):
         service = self.service
         entry = self.snapshot()
@@ -69,7 +77,7 @@ class ClosedMinuteEntry(CurveEntryController):
         if curve is None:
             self._update(entry['id'], state='failed', error='曲線已停用或刪除')
             return
-        signature = json.dumps([curve['anchors'], curve['timeframe']], sort_keys=True)
+        signature = self._signature(curve)
         with db.session(service.db_path) as conn:
             config = conn.execute('SELECT * FROM trade_curve_versions WHERE entry_id=?', (entry['id'],)).fetchone()
             if config is None:
@@ -94,21 +102,22 @@ class ClosedMinuteEntry(CurveEntryController):
                 continue
             through = closed.iloc[:index + 1]
             self._update(entry['id'], last_checked_minute=mh.iso(stamp))
-            if not crossed_curve(through, curve['anchors'], now, entry['action'], curve['timeframe']):
+            if not crossed_curve(through, curve['anchors'], now, entry['action'], curve['timeframe'], curve['kind']):
                 continue
             # Require the fresh signal quote to remain on the breakout side.
             signal_quote = service.signal_quote()
             source = tl.source_bars(through, curve['timeframe'])
-            threshold = tl.values_at_times(source, curve['anchors'], [stamp], timeframe=curve['timeframe']).iloc[0]
+            threshold = tl.values_at_times(source, curve['anchors'], [stamp], kind=curve['kind'], timeframe=curve['timeframe']).iloc[0]
             direction = 1 if entry['action'] == 'Buy' else -1
             if signal_quote is None or not math.isfinite(threshold) or direction * (signal_quote - threshold) <= 0:
                 self._update(entry['id'], error='新鮮行情已離開突破側，略過訊號')
                 continue
             with db.session(service.db_path) as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                current = conn.execute('SELECT anchors, timeframe, enabled FROM trendlines WHERE id=?',
+                current = conn.execute('SELECT anchors, timeframe, kind, enabled FROM trendlines WHERE id=?',
                                        (entry['curve_id'],)).fetchone()
-                if current is None or not current['enabled'] or json.dumps([json.loads(current['anchors']), current['timeframe']], sort_keys=True) != signature:
+                if (current is None or not current['enabled'] or current['kind'] not in tl.KINDS
+                        or self._signature({**dict(current), 'anchors': json.loads(current['anchors'])}) != signature):
                     conn.rollback()
                     self._update(entry['id'], state='cancelled', error='曲線版本已變更，請重新啟用')
                     return
@@ -132,7 +141,7 @@ class ClosedMinuteEntry(CurveEntryController):
         curve = self._curve(result['curve_id'])
         with db.session(self.service.db_path) as conn:
             conn.execute('INSERT INTO trade_curve_versions VALUES (?,?)',
-                         (result['id'], json.dumps([curve['anchors'], curve['timeframe']], sort_keys=True)))
+                         (result['id'], self._signature(curve)))
             conn.commit()
         return result
 
@@ -179,8 +188,9 @@ class IndependentTradingService(TradingService):
             self._connect_error = f'稽核寫入失敗：{type(error).__name__}'
 
     def window(self):
-        calendar = mh.SessionCalendar.load(self.fetcher_settings.calendar_path) if not self._calendar_injected else self._calendar
-        return self.schedule.window(self._now(), calendar)
+        if not self._calendar_injected:
+            self._calendar = mh.SessionCalendar.load(self.fetcher_settings.calendar_path)
+        return self.schedule.window(self._now(), self._calendar)
 
     def ensure_connected(self):
         if self._recovery.pending and self._api is not None:
@@ -369,17 +379,17 @@ class IndependentTradingService(TradingService):
         with db.session(self.db_path) as conn:
             curves = db.load_trendlines(conn, self.code)
             minutes = db.load_minute_bars(conn, self.code)
-        curve = next((item for item in curves if item['id'] == row['curve_id']), None)
+        curve = next((item for item in curves if item['id'] == row['curve_id'] and item['kind'] in tl.KINDS), None)
         bars = minutes[minutes['minute_start'] + pd.Timedelta(minutes=1) <= pd.Timestamp(self._now())]
         if curve is None or len(bars) < 2:
             return 'curve_unavailable'
         pair = bars.iloc[-2:]
-        if pair.iloc[-1]['minute_start'] - pair.iloc[0]['minute_start'] != pd.Timedelta(minutes=1):
+        if not self._calendar.consecutive_trading_minutes(pair.iloc[0]['minute_start'], pair.iloc[-1]['minute_start']):
             return 'curve_unavailable'
         if row.get('curve_check_from') and pair.iloc[-1]['minute_start'] < pd.Timestamp(row['curve_check_from']):
             return None
         values = tl.values_at_times(tl.source_bars(bars, curve['timeframe']), curve['anchors'],
-                                    pair['minute_start'].tolist(), timeframe=curve['timeframe']).tolist()
+                                    pair['minute_start'].tolist(), kind=curve['kind'], timeframe=curve['timeframe']).tolist()
         if any(not math.isfinite(value) for value in values):
             return 'curve_unavailable'
         return 'curve' if crossed_curve_close(row['action'], float(pair.iloc[0]['close']), values[0],

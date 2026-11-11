@@ -305,7 +305,7 @@ function listenForCurveHover(element) {
     });
     if (!closest) { hideCurveHover(); return; }
     const curve = closest.curve;
-    tooltip.textContent = `${curve.label || '曲線'} · [${curve.timeframe || '1h'}] · #${curve.id}`;
+    tooltip.textContent = `${curve.label || (curve.kind === 'line' ? '直線' : '曲線')} · [${curve.timeframe || '1h'}] · #${curve.id}`;
     tooltip.hidden = false;
     tooltip.style.left = Math.max(0, Math.min(point.x + 14, element.clientWidth - tooltip.offsetWidth - 6)) + 'px';
     tooltip.style.top = Math.max(0, Math.min(point.y + 14, chart.panes()[PANE_PRICE].getHeight() - tooltip.offsetHeight - 6)) + 'px';
@@ -1125,7 +1125,7 @@ document.getElementById('recent').addEventListener('click', () => {
 });
 
 function canDraw(tool, frame) {
-  return frame === '1h' || (tool === 'curve' && ['1m', '5m', '15m'].includes(frame));
+  return ['line', 'curve'].includes(tool) && ['1m', '5m', '15m', '1h'].includes(frame);
 }
 
 function updateTimeframeButtons(loading = false) {
@@ -1141,7 +1141,7 @@ function updateTimeframeButtons(loading = false) {
     const button = document.getElementById('draw-' + tool);
     button.disabled = loading || !canDraw(tool, timeframe);
     button.title = canDraw(tool, timeframe) ? ''
-      : tool === 'curve' ? '切換至 1m、5m、15m 或 1h 畫曲線' : '切換至 1h 畫線';
+      : '切換至 1m、5m、15m 或 1h 畫直線或曲線';
   }
 }
 
@@ -1204,7 +1204,7 @@ async function refreshChart() {
   candles.setData(lastBars);
   applySeries(payload.series || []);
   hideCurveHover();
-  hoverCurves = (payload.trendlines || []).filter(line => line.kind === 'curve').flatMap(line => {
+  hoverCurves = (payload.trendlines || []).filter(line => ['line', 'curve'].includes(line.kind)).flatMap(line => {
     const entry = indicators.get('trendline_' + line.id);
     return entry ? [{...line, series: entry.series, data: entry.spec.data}] : [];
   });

@@ -42,8 +42,13 @@ class EntryNotifier:
             quantity = row['filled_quantity'] if phase == 'entry' else row['exit_filled_quantity']
             if quantity <= 0:
                 return
-            message = tg.format_entry_fill(row) if phase == 'entry' else tg.format_exit_fill(row)
             with db.session(self.db_path) as conn:
+                if row.get('curve_id') is not None:
+                    drawing = conn.execute('SELECT kind FROM trendlines WHERE id=? AND code=?',
+                                           (row['curve_id'], row['code'])).fetchone()
+                    if drawing is not None:
+                        row = {**row, 'curve_kind': drawing['kind']}
+                message = tg.format_entry_fill(row) if phase == 'entry' else tg.format_exit_fill(row)
                 alert_id = db.record_alert(
                     conn, row["code"], hour_start=row["created_at"],
                     box_type=f"{phase}:{row['id']}:{quantity}",

@@ -91,11 +91,12 @@ def market(request, tmp_path, monkeypatch):
     dashboard._LOAD_CACHE.clear()
 
 
-def save_curve(driver, price, timeframe="1h"):
+def save_curve(driver, price, timeframe="1h", kind="curve"):
     import trendline as tl
     bars = tl.source_bars(driver.bars.iloc[:driver.cursor], timeframe)
-    anchors = [{"time": int(bars.iloc[index].timestamp.timestamp()), "price": price} for index in (-5, -3, -1)]
-    response = driver.client.post("/api/trendlines", json={"kind": "curve", "anchors": anchors, "timeframe": timeframe})
+    anchors = [{"time": int(bars.iloc[index].timestamp.timestamp()), "price": price}
+               for index in ((-5, -1) if kind == 'line' else (-5, -3, -1))]
+    response = driver.client.post("/api/trendlines", json={"kind": kind, "anchors": anchors, "timeframe": timeframe})
     assert response.status_code == 200, response.text
     return response.json()["id"]
 
@@ -190,10 +191,12 @@ def test_shared_fixed_atr_target(market):
     assert driver.broker.position == 0 and len(driver.broker.trades) == 2
 
 
-def test_shared_curve_profit(market):
+@pytest.mark.parametrize('kind', ['line', 'curve'])
+@pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
+def test_shared_curve_profit(market, kind, timeframe):
     driver = market(start=4020)
     order = buy(driver)
-    curve = save_curve(driver, 25040)
+    curve = save_curve(driver, 25040, timeframe, kind)
     response = driver.client.put(f"/api/trading/orders/{order['id']}/curve-selection", json={"curve_id": curve})
     assert response.status_code == 200, response.text
     assert response.json()["target_price"] is None and response.json()["stop_price"] == order["stop_price"]

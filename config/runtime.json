@@ -1,6 +1,6 @@
 {
   "mode_comment": "可用模式：mock（離線回放／假券商）；simulation（券商模擬，會登入）；production（正式交易，需 CA）。不支援 prd。非 Mock 須在 contracts 加入實際月份合約，並使用各模式專用 DB；修改後重啟。",
-  "mode": "mock",
+  "mode": "production",
   "signal_code": "TMFR1",
   "contracts": ["TMFR1", "TMFK6"],
   "acquisition_db": "../data/market_fetchers.db",

@@ -39,20 +39,20 @@ function element() {
     chart.timeframe = chart.displayedTimeframe = timeframe;
     chart.updateTimeframeButtons();
     assert.equal(get('draw-curve').disabled, false);
-    assert.equal(get('draw-line').disabled, timeframe !== '1h');
-    chart.setDrawing('curve');
-    assert.equal(chart.draw.kind, 'curve');
-    {
-      chart.draw.anchors = [0, 1, 2].map((i) => ({ time: 100 + i * 60, price: 20000 }));
+    assert.equal(get('draw-line').disabled, false);
+    for (const kind of ['line', 'curve']) {
+      chart.setDrawing(kind);
+      assert.equal(chart.draw.kind, kind);
+      chart.draw.anchors = (kind === 'line' ? [0, 1] : [0, 1, 2]).map((i) => ({ time: 100 + i * 60, price: 20000 }));
       await chart.saveDrawing();
       assert.equal(saved.at(-1).timeframe, timeframe);
-      assert.equal(saved.at(-1).kind, 'curve');
+      assert.equal(saved.at(-1).kind, kind);
       assert.equal(chart.draw.kind, null);
     }
     chart.setDrawing(null);
   }
-  assert.equal(saved.length, 4);
-  assert.equal(events.length, 4);
+  assert.equal(saved.length, 8);
+  assert.equal(events.length, 8);
   chart.timeframe = '5m'; chart.displayedTimeframe = '1m';
   chart.setDrawing('curve');
   assert.equal(chart.draw.kind, null); // cannot draw against the previous chart
@@ -63,7 +63,9 @@ function element() {
   const lines = [{ id: 1, kind: 'curve', timeframe: '1m' },
     { id: 2, kind: 'curve', timeframe: '5m', label: '短線' },
     { id: 3, kind: 'curve', timeframe: '1h' }, { id: 4, kind: 'line', timeframe: '1h' },
-    { id: 6, kind: 'curve', timeframe: '15m' }];
+    { id: 6, kind: 'curve', timeframe: '15m' },
+    { id: 7, kind: 'line', timeframe: '1m' }, { id: 8, kind: 'line', timeframe: '5m' },
+    { id: 9, kind: 'line', timeframe: '15m' }, { id: 10, kind: 'line', timeframe: '2m' }];
   const trade = { state: { curves: [], connected: true, atr: 100, simulation: true },
     curvesListKey: null, entrySnapshot: null, entryEnabled: true, entryBusy: false,
     $: get, Option: class { constructor(text, value) { this.text = text; this.value = value; } },
@@ -77,8 +79,9 @@ function element() {
   get('entry-quantity').value = '1';
   await trade.loadCurves();
   assert.deepEqual(get('entry-curve').options.map((option) => option.text).slice(1),
-    ['[1m] 曲線 #1', '[5m] 短線', '[1h] 曲線 #3', '[15m] 曲線 #6']);
-  assert.deepEqual(get('trade-curve').options.map((option) => option.value), ['', '1', '2', '3', '6']);
+    ['[1m] 曲線 #1', '[5m] 短線', '[1h] 曲線 #3', '[1h] 直線 #4', '[15m] 曲線 #6',
+     '[1m] 直線 #7', '[5m] 直線 #8', '[15m] 直線 #9']);
+  assert.deepEqual(get('trade-curve').options.map((option) => option.value), ['', '1', '2', '3', '4', '6', '7', '8', '9']);
   get('entry-curve').value = '2';
   lines.push({ id: 5, kind: 'curve', timeframe: '1m' });
   await trade.loadCurves();
@@ -89,10 +92,16 @@ function element() {
   assert.match(summary, /\[5m\] 短線/);
   assert.match(summary, /已收盤 1 分 K/);
   assert.match(summary, /各 2 倍進場 1h ATR/);
+  get('entry-curve').value = '8';
+  await trade.controlEntry();
+  assert.match(summary, /線條：\[5m\] 直線 #8/);
   trade.entrySnapshot = { state: 'armed', curve_id: 2, timeframe: '5m', quantity: 1,
     contract_code: 'TMF209912', action: 'Sell' };
   trade.renderEntry();
   assert.match(get('entry-state').textContent, /\[5m\] 曲線 #2/);
   assert.match(get('entry-state').textContent, /向下突破做空/);
+  trade.entrySnapshot = { ...trade.entrySnapshot, kind: 'line', curve_id: 8 };
+  trade.renderEntry();
+  assert.match(get('entry-state').textContent, /\[5m\] 直線 #8/);
   console.log('Curve drawing, timeframe guards, entry menus and confirmation scenarios passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -114,19 +114,20 @@ def test_minute_drawings_require_their_source_data(config, timeframe):
 
 
 @pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h"])
+@pytest.mark.parametrize("kind", ["line", "curve"])
 @pytest.mark.parametrize("step, rule", [
     (10, "trendline_break_below_up"), (-10, "trendline_break_above_down"),
 ])
-def test_curve_alerts_use_each_saved_timeframe(config, timeframe, step, rule):
+def test_curve_alerts_use_each_saved_timeframe(config, timeframe, step, rule, kind):
     minutes = pd.DataFrame({"minute_start": pd.date_range(HOURS[0], MINUTE, freq="min")})
     for column in ("open", "high", "low", "close", "volume"):
         minutes[column] = 100.0
     source = tl.source_bars(minutes, timeframe)
     drawing = {
-        "id": 42, "kind": "curve", "timeframe": timeframe,
+        "id": 42, "kind": kind, "timeframe": timeframe,
         "anchors": [
             {"time": dashboard._epoch(source.iloc[i]["timestamp"]), "price": 100 + step * i}
-            for i in range(3)
+            for i in (range(2) if kind == 'line' else range(3))
         ],
     }
     # Collinear Bezier controls: extension is exactly one step per source bar.

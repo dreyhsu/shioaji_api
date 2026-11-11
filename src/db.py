@@ -956,7 +956,7 @@ def update_trendline_anchors(conn: sqlite3.Connection, line_id: int, anchors: Se
         key=lambda anchor: anchor["time"],
     )
     cursor = conn.execute(
-        "UPDATE trendlines SET anchors = ? WHERE id = ? AND enabled = 1 AND kind = 'curve'",
+        "UPDATE trendlines SET anchors = ? WHERE id = ? AND enabled = 1 AND kind IN ('line', 'curve')",
         (json.dumps(ordered), int(line_id)),
     )
     conn.commit()

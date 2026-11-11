@@ -133,6 +133,21 @@ class SessionCalendar:
     def covered(self, stamp):
         return self.start is not None and self.start <= pd.Timestamp(stamp) < self.end
 
+    def consecutive_trading_minutes(self, previous, current):
+        """Accept contiguous candles or verified close-to-open session boundaries.
+
+        A session break contains no missing trading minutes. Missing candles at
+        either edge, or an entire missing session, must still reject the pair.
+        """
+        previous, current = pd.Timestamp(previous), pd.Timestamp(current)
+        minute = pd.Timedelta(minutes=1)
+        if current - previous == minute:
+            return True
+        if not self.covered(previous) or not self.covered(current):
+            return False
+        return any(previous == end - minute and current == next_start
+                   for (_, end), (next_start, _) in zip(self.sessions, self.sessions[1:]))
+
     def active(self, now):
         now = pd.Timestamp(now)
         if self.covered(now):

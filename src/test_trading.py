@@ -347,12 +347,22 @@ def test_filled_position_can_switch_between_fixed_and_curve_take_profit(fake_ser
     assert restored["target_price"] == 46510
 
 
-def test_curve_monitor_uses_latest_closed_minute_and_hourly_curve(fake_service, monkeypatch):
+@pytest.mark.parametrize('previous,current,expected', [
+    ('2026-10-05 11:01', '2026-10-05 11:02', 'curve'),
+    ('2026-10-05 13:44', '2026-10-05 15:00', 'curve'),
+    ('2026-10-05 11:00', '2026-10-05 11:02', None),
+    ('2026-10-05 13:43', '2026-10-05 15:00', None),
+])
+def test_curve_monitor_uses_latest_closed_minute_and_hourly_curve(fake_service, monkeypatch, previous, current, expected):
     service, _api, _modes = fake_service
-    monkeypatch.setattr(trading.market_clock, "now", lambda: pd.Timestamp("2026-10-05 11:03:00"))
+    monkeypatch.setattr(trading.market_clock, "now", lambda: pd.Timestamp(current) + pd.Timedelta(minutes=1))
+    service._calendar = trading.mh.SessionCalendar(dict(source='offline exchange-calendar fixture',
+        coverage_start='2026-10-05', coverage_end='2026-10-07', sessions=[
+            dict(start='2026-10-05 08:45', end='2026-10-05 13:45'),
+            dict(start='2026-10-05 15:00', end='2026-10-06 05:00')]))
     stamps = [
         "2026-10-05 08:45", "2026-10-05 09:45", "2026-10-05 10:45",
-        "2026-10-05 11:01", "2026-10-05 11:02",
+        previous, current,
     ]
     closes = [100, 100, 100, 101, 99]
     with db.session(service.db_path) as conn:
@@ -371,7 +381,7 @@ def test_curve_monitor_uses_latest_closed_minute_and_hourly_curve(fake_service, 
         "id": "minute-curve-test", "code": "TMFR1", "curve_id": curve_id,
         "curve_check_from": "2026-10-05 08:45:00", "action": "Buy",
     }
-    assert service._curve_close_break(row) == "curve"
+    assert service._curve_close_break(row) == expected
 
 
 def test_partial_entry_is_cancelled_before_market_exit(fake_service):

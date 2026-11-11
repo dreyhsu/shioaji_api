@@ -23,7 +23,7 @@ class CurveEntryController:
         service = self.service
         with db.session(service.db_path) as conn:
             row = conn.execute(
-                "SELECT e.*, t.timeframe FROM curve_entries e LEFT JOIN trendlines t ON t.id = e.curve_id "
+                "SELECT e.*, t.timeframe, t.kind FROM curve_entries e LEFT JOIN trendlines t ON t.id = e.curve_id "
                 "WHERE e.code = ? AND e.simulation = ? ORDER BY e.id DESC LIMIT 1",
                 (service.code, int(service.simulation)),
             ).fetchone()
@@ -36,7 +36,7 @@ class CurveEntryController:
     def _curve(self, curve_id):
         with db.session(self.service.db_path) as conn:
             return next((curve for curve in db.load_trendlines(conn, self.service.code)
-                         if curve["id"] == curve_id and curve["kind"] == "curve"), None)
+                         if curve["id"] == curve_id and curve["kind"] in tl.KINDS), None)
 
     def _update(self, entry_id, **values):
         with db.session(self.service.db_path) as conn:
@@ -65,8 +65,8 @@ class CurveEntryController:
                 minutes = db.load_minute_bars(conn, service.code)
             closed = minutes[minutes["minute_start"] + pd.Timedelta(minutes=1) <= now]
             if (curve is None or curve["timeframe"] not in tl.TIMEFRAME_MINUTES
-                    or not tl.anchor_indices(tl.source_bars(closed, curve["timeframe"]), curve["anchors"], "curve")):
-                raise ValueError("請選擇已保存、有效的 1m／5m／15m／1h 曲線")
+                    or not tl.anchor_indices(tl.source_bars(closed, curve["timeframe"]), curve["anchors"], curve["kind"])):
+                raise ValueError("請選擇已保存、有效的 1m／5m／15m／1h 直線或曲線")
             service.subscribe_contract(contract_code)
             try:
                 with db.session(service.db_path) as conn:
@@ -131,7 +131,7 @@ class CurveEntryController:
         if not quote or service._fresh_risk_quote({"contract_code": str(contract.code)}) is None:
             return
         self._update(entry["id"], last_checked_minute=latest.isoformat(sep=" "))
-        if not crossed_curve(closed, curve["anchors"], now, entry["action"], curve["timeframe"]):
+        if not crossed_curve(closed, curve["anchors"], now, entry["action"], curve["timeframe"], curve["kind"]):
             return
         with db.session(service.db_path) as conn:
             claimed = conn.execute("UPDATE curve_entries SET state = 'submitting' WHERE id = ? AND state = 'armed'",

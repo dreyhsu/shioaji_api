@@ -92,7 +92,7 @@ def crossed_curve_close(
     current_close: float,
     current_curve: float,
 ) -> bool:
-    """True only when two consecutive 1m closes cross the 1h curve."""
+    """Check the direction of a close-to-close crossing; callers validate timing."""
     if action == "Buy":
         return previous_close > previous_curve and current_close <= current_curve
     if action == "Sell":
@@ -771,7 +771,7 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors, timeframe, kind FROM trendlines WHERE id = ? AND code = ? AND kind IN ('line', 'curve') AND enabled = 1",
                 (int(row["curve_id"]), row["code"]),
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
@@ -807,21 +807,21 @@ class TradingService:
         timeframe = curve['timeframe']
         source = tl.source_bars(minutes, timeframe)
         anchors = json.loads(curve['anchors'])
-        points = tl.anchor_indices(source, anchors, "curve")
+        points = tl.anchor_indices(source, anchors, curve['kind'])
         if not points:
             self._curve_break_cache[cache_key] = (time.monotonic(), "curve_unavailable")
             return "curve_unavailable"
 
         eligible = minutes.index[minutes['minute_start'] >= check_from].tolist()
         positions = sorted({position for index in eligible if index > 0 for position in (index - 1, index)})
-        projected = tl.values_at_times(source, anchors, minutes.iloc[positions]['minute_start'], timeframe=timeframe)
+        projected = tl.values_at_times(source, anchors, minutes.iloc[positions]['minute_start'], kind=curve['kind'], timeframe=timeframe)
         values = dict(zip(positions, projected))
         result = None
         for index in eligible:
             if index == 0:
                 continue
             previous, current = minutes.iloc[index - 1], minutes.iloc[index]
-            if pd.Timestamp(current["minute_start"]) - pd.Timestamp(previous["minute_start"]) != pd.Timedelta(minutes=1):
+            if not self._calendar.consecutive_trading_minutes(previous["minute_start"], current["minute_start"]):
                 continue
             previous_curve, current_curve = values[index - 1], values[index]
             if not math.isfinite(previous_curve) or not math.isfinite(current_curve):
@@ -843,7 +843,7 @@ class TradingService:
             return cached[1]
         with db.session(self.db_path) as conn:
             curve = conn.execute(
-                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors, timeframe, kind FROM trendlines WHERE id = ? AND code = ? AND kind IN ('line', 'curve') AND enabled = 1",
                 cache_key,
             ).fetchone()
             minutes = db.load_minute_bars(conn, row["code"])
@@ -853,7 +853,7 @@ class TradingService:
         source = tl.source_bars(minutes, curve['timeframe'])
         # Use the same fractional source-bar geometry as the chart and signals.
         stamp = pd.Timestamp(minutes.iloc[-1]["minute_start"])
-        value = tl.values_at_times(source, json.loads(curve['anchors']), [stamp], timeframe=curve['timeframe']).iloc[0]
+        value = tl.values_at_times(source, json.loads(curve['anchors']), [stamp], kind=curve['kind'], timeframe=curve['timeframe']).iloc[0]
         result = None if not math.isfinite(value) else float(value)
         self._curve_cache[cache_key] = (time.monotonic(), result)
         return result
@@ -1225,7 +1225,7 @@ class TradingService:
         if curve_id is not None:
             with db.session(self.db_path) as conn:
                 curve = conn.execute(
-                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                    "SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind IN ('line', 'curve') AND enabled = 1",
                     (int(curve_id), self.code),
                 ).fetchone()
             if curve is None:
@@ -1344,7 +1344,7 @@ class TradingService:
                 raise ValueError("多單 stop 須低於 target；空單 stop 須高於 target")
         else:
             with db.session(self.db_path) as conn:
-                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                curve = conn.execute("SELECT id FROM trendlines WHERE id = ? AND code = ? AND kind IN ('line', 'curve') AND enabled = 1",
                                      (curve_id, row["code"])).fetchone()
             if curve is None:
                 raise ValueError("選用的停利曲線不存在或已刪除")
@@ -1412,7 +1412,7 @@ class TradingService:
             raise ValueError("選用曲線目前無法計算")
         with db.session(self.db_path) as conn:
             record = conn.execute(
-                "SELECT anchors, timeframe FROM trendlines WHERE id = ? AND code = ? AND kind = 'curve' AND enabled = 1",
+                "SELECT anchors, timeframe, kind FROM trendlines WHERE id = ? AND code = ? AND kind IN ('line', 'curve') AND enabled = 1",
                 (row["curve_id"], row["code"]),
             ).fetchone()
             if record is None:
@@ -1504,11 +1504,13 @@ class TradingService:
         )}
         item.update(self._order_breakeven_settings(row))
         item['curve_timeframe'] = None
+        item['curve_kind'] = None
         if row.get('curve_id') is not None:
             with db.read_session(self.db_path) as conn:
-                curve = conn.execute('SELECT timeframe FROM trendlines WHERE id=? AND code=?',
+                curve = conn.execute('SELECT timeframe, kind FROM trendlines WHERE id=? AND code=?',
                                      (row['curve_id'], row['code'])).fetchone()
             item['curve_timeframe'] = curve['timeframe'] if curve else None
+            item['curve_kind'] = curve['kind'] if curve else None
         item["curve_price"] = self._curve_value(row) if row.get("curve_id") is not None else None
         entry = row.get("avg_fill_price") or row.get("price")
         item["default_stop_price"] = item["default_target_price"] = None

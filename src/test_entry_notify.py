@@ -51,6 +51,20 @@ def test_deduplication_survives_restart_and_allows_additional_partial_fill(notif
     assert "3 / 3 口" in messages[1]
 
 
+@pytest.mark.parametrize('kind,label', [('line', '直線'), ('curve', '曲線')])
+def test_drawing_fill_messages_name_saved_kind(notifier, kind, label):
+    notifier, messages = notifier
+    with db.session(notifier.db_path) as conn:
+        line_id = db.insert_trendline(conn, 'TMFR1', [dict(time=i, price=25000) for i in range(3)], kind=kind, timeframe='5m')
+    row = order(curve_id=line_id)
+    notifier.notify(row)
+    notifier.notify_exit({**row, 'exit_filled_quantity': 1, 'avg_exit_price': 25100,
+                          'trigger_reason': 'curve', 'exit_trade_id': 'exit-1'})
+    assert len(messages) == 2
+    assert label + '停利' in messages[0]
+    assert label + '出場' in messages[1]
+
+
 def test_switch_reloads_and_disabled_notifications_do_not_claim_alerts(notifier):
     notifier, messages = notifier
     notifier.config.path.write_text(json.dumps({"telegram_enabled": False, "_comment": "pause"}))

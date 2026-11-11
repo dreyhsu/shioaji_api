@@ -80,3 +80,20 @@ def test_sloping_curve_uses_source_bar_fraction_at_each_minute(timeframe, step, 
     assert crossed_curve(bars, curve, now, action, timeframe)
     bars.loc[bars.index[-1], "close"] = current_value - sign * 0.5
     assert not crossed_curve(bars, curve, now, action, timeframe)
+
+
+@pytest.mark.parametrize('timeframe,step', [('1m', 1), ('5m', 5), ('15m', 15), ('1h', 60)])
+@pytest.mark.parametrize('action,sign', [('Buy', 1), ('Sell', -1)])
+def test_two_anchor_line_crossing_keeps_source_geometry_and_closed_minute_rules(timeframe, step, action, sign):
+    start = pd.Timestamp('2026-10-05 08:45')
+    stamps = list(pd.date_range(start, periods=2 * step + 3, freq='min'))
+    line = [{'time': int((start + pd.Timedelta(minutes=i * step)).timestamp()), 'price': price}
+            for i, price in [(0, 100), (2, 120)]]
+    previous, current = 120 + 10 / step, 120 + 20 / step
+    bars = frame([100] * (len(stamps) - 2) + [previous - sign * .5, current + sign * .5], stamps)
+    now = stamps[-1] + pd.Timedelta(minutes=1)
+    assert crossed_curve(bars, line, now, action, timeframe, kind='line')
+    assert not crossed_curve(bars, line, now - pd.Timedelta(seconds=30), action, timeframe, kind='line')
+    assert not crossed_curve(bars.drop(bars.index[-2]), line, now, action, timeframe, kind='line')
+    bars.loc[bars.index[-1], 'close'] = current - sign * .5
+    assert not crossed_curve(bars, line, now, action, timeframe, kind='line')

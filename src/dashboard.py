@@ -589,12 +589,12 @@ def api_trendlines(code: str | None = None) -> list[dict]:
     sources = {'1h': data['hourly']}
     for line in lines:
         line['curve_price'] = None
-        if line['kind'] == 'curve':
+        if line['kind'] in tl.KINDS:
             timeframe = line['timeframe']
             if timeframe not in sources:
                 sources[timeframe] = tl.source_bars(_minutes(data), timeframe)
             value = tl.values_at_times(sources[timeframe], line['anchors'],
-                [pd.Timestamp(data['last_minute']['minute_start'])], timeframe=timeframe).iloc[0]
+                [pd.Timestamp(data['last_minute']['minute_start'])], kind=line['kind'], timeframe=timeframe).iloc[0]
             line['curve_price'] = float(value) if pd.notna(value) else None
     return lines
 
@@ -608,8 +608,6 @@ def api_create_trendline(body: TrendlineIn) -> dict:
         raise HTTPException(status_code=422, detail="anchors must be on different bars")
     if body.kind == "curve" and len(anchors) != 3:
         raise HTTPException(status_code=422, detail="a curve takes exactly 3 anchors")
-    if body.kind == "line" and body.timeframe != "1h":
-        raise HTTPException(status_code=422, detail="straight lines require timeframe=1h")
     with db.session(CONFIG["db_path"]) as conn:
         line_id = db.insert_trendline(
             conn, code, anchors, label=body.label, color=body.color, kind=body.kind, timeframe=body.timeframe

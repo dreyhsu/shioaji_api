@@ -92,7 +92,7 @@ def format_entry_fill(row: dict) -> str:
     def price(value):
         return "待券商回報" if value is None else f"{value:,.2f}"
 
-    target = "曲線停利" if row.get("curve_id") is not None else price(row.get("target_price"))
+    target = ("直線停利" if row.get('curve_kind') == 'line' else "曲線停利") if row.get("curve_id") is not None else price(row.get("target_price"))
     return (
         f"<b>{escape(str(row['contract_code']))} {side}進場成交</b>\n"
         f"環境：{mode}\n"
@@ -116,7 +116,8 @@ def format_exit_fill(row: dict) -> str:
     price = lambda value: '待券商回報' if value is None else f'{value:,.2f}'
     points = ('待券商回報' if entry is None or exit_price is None else
               f"{(exit_price - entry) * (1 if row['action'] == 'Buy' else -1):+,.2f} 點")
-    reason = {'stop': '停損／保本', 'target': '固定停利', 'curve': '曲線出場'}.get(
+    reason = {'stop': '停損／保本', 'target': '固定停利',
+              'curve': '直線出場' if row.get('curve_kind') == 'line' else '曲線出場'}.get(
         row.get('trigger_reason'), row.get('trigger_reason') or '券商成交回報')
     return (
         f"<b>{escape(str(row['contract_code']))} {side}{state}</b>\n"

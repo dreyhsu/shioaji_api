@@ -1,6 +1,7 @@
 """Real command ledger, unified DB and order engine with an offline broker."""
 from dataclasses import replace
 import json
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pandas as pd
@@ -218,8 +219,9 @@ def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
 
 
 @pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
+@pytest.mark.parametrize('kind', ['line', 'curve'])
 @pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
-def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, action, direction):
+def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, action, direction, kind, monkeypatch):
     import trendline as tl
     r = rig
     minutes = sb.add_sessions(pd.DataFrame([dict(minute_start=stamp, open=20000, high=20000, low=20000,
@@ -230,8 +232,16 @@ def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, ac
             db.upsert_minute_bars(conn, code, minutes)
         source = tl.source_bars(minutes, timeframe)
         anchors = [{'time': int(stamp.value // 10**9), 'price': 20000}
-                   for stamp in source['hour_start' if timeframe == '1h' else 'timestamp'].iloc[:3]]
-        curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe=timeframe)
+                   for stamp in source['hour_start' if timeframe == '1h' else 'timestamp'].iloc[:2 if kind == 'line' else 3]]
+        curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind=kind, timeframe=timeframe)
+    import telegram_notify as tg
+    messages = []
+    monkeypatch.setattr(tg, 'send_message', lambda message: messages.append(message) or True)
+    notifier = r.service.entry_notifier
+    notifier.enabled = True
+    notifier.config.path = r.path.parent / 'fill-alerts.json'
+    notifier.config.path.write_text('{"telegram_enabled": true}')
+    notifier.dispatch = lambda task: task()
     r.update('2026-10-30 10:47:03', signal_close=20000 + direction)
     assert request(r, payload=dict(contract_code='TMF209912', action=action, quantity=1,
         price=0, price_type='MKT', order_type='IOC', simulation=True, confirmed=True)).status_code == 202
@@ -258,10 +268,112 @@ def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, ac
     assert len(r.broker.trades) == 2
     assert closed['trigger_reason'] == 'curve' and closed['exit_status'] == 'Filled'
     assert closed['exit_filled_quantity'] == 1 and not closed['active']
+    assert closed['curve_kind'] == kind
+    assert len(messages) == 2 and '進場成交' in messages[0] and '平倉成交' in messages[1]
+    assert ('直線出場' if kind == 'line' else '曲線出場') in messages[1]
+    r.runtime.step()
+    assert len(messages) == 2
     assert closed['curve_timeframe'] == timeframe and r.broker.position == 0
 
 
-def test_independent_trade_notifies_confirmed_open_and_close(rig, monkeypatch):
+@pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+@pytest.mark.parametrize('last_minute,opening', [
+    ('2026-10-30 13:44', '2026-10-30 15:00'),
+    ('2026-10-31 04:59', '2026-11-02 08:45'),
+    ('2026-11-03 04:59', '2026-11-03 08:45'),
+])
+def test_curve_exit_bridges_session_break_after_first_minute_closes(rig, timeframe, action, direction,
+                                                                  last_minute, opening):
+    import trendline as tl
+    r = rig
+    document = json.loads(Path(r.service.health_settings.calendar_path).read_text())
+    document['coverage_end'] = '2026-11-04'
+    document['sessions'].extend([
+        dict(start='2026-11-02 08:45', end='2026-11-02 13:45'),
+        dict(start='2026-11-02 15:00', end='2026-11-03 05:00'),
+        dict(start='2026-11-03 08:45', end='2026-11-03 13:45'),
+    ])
+    Path(r.service.health_settings.calendar_path).write_text(json.dumps(document))
+    r.service._calendar = mh.SessionCalendar(document)
+    minutes = sb.add_sessions(pd.DataFrame([dict(minute_start=stamp, open=20000, high=20000, low=20000,
+        close=20000, volume=1, amount=20000)
+        for stamp in pd.date_range('2026-10-30 08:45', '2026-10-30 10:46', freq='min')]))
+    with db.session(r.path) as conn:
+        for code in ('TMFR1', 'TMF209912'):
+            db.upsert_minute_bars(conn, code, minutes)
+        source = tl.source_bars(minutes, timeframe)
+        anchors = [{'time': int(stamp.value // 10**9), 'price': 20000}
+                   for stamp in source['hour_start' if timeframe == '1h' else 'timestamp'].iloc[:3]]
+        curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe=timeframe)
+    r.update('2026-10-30 10:47:03', signal_close=20000 + direction)
+    assert request(r, payload=dict(contract_code='TMF209912', action=action, quantity=2,
+        price=0, price_type='MKT', order_type='IOC', simulation=True, confirmed=True)).status_code == 202
+    r.runtime.step()
+    r.runtime.step()
+    order = r.service.orders()[0]
+    assert r.client.post('/api/commands', json=dict(id='session-risk', name='update_risk', target=order['id'],
+        payload=dict(curve_id=curve_id, stop_price=order['stop_price'], target_price=None,
+                     breakeven_enabled=False, risk_revision=order['risk_revision']))).status_code == 202
+    r.runtime.step()
+    assert r.client.get('/api/commands/session-risk').json()['state'] == 'succeeded'
+
+    last_minute, opening = pd.Timestamp(last_minute), pd.Timestamp(opening)
+    r.update(last_minute + pd.Timedelta(minutes=1, seconds=3), signal_close=20000 + direction)
+    r.runtime.step()
+    r.now[0] = last_minute + pd.Timedelta(minutes=3)
+    r.runtime.step()  # scheduled logout must retain the two-contract position
+    assert r.service._api is None and len(r.broker.trades) == 1
+
+    r.update(opening + pd.Timedelta(seconds=30), signal_close=20000 - direction)
+    # Even if the opening candle is already present in storage, it is not closed.
+    with db.session(r.path) as conn:
+        for code in ('TMFR1', 'TMF209912'):
+            price = 20000 - direction if code == 'TMFR1' else 20000
+            frame = pd.DataFrame([dict(minute_start=opening, open=price, high=price, low=price,
+                                       close=price, volume=1, amount=price)])
+            db.upsert_minute_bars(conn, code, sb.add_sessions(frame))
+    r.runtime.step()
+    assert len(r.broker.trades) == 1
+    r.update(opening + pd.Timedelta(minutes=1, seconds=3), signal_close=20000 - direction)
+    r.runtime.step()
+    r.runtime.step()
+    closed = r.service.orders()[0]
+    assert len(r.broker.trades) == 2
+    assert closed['trigger_reason'] == 'curve' and closed['exit_status'] == 'Filled'
+    assert closed['exit_filled_quantity'] == 2 and not closed['active']
+    assert r.broker.position == 0
+    exit_order = r.broker.trades[-1].order
+    assert exit_order.quantity == 2 and exit_order.action == ('Sell' if action == 'Buy' else 'Buy')
+    assert exit_order.price_type == 'MKT' and exit_order.order_type == 'IOC' and exit_order.octype == 'Cover'
+    r.runtime.step()
+    assert len(r.broker.trades) == 2  # the same session crossing must not submit twice
+
+
+@pytest.mark.parametrize('previous,current', [
+    ('2026-10-30 09:04', '2026-10-30 09:06'),
+    ('2026-10-30 13:43', '2026-10-30 15:00'),
+    ('2026-10-30 13:44', '2026-10-30 15:01'),
+    ('2026-10-30 13:44', '2026-11-02 08:45'),
+])
+def test_curve_exit_still_rejects_missing_trading_minutes(rig, previous, current):
+    r = rig
+    r.update(pd.Timestamp(current) + pd.Timedelta(minutes=1, seconds=3), signal_close=19999)
+    with db.session(r.path) as conn:
+        frame = pd.DataFrame([dict(minute_start=pd.Timestamp(previous), open=20001, high=20001,
+                                  low=20001, close=20001, volume=1, amount=20001)])
+        db.upsert_minute_bars(conn, 'TMFR1', sb.add_sessions(frame))
+        anchors = [{'time': int(pd.Timestamp(stamp).value // 10**9), 'price': 20000}
+                   for stamp in pd.date_range('2026-10-30 08:55', periods=3, freq='min')]
+        curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe='1m')
+    row = dict(contract_code='TMF209912', action='Buy', stop_price=19000, target_price=None,
+               curve_id=curve_id, curve_check_from='2026-10-30 09:02')
+    assert r.service._exit_signal(row, 20000) == 'curve_unavailable'
+
+
+@pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
+@pytest.mark.parametrize('action,direction', [('Buy', 1), ('Sell', -1)])
+def test_line_entry_notifies_confirmed_open_and_close(rig, monkeypatch, timeframe, action, direction):
     r = rig
     import telegram_notify as tg
     messages = []
@@ -271,16 +383,41 @@ def test_independent_trade_notifies_confirmed_open_and_close(rig, monkeypatch):
     notifier.config.path = r.path.parent / 'fill-alerts.json'
     notifier.config.path.write_text('{"telegram_enabled": true}')
     notifier.dispatch = lambda task: task()
-    request(r)
+    import trendline as tl
+    minutes = sb.add_sessions(pd.DataFrame([dict(minute_start=stamp, open=20000, high=20000,
+        low=20000, close=20000, volume=1, amount=20000)
+        for stamp in pd.date_range('2026-10-30 08:45', '2026-10-30 10:46', freq='min')]))
+    with db.session(r.path) as conn:
+        for code in ('TMFR1', 'TMF209912'):
+            db.upsert_minute_bars(conn, code, minutes)
+        source = tl.source_bars(minutes, timeframe)
+        anchors = [dict(time=int(stamp.timestamp()), price=20000)
+                   for stamp in source['timestamp'].iloc[:2]]
+        line_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='line', timeframe=timeframe)
+    r.update('2026-10-30 10:47:03', signal_close=20000 - direction)
+    response = r.client.post('/api/commands', json=dict(id='arm-line', name='arm_curve', payload=dict(
+        curve_id=line_id, contract_code='TMF209912', quantity=2, action=action, simulation=True, confirmed=True)))
+    assert response.status_code == 202
+    r.runtime.step()
+    command = r.client.get('/api/commands/arm-line').json()
+    assert command['state'] == 'succeeded', command
+    assert command['result']['kind'] == 'line' and command['result']['timeframe'] == timeframe
+    r.update('2026-10-30 10:48:30', signal_close=20000 - direction, tick=20000 + direction)
+    r.runtime.step()
+    assert not r.broker.trades and not messages
+    r.update('2026-10-30 10:49:03', signal_close=20000 + direction)
     r.runtime.step()
     r.runtime.step()
+    assert len(r.broker.trades) == 1
+    assert r.service.curve_entry.snapshot()['state'] == 'triggered'
     assert len(messages) == 1 and '進場成交' in messages[0]
-    r.update('2026-10-30 09:03:03', close=21000)
+    r.update('2026-10-30 10:50:03', close=20000 + direction * 1000)
     r.runtime.step()
     r.runtime.step()
     assert len(messages) == 2 and '平倉成交' in messages[1]
     order = r.service.orders()[0]
     assert not order['active'] and order['avg_exit_price'] is not None
+    assert order['filled_quantity'] == order['exit_filled_quantity'] == 2
     r.runtime.step()
     assert len(messages) == 2
 
@@ -426,11 +563,11 @@ def test_dashboard_uses_remote_client_without_instantiating_trading_service(rig,
         assert len(rig.broker.trades) == 1
 
 
-def arm_curve(r, price=20000):
+def arm_curve(r, price=20000, kind='curve'):
     with db.session(r.path) as conn:
         bars = db.load_minute_bars(conn, 'TMFR1')
         anchors = [{'time': int(at.timestamp()), 'price': price} for at in bars['minute_start'].iloc[[-5, -3, -1]]]
-        curve = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe='1m')
+        curve = db.insert_trendline(conn, 'TMFR1', anchors, kind=kind, timeframe='1m')
     response = request(r, identity='arm-1', name='arm_curve', payload=dict(curve_id=curve,
                        contract_code='TMF209912', quantity=1, simulation=True, confirmed=True, action='Buy'))
     assert response.status_code == 202
@@ -459,16 +596,24 @@ def test_curve_entry_uses_adjacent_closes_and_survives_monitor_checking(rig):
     assert len(r.broker.trades) == 1
 
 
-def test_curve_modification_cancels_old_armed_version(rig):
+@pytest.mark.parametrize('kind', ['line', 'curve'])
+@pytest.mark.parametrize('change', ['anchors', 'kind', 'deleted'])
+def test_curve_modification_cancels_old_armed_version(rig, kind, change):
     r = rig
-    curve = arm_curve(r)
+    curve = arm_curve(r, kind=kind)
     with db.session(r.path) as conn:
         anchors = db.load_trendlines(conn, 'TMFR1')[0]['anchors']
         anchors[0]['price'] += 1
-        db.update_trendline_anchors(conn, curve, anchors)
+        if change == 'anchors':
+            db.update_trendline_anchors(conn, curve, anchors)
+        elif change == 'kind':
+            conn.execute('UPDATE trendlines SET kind=? WHERE id=?', ('line' if kind == 'curve' else 'curve', curve))
+            conn.commit()
+        else:
+            db.delete_trendline(conn, curve)
     r.update('2026-10-30 09:04:03', close=20001)
     r.runtime.step()
-    assert r.service.curve_entry.snapshot()['state'] == 'cancelled'
+    assert r.service.curve_entry.snapshot()['state'] == ('failed' if change == 'deleted' else 'cancelled')
     assert not r.broker.trades
 
 

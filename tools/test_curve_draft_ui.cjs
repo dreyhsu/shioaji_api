@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '../src/web/lwc_app.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../src/web/lwc_app.js'), 'utf8').replace(/\r\n/g, '\n');
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 class Element {
   constructor() { this.style = {}; this.children = []; this.listeners = []; this.classList = { toggle() {} }; this.captured = null; }

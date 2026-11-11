@@ -24,6 +24,33 @@ def test_night_end_and_breaks_have_exclusive_minutes():
     assert not calendar.active("2026-10-28 10:00")  # fixture declares a holiday
 
 
+@pytest.mark.parametrize('previous,current,expected', [
+    ('2026-10-27 13:43', '2026-10-27 13:44', True),
+    ('2026-10-27 13:44', '2026-10-27 15:00', True),
+    ('2026-10-28 04:59', '2026-10-28 08:45', True),
+    ('2026-10-28 13:44', '2026-10-29 08:45', True),  # declared holiday/night closure
+    ('2026-10-27 13:42', '2026-10-27 13:44', False),
+    ('2026-10-27 13:43', '2026-10-27 15:00', False),  # missing final minute
+    ('2026-10-27 13:44', '2026-10-27 15:01', False),  # missing opening minute
+    ('2026-10-27 13:44', '2026-10-28 08:45', False),  # missing entire night session
+    ('2026-10-27 13:44', '2026-10-30 08:45', False),  # outside coverage
+    ('2026-10-27 15:00', '2026-10-27 13:44', False),
+])
+def test_consecutive_trading_minutes_only_bridge_verified_session_breaks(previous, current, expected):
+    document = calendar_document()
+    document['sessions'] = [
+        dict(start='2026-10-27 08:45', end='2026-10-27 13:45'),
+        dict(start='2026-10-27 15:00', end='2026-10-28 05:00'),
+        dict(start='2026-10-28 08:45', end='2026-10-28 13:45'),
+        dict(start='2026-10-29 08:45', end='2026-10-29 13:45'),
+    ]
+    assert mh.SessionCalendar(document).consecutive_trading_minutes(previous, current) is expected
+
+
+def test_unavailable_calendar_cannot_certify_session_break():
+    assert not mh.SessionCalendar().consecutive_trading_minutes('2026-10-27 13:44', '2026-10-27 15:00')
+
+
 def test_gap_is_not_hidden_by_a_fresh_tail_or_no_volume():
     calendar = mh.SessionCalendar(calendar_document())
     frame = bars("2026-10-27 19:00", "2026-10-27 19:09")
