@@ -72,6 +72,14 @@ class TickFetcher(FetcherRuntime):
                  'received_at': str(self.latest[code].received_at), 'instance': self.instance,
                  'generation': self.generation} for code in sorted(self.dirty)]
         self.store.quotes(rows)
+        published_at = pd.Timestamp(self.clock())
+        for row in rows:
+            self.health['quote_publish_latency'][row['code']] = {
+                'quote_at': row['quote_at'], 'received_at': row['received_at'],
+                'published_at': str(published_at),
+                'receive_to_publish_ms': (published_at - pd.Timestamp(row['received_at'])).total_seconds() * 1000,
+                'quote_age_ms': (published_at - pd.Timestamp(row['quote_at'])).total_seconds() * 1000,
+            }
         self.dirty.clear()  # only acknowledge after a successful DB commit
         self.last_publish = self.monotonic()
 

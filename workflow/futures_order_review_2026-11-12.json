@@ -1,0 +1,216 @@
+{
+  "reviewed_at": "2026-11-12T16:20:46.252706+08:00",
+  "final_checked_at": "2026-11-12T16:20:46.252706+08:00",
+  "head": "ac1a8401cdf53e23cfdeb6075d6a63c1f17abec3",
+  "sdk_version": "1.7.7",
+  "source": "working tree including pre-existing uncommitted edits",
+  "changed_since_previous_review": [
+    "src/trading.py",
+    "src/test_position_reconciliation.py"
+  ],
+  "newly_covered_files": [
+    "src/pnl_calendar.py",
+    "src/entry_notify.py",
+    "src/curve_entry_controller.py",
+    "src/test_place_order.py",
+    "src/test_shioaji_order_adapter.py",
+    "src/test_trading.py",
+    "src/test_trade_client.py",
+    "tools/reconcile_positions.py",
+    "doc/independent_trade.md"
+  ],
+  "sha256_at_full_test_start": {
+    "src/trade.py": "5bb09449972a8e81eb2fa6074af653882310a62a38b05f1f9fef3415b419a155",
+    "src/trade_service.py": "2e3c4db906e3d4e3c1572f37add4bdf9116580697e41b2f8597ecdca216a1e81",
+    "src/trading.py": "476ef829fc64af46de370311a7c3fd64e804117b0bcb94006e32e90bcbcbce4a",
+    "src/shioaji_order_adapter.py": "88cc3f1df15d13dd386680e02ba94b9de6cf3df6553efe5dcf1e8e871d5d2843",
+    "src/place_order.py": "75f585990fe95fa9ad9cd6a08708f3dacdacd432bf76ac5d69fce123aeb05b8f",
+    "src/position_reconciliation.py": "99f68925745a95240cfc629bc72ef7511dba679c94a66f6f735612ab74020165",
+    "src/trade_client.py": "bb6a5d8f5d42ffcc776c228d0b23a2b4c22f26e070058b87896e05eb052c3db2",
+    "src/trading_models.py": "71a3d91c0351906f72ae6eec972646cb94f3b321b78ffaa7c824925a97f43b0e",
+    "src/dashboard.py": "0ead5cf6b07c4ac3acf896959be289a91d211188b95d634fe4bfc6647c5ac06b",
+    "src/shioaji_client.py": "30ae02e9dde72d459f797fbdf705fa898cc8d36364d8713b16eeab29fffc73c3",
+    "src/web/trading.js": "e5ecb611e4474cdeecff5662cb43cf12a71fd7d768a17829c2698f203957fc27",
+    "config/runtime.json": "40b74a96a104f1bf5c5bd9f1ffe49397872ab66c12fab1f57853b1f291e4f415",
+    "config/market_health.json": "46572bbe82f2e35ae2d8aae47beef217ca1e4e1c038b47e140ac99b5dd075bf9",
+    "config/market_services.json": "3ad612a53b6e6530758c6e373f46ac5d703b01ae33c7f481a12df20696019fed",
+    "config/trading.json": "57e6f4510adf552129539d7158f85213619e0ea698950e6ce8acbff71d66b57f",
+    "src/db.py": "3ff6955efcaf5f039b83581df635b69a22046c8531694f986c60136bd45486f7",
+    "src/mock_broker.py": "91c25a1c9af8751c956292a2bdb6a7dd721319e712061db98bbbda1a6f32b441",
+    "src/test_position_reconciliation.py": "8ea62aa6471b37583341cab1ae0b005efdf93b4f0991cd3456fbb2ca27a9e4f3",
+    "src/test_independent_trade.py": "134989bf162e3b6fb8114f5039aec7fad6fe022a3d3d7e440d63b155f1e5c86f",
+    "src/pnl_calendar.py": "a2078f2c9d265dbaaa9c5bec2ba18fb39258c3ddd35ccbf0da5bd295dd3e3eaf",
+    "src/entry_notify.py": "cda6421db6d2c35fd4fb35c974e4e7e630ba333e4d7b18bc188be01c22135a08",
+    "src/curve_entry_controller.py": "6fdd52ec81cfe43748d9c43728131ceb10f7bc66862aa26d37406c8dfc11e1a5",
+    "src/test_place_order.py": "60129f26228ec6496c253ee01e7591883d4a355acea39bbe879b5c1eebcefd2e",
+    "src/test_shioaji_order_adapter.py": "cf95d1aed9200b0470c7d4435668a80e90359c96ecbb5c6af6cd68a8a355a1c7",
+    "src/test_trading.py": "a23a795ff966ceff262a4714418af41689cc23a2ff90cf2692661e7babc4f156",
+    "src/test_trade_client.py": "35b2c538793e8f573019a3149222f0cc9c90096cab61ef2f0ba5c105dc00e8f4",
+    "tools/reconcile_positions.py": "3f9f57e6a52181f1134e91c2bb58c550f5792483150b6e8e1eaa540bfdf45207",
+    "doc/independent_trade.md": "42499896018a2b6936c12fda5ebc3c20d39a97829adaa71a8cd6a07b0c3fc0a0"
+  },
+  "sha256": {
+    "src/trade.py": "5bb09449972a8e81eb2fa6074af653882310a62a38b05f1f9fef3415b419a155",
+    "src/trade_service.py": "2e3c4db906e3d4e3c1572f37add4bdf9116580697e41b2f8597ecdca216a1e81",
+    "src/trading.py": "476ef829fc64af46de370311a7c3fd64e804117b0bcb94006e32e90bcbcbce4a",
+    "src/shioaji_order_adapter.py": "88cc3f1df15d13dd386680e02ba94b9de6cf3df6553efe5dcf1e8e871d5d2843",
+    "src/place_order.py": "75f585990fe95fa9ad9cd6a08708f3dacdacd432bf76ac5d69fce123aeb05b8f",
+    "src/position_reconciliation.py": "99f68925745a95240cfc629bc72ef7511dba679c94a66f6f735612ab74020165",
+    "src/trade_client.py": "bb6a5d8f5d42ffcc776c228d0b23a2b4c22f26e070058b87896e05eb052c3db2",
+    "src/trading_models.py": "71a3d91c0351906f72ae6eec972646cb94f3b321b78ffaa7c824925a97f43b0e",
+    "src/dashboard.py": "0ead5cf6b07c4ac3acf896959be289a91d211188b95d634fe4bfc6647c5ac06b",
+    "src/shioaji_client.py": "30ae02e9dde72d459f797fbdf705fa898cc8d36364d8713b16eeab29fffc73c3",
+    "src/web/trading.js": "e5ecb611e4474cdeecff5662cb43cf12a71fd7d768a17829c2698f203957fc27",
+    "config/runtime.json": "40b74a96a104f1bf5c5bd9f1ffe49397872ab66c12fab1f57853b1f291e4f415",
+    "config/market_health.json": "46572bbe82f2e35ae2d8aae47beef217ca1e4e1c038b47e140ac99b5dd075bf9",
+    "config/market_services.json": "3ad612a53b6e6530758c6e373f46ac5d703b01ae33c7f481a12df20696019fed",
+    "config/trading.json": "57e6f4510adf552129539d7158f85213619e0ea698950e6ce8acbff71d66b57f",
+    "src/db.py": "3ff6955efcaf5f039b83581df635b69a22046c8531694f986c60136bd45486f7",
+    "src/mock_broker.py": "91c25a1c9af8751c956292a2bdb6a7dd721319e712061db98bbbda1a6f32b441",
+    "src/test_position_reconciliation.py": "8ea62aa6471b37583341cab1ae0b005efdf93b4f0991cd3456fbb2ca27a9e4f3",
+    "src/test_independent_trade.py": "134989bf162e3b6fb8114f5039aec7fad6fe022a3d3d7e440d63b155f1e5c86f",
+    "src/pnl_calendar.py": "a2078f2c9d265dbaaa9c5bec2ba18fb39258c3ddd35ccbf0da5bd295dd3e3eaf",
+    "src/entry_notify.py": "cda6421db6d2c35fd4fb35c974e4e7e630ba333e4d7b18bc188be01c22135a08",
+    "src/curve_entry_controller.py": "6fdd52ec81cfe43748d9c43728131ceb10f7bc66862aa26d37406c8dfc11e1a5",
+    "src/test_place_order.py": "60129f26228ec6496c253ee01e7591883d4a355acea39bbe879b5c1eebcefd2e",
+    "src/test_shioaji_order_adapter.py": "cf95d1aed9200b0470c7d4435668a80e90359c96ecbb5c6af6cd68a8a355a1c7",
+    "src/test_trading.py": "a23a795ff966ceff262a4714418af41689cc23a2ff90cf2692661e7babc4f156",
+    "src/test_trade_client.py": "35b2c538793e8f573019a3149222f0cc9c90096cab61ef2f0ba5c105dc00e8f4",
+    "tools/reconcile_positions.py": "3f9f57e6a52181f1134e91c2bb58c550f5792483150b6e8e1eaa540bfdf45207",
+    "doc/independent_trade.md": "42499896018a2b6936c12fda5ebc3c20d39a97829adaa71a8cd6a07b0c3fc0a0"
+  },
+  "files_changed_during_full_test": [],
+  "workflow_sha256": "6a4c4dcb0a01496ba9c67002c0510cc133823b7b4d39589a48a8b104b7126f60",
+  "validation": {
+    "broker_login": false,
+    "broker_orders": false,
+    "service_restart": false,
+    "repair_tool_run": false,
+    "offline_constructor_check": {
+      "entry": "Order: LMT / ROD / Auto",
+      "exit": "Order: MKT / IOC / Cover",
+      "futures_order_signature": "action, price, quantity, price_type, order_type, octype=None, custom_field=None, account=None"
+    },
+    "full_regression": {
+      "junit": "out/futures-workflow-recheck-20261112.xml",
+      "tests": "173",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "216.482",
+      "timestamp": "2026-11-12T16:16:04.331114+08:00"
+    },
+    "pnl_regression": {
+      "junit": "out/futures-workflow-recheck-pnl-20261112.xml",
+      "tests": "19",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "47.618",
+      "timestamp": "2026-11-12T16:16:58.593321+08:00"
+    }
+  },
+  "official_sources": [
+    "https://sinotrade.github.io/tutor/order/FutureOption/",
+    "https://sinotrade.github.io/tutor/order/OrderEvent/"
+  ],
+  "review_history": [
+    {
+      "reviewed_at": "2026-11-12T16:02:46.724480+08:00",
+      "head": "ac1a8401cdf53e23cfdeb6075d6a63c1f17abec3",
+      "sdk_version": "1.7.7",
+      "source": "working tree including pre-existing uncommitted edits",
+      "sha256": {
+        "src/trade.py": "5bb09449972a8e81eb2fa6074af653882310a62a38b05f1f9fef3415b419a155",
+        "src/trade_service.py": "2e3c4db906e3d4e3c1572f37add4bdf9116580697e41b2f8597ecdca216a1e81",
+        "src/trading.py": "a9ba93003ee3edf7731a845d03308ddbb6b9db12b3786d0024efbe8699a77e54",
+        "src/shioaji_order_adapter.py": "88cc3f1df15d13dd386680e02ba94b9de6cf3df6553efe5dcf1e8e871d5d2843",
+        "src/place_order.py": "75f585990fe95fa9ad9cd6a08708f3dacdacd432bf76ac5d69fce123aeb05b8f",
+        "src/position_reconciliation.py": "99f68925745a95240cfc629bc72ef7511dba679c94a66f6f735612ab74020165",
+        "src/trade_client.py": "bb6a5d8f5d42ffcc776c228d0b23a2b4c22f26e070058b87896e05eb052c3db2",
+        "src/trading_models.py": "71a3d91c0351906f72ae6eec972646cb94f3b321b78ffaa7c824925a97f43b0e",
+        "src/dashboard.py": "0ead5cf6b07c4ac3acf896959be289a91d211188b95d634fe4bfc6647c5ac06b",
+        "src/shioaji_client.py": "30ae02e9dde72d459f797fbdf705fa898cc8d36364d8713b16eeab29fffc73c3",
+        "src/web/trading.js": "e5ecb611e4474cdeecff5662cb43cf12a71fd7d768a17829c2698f203957fc27",
+        "config/runtime.json": "40b74a96a104f1bf5c5bd9f1ffe49397872ab66c12fab1f57853b1f291e4f415",
+        "config/market_health.json": "46572bbe82f2e35ae2d8aae47beef217ca1e4e1c038b47e140ac99b5dd075bf9",
+        "config/market_services.json": "3ad612a53b6e6530758c6e373f46ac5d703b01ae33c7f481a12df20696019fed",
+        "config/trading.json": "57e6f4510adf552129539d7158f85213619e0ea698950e6ce8acbff71d66b57f",
+        "src/db.py": "3ff6955efcaf5f039b83581df635b69a22046c8531694f986c60136bd45486f7",
+        "src/mock_broker.py": "91c25a1c9af8751c956292a2bdb6a7dd721319e712061db98bbbda1a6f32b441",
+        "src/test_position_reconciliation.py": "5e88cdbaeb93ac0b4c6a8146fea01b55b3854c4137b741fb6d7aa8c546e0ec14",
+        "src/test_independent_trade.py": "134989bf162e3b6fb8114f5039aec7fad6fe022a3d3d7e440d63b155f1e5c86f"
+      },
+      "sha256_at_full_test_start": {
+        "src/trade.py": "5bb09449972a8e81eb2fa6074af653882310a62a38b05f1f9fef3415b419a155",
+        "src/trade_service.py": "2e3c4db906e3d4e3c1572f37add4bdf9116580697e41b2f8597ecdca216a1e81",
+        "src/trading.py": "dabe4a8ab5761bb74c69904413a01defd4f5783b3e2e42bb3253fd6a6673ffa1",
+        "src/shioaji_order_adapter.py": "88cc3f1df15d13dd386680e02ba94b9de6cf3df6553efe5dcf1e8e871d5d2843",
+        "src/place_order.py": "75f585990fe95fa9ad9cd6a08708f3dacdacd432bf76ac5d69fce123aeb05b8f",
+        "src/position_reconciliation.py": "c8ac859c3603a5ea461ad5df4b4fa60cba3f06338d681d581eeedaa3037ac84b",
+        "src/trade_client.py": "bb6a5d8f5d42ffcc776c228d0b23a2b4c22f26e070058b87896e05eb052c3db2",
+        "src/trading_models.py": "71a3d91c0351906f72ae6eec972646cb94f3b321b78ffaa7c824925a97f43b0e",
+        "src/dashboard.py": "0ead5cf6b07c4ac3acf896959be289a91d211188b95d634fe4bfc6647c5ac06b",
+        "src/shioaji_client.py": "30ae02e9dde72d459f797fbdf705fa898cc8d36364d8713b16eeab29fffc73c3",
+        "src/web/trading.js": "e5ecb611e4474cdeecff5662cb43cf12a71fd7d768a17829c2698f203957fc27",
+        "config/runtime.json": "40b74a96a104f1bf5c5bd9f1ffe49397872ab66c12fab1f57853b1f291e4f415",
+        "config/market_health.json": "46572bbe82f2e35ae2d8aae47beef217ca1e4e1c038b47e140ac99b5dd075bf9",
+        "config/market_services.json": "3ad612a53b6e6530758c6e373f46ac5d703b01ae33c7f481a12df20696019fed",
+        "config/trading.json": "57e6f4510adf552129539d7158f85213619e0ea698950e6ce8acbff71d66b57f",
+        "src/db.py": "3ff6955efcaf5f039b83581df635b69a22046c8531694f986c60136bd45486f7",
+        "src/mock_broker.py": "91c25a1c9af8751c956292a2bdb6a7dd721319e712061db98bbbda1a6f32b441",
+        "src/test_position_reconciliation.py": "9cd479d3fbcf7922fff5ae9f7ab3dad8246915de5ad3469aee9683c444ba8cd0",
+        "src/test_independent_trade.py": "134989bf162e3b6fb8114f5039aec7fad6fe022a3d3d7e440d63b155f1e5c86f"
+      },
+      "files_changed_during_full_test": [
+        "src/trading.py",
+        "src/position_reconciliation.py",
+        "src/test_position_reconciliation.py"
+      ],
+      "validation": {
+        "broker_login": false,
+        "broker_orders": false,
+        "service_restart": false,
+        "initial_regression": {
+          "passed": 160,
+          "failed": 3,
+          "seconds": 168.02
+        },
+        "fixed_cases_recheck": {
+          "passed": 3,
+          "failed": 0,
+          "seconds": 3.66
+        },
+        "full_regression": {
+          "junit": "out/futures-order-review-20261112.xml",
+          "errors": "0",
+          "failures": "0",
+          "skipped": "0",
+          "tests": "168",
+          "time": "197.744",
+          "timestamp": "2026-11-12T16:02:53.342682+08:00"
+        },
+        "followup": {
+          "junit": "out/futures-order-review-followup-20261112.xml",
+          "tests": "41",
+          "failures": "0",
+          "errors": "0",
+          "skipped": "0",
+          "time": "43.197",
+          "timestamp": "2026-11-12T16:06:07.310106+08:00"
+        },
+        "offline_constructor_check": {
+          "entry": "Order: LMT / ROD / Auto",
+          "exit": "Order: MKT / IOC / Cover",
+          "futures_order_signature": "action, price, quantity, price_type, order_type, octype=None, custom_field=None, account=None"
+        }
+      },
+      "final_checked_at": "2026-11-12T16:07:38.087678+08:00",
+      "files_changed_after_followup_fingerprint": [],
+      "official_sources": [
+        "https://sinotrade.github.io/tutor/order/FutureOption/",
+        "https://sinotrade.github.io/tutor/order/OrderEvent/"
+      ]
+    }
+  ]
+}

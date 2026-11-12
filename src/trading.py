@@ -30,6 +30,7 @@ from shioaji_order_adapter import ShioajiOrderAdapter
 from curve_entry_controller import CurveEntryController
 from entry_notify import EntryNotifier
 import pnl_calendar
+from position_reconciliation import plan_cover_repairs, position_totals, ReconciliationPending
 from alert_rules import DEFAULT_CONFIG_PATH as DEFAULT_ALERTS_PATH
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -215,6 +216,8 @@ class TradingService:
         self._last_fresh_receipt: dict[str, float] = {}
         self._last_order_sync_at = None
         self._last_order_event_at = None
+        self._last_position_sync_at = None
+        self._broker_positions = []
         self._broker_ready = not self._health_enabled
         self._reconcile_required = self._health_enabled
         self._reconcile_error = None
@@ -437,7 +440,7 @@ class TradingService:
         except Exception:  # noqa: BLE001 - callback runs on Shioaji's quote thread
             return
 
-    def _trades_by_id(self) -> dict[str, Any]:
+    def _trades_by_id(self, *, force=False) -> dict[str, Any]:
         if self._api is None:
             return {}
         try:
@@ -451,20 +454,68 @@ class TradingService:
             self._sync_pnl_history(trades)
             self._sync_ok = True
             self._last_order_sync_at = mh.iso(self._now())
-            if not self._reconcile_required:
-                self._broker_ready = True
+            if self._position_checks_enabled():
+                self._reconcile_required = True
+                self._broker_ready = False
             return trades
         except Exception as error:  # noqa: BLE001
             self._sync_ok = self._broker_ready = False
             if self._health_enabled and error_kind(error) in {"session", "transport", "authentication"}:
                 self._recovery.fail(error_kind(error), immediate=error_kind(error) in {"session", "authentication"})
-            self._connect_error = f"委託狀態同步失敗：{error}"
+            self._connect_error = f"委託狀態同步失敗：{type(error).__name__}"
             return {}
+
+    def _position_checks_enabled(self):
+        return self._health_enabled or callable(getattr(self._api, 'list_positions', None))
+
+    def _sync_managed_orders(self, *, force=False):
+        """Run on the order worker, before any strategy decision or new entry."""
+        trades = self._trades_by_id(force=force)
+        for row in self._active_orders():
+            entry = trades.get(str(row['entry_trade_id']))
+            exit_trade = trades.get(str(row['exit_trade_id'])) if row.get('exit_trade_id') else None
+            if entry is not None or exit_trade is not None:
+                self._persist_trade_state(row['id'], entry=entry, exit_trade=exit_trade)
+        if self._position_checks_enabled() and self._reconcile_required:
+            self._reconcile_broker(trades)
+        return trades
+
+    def _apply_cover_repairs(self, repairs):
+        if not repairs:
+            return
+        stamp = mh.iso(self._now())
+        with db.session(self.db_path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            for source, target, source_changes, target_changes, trade, fills in repairs:
+                for original, changes in ((source, source_changes), (target, target_changes)):
+                    changes = dict(changes, updated_at=stamp, risk_revision=int(original['risk_revision']) + 1)
+                    assignments = ', '.join(f'{key}=?' for key in changes)
+                    cursor = conn.execute(f'UPDATE managed_orders SET {assignments} WHERE id=? AND risk_revision=? AND updated_at=?',
+                        (*changes.values(), original['id'], original['risk_revision'], original['updated_at']))
+                    if cursor.rowcount != 1:
+                        raise ReconciliationPending('部位在核對期間已更新，等待重新核對')
+                conn.execute('INSERT INTO order_reconciliations VALUES (?,?,?,?,?)',
+                    (source['id'], target['id'], source['entry_trade_id'], json.dumps(dict(
+                        source_before=source, target_before=target, source_changes=source_changes,
+                        target_changes=target_changes), ensure_ascii=False), stamp))
+                # A Cover is an exit fill of the original position, never a second entry.
+                conn.execute("DELETE FROM pnl_fills WHERE order_id=? AND phase='entry'", (source['id'],))
+                self._save_pnl(conn, {**target, **target_changes})
+                conn.execute("DELETE FROM pnl_fills WHERE order_id=? AND phase='exit'", (target['id'],))
+                conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+                    [(target['id'], 'exit', key, str(source['entry_trade_id']), at, day, qty, price)
+                     for key, at, day, qty, price in fills])
+                conn.execute('UPDATE pnl_order_metadata SET exit_error=NULL, updated_at=? WHERE order_id=?', (stamp, target['id']))
+            conn.commit()
+        for _, target, _, changes, _, _ in repairs:
+            self.entry_notifier.notify_exit({**target, **changes})
 
     def _reconcile_broker(self, trades):
         """Never clear uncertain submission claims or infer that missing means flat."""
         if not self._sync_ok:
             return
+        self._broker_ready = False
+        self._reconcile_required = True
         rows = self._active_orders()
         terminal = {"Filled", "Cancelled", "Failed", "Rejected"}
         known_ids = {str(row[key]) for row in rows for key in ("entry_trade_id", "exit_trade_id") if row.get(key)}
@@ -475,17 +526,15 @@ class TradingService:
             if (row["entry_status"] not in terminal and str(row["entry_trade_id"]) not in trades
                     or row.get("exit_status") in {"unknown", "submitting", "cancelling_entry", "waiting_entry_cancel"}
                     and not row.get("exit_trade_id")
-                    or row.get("exit_trade_id") and str(row["exit_trade_id"]) not in trades):
+                    or row.get("exit_trade_id") and str(row["exit_trade_id"]) not in trades
+                    and not (row.get('exit_status') in {'Failed', 'Rejected', 'Cancelled'}
+                             and int(row['exit_filled_quantity']) == 0)):
                 self._reconcile_error = "委託身分或送單結果待券商核對；不自動重送"
                 return
         try:
             kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
             positions = self._api.list_positions(self._api.futopt_account, **kwargs)
-            expected, actual = {}, {}
-            for row in rows:
-                quantity = int(row["filled_quantity"]) - int(row["exit_filled_quantity"])
-                key = (row["contract_code"], row["action"])
-                expected[key] = expected.get(key, 0) + quantity
+            actual = {}
             for position in positions:
                 code = str(_value(position, "code", ""))
                 direction = _enum_text(_value(position, "direction", ""))
@@ -493,17 +542,38 @@ class TradingService:
                     raise ValueError("unrecognized position direction")
                 key = (self._quote_aliases.get(code, code), direction)
                 actual[key] = actual.get(key, 0) + int(_value(position, "quantity", 0))
-            expected = {key: value for key, value in expected.items() if value}
             actual = {key: value for key, value in actual.items() if value}
+            self._last_position_sync_at = mh.iso(self._now())
+            self._broker_positions = [dict(contract_code=code, action=action, quantity=quantity)
+                                      for (code, action), quantity in sorted(actual.items())]
+            entry_fills = {}
+            if any(row.get('broker_octype') == 'Cover' for row in rows):
+                with db.read_session(self.db_path) as conn:
+                    for row in rows:
+                        phase = 'cover' if row.get('broker_octype') == 'Cover' else 'entry'
+                        entry_fills[row['id']] = [tuple(fill) for fill in conn.execute(
+                            'SELECT fill_key, filled_at, fill_date, quantity, price FROM pnl_fills WHERE order_id=? AND phase=? AND broker_trade_id=?',
+                            (row['id'], phase, str(row['entry_trade_id'])))]
+                        if phase == 'cover' and not entry_fills[row['id']]:
+                            entry_fills[row['id']] = [tuple(fill) for fill in conn.execute(
+                                "SELECT fill_key, filled_at, fill_date, quantity, price FROM pnl_fills WHERE order_id=? AND phase='entry' AND broker_trade_id=?",
+                                (row['id'], str(row['entry_trade_id'])))]
+            repairs = plan_cover_repairs(rows, trades, actual, self._quote_aliases, entry_fills)
+            self._apply_cover_repairs(repairs)
+            expected = position_totals(self._active_orders())
             if expected != actual:
                 self._reconcile_error = "券商部位與本機管理部位不一致；請核對外部委託與部位"
                 return
+        except ReconciliationPending as error:
+            self._reconcile_error = str(error)
+            return
         except Exception as error:
             self._reconcile_error = f"券商部位核對失敗：{type(error).__name__}"
             return
         self._reconcile_required = False
         self._broker_ready = True
         self._reconcile_error = None
+        self._connect_error = None
 
     def _curve_data_ready(self):
         if not self._health_enabled:
@@ -514,7 +584,7 @@ class TradingService:
 
     def _entry_data_ready(self, entry):
         if not self._health_enabled:
-            return True
+            return not self._reconcile_error
         ready, document = mh.monitor_ready(self.db_path, self.code, self._now(), self.health_settings,
                                            mode="simulation" if self.simulation else "production")
         if not ready or not self._broker_ready or self._recovery.pending:
@@ -550,6 +620,8 @@ class TradingService:
                                  quotes=self._quote_health(), broker_ready=self._broker_ready,
                                  reconciliation_error=self._reconcile_error,
                                  last_order_sync_at=self._last_order_sync_at,
+                                 last_position_sync_at=self._last_position_sync_at,
+                                 broker_positions=self._broker_positions,
                                  last_order_event_at=self._last_order_event_at, **changes)
 
     def _maintain_connection(self):
@@ -616,7 +688,7 @@ class TradingService:
                 currency = _enum_text(_value(contract, 'currency', _value(contract, 'quote_ccy', '')))
             except Exception:
                 multiplier, currency = None, None
-            pnl_calendar.save_fills(conn, row, entry=entry, exit_trade=exit_trade,
+            pnl_calendar.save_fills(conn, row, entry=None if row.get('broker_octype') == 'Cover' else entry, exit_trade=exit_trade,
                 multiplier=multiplier, currency=currency, observed_at=self._now().isoformat())
         except Exception as error:
             conn.execute('ROLLBACK TO pnl_write')
@@ -656,11 +728,18 @@ class TradingService:
         new_exit_fill = False
         updates: dict[str, Any] = {"updated_at": now}
         if entry is not None:
-            filled, avg = _fill_summary(entry)
+            filled, avg = _fill_summary(entry, confirmed_price_only=True)
             status = _trade_status(entry)
             current = self._active_order(row_id)
             new_fill = filled > int(current.get("filled_quantity", 0))
             updates.update(filled_quantity=filled, entry_status=status)
+            octype = _enum_text(_value(_value(entry, 'order'), 'octype', ''))
+            if octype in {'New', 'NewPosition', 'Cover', 'Auto', 'DayTrade'}:
+                updates['broker_octype'] = octype
+            if octype == 'Cover':
+                # Broker execution is real, but it did not create a new position.
+                new_fill = False
+                updates['auto_exit'] = 0
             terminal = status in {"Filled", "Cancelled", "Failed", "Rejected"}
             if terminal and current.get("exit_status") == "waiting_entry_cancel":
                 # Once the remainder is confirmed terminal, the watchdog may
@@ -699,9 +778,18 @@ class TradingService:
             elif status in {"Cancelled", "Failed", "Rejected"}:
                 # Do not retry an ambiguous exit automatically; it needs review.
                 updates["error"] = f"平倉委託狀態：{status}，請確認剩餘部位"
+                code = str(_value(_value(exit_trade, 'status'), 'status_code', '')).strip()
+                if code and code.isascii() and code.isalnum() and len(code) <= 12:
+                    updates['exit_status_code'] = code
+                    if code == '99Q1':
+                        updates['error'] += '（99Q1：超過客戶可平倉口數）'
         risk_keys = {"avg_fill_price", "filled_quantity", "exit_filled_quantity", "active", "stop_price", "target_price", "breakeven_price"}
         if any(key in risk_keys and value != original.get(key) for key, value in updates.items()):
             updates["risk_revision"] = int(original.get("risk_revision", 0)) + 1
+        if self._position_checks_enabled() and any(updates.get(key, original.get(key)) != original.get(key)
+                for key in ('filled_quantity', 'exit_filled_quantity', 'entry_status', 'exit_status', 'broker_octype', 'active')):
+            self._reconcile_required = True
+            self._broker_ready = False
         assignments = ", ".join(f"{key} = ?" for key in updates)
         with db.session(self.db_path) as conn:
             conn.execute(
@@ -709,6 +797,16 @@ class TradingService:
                 (*updates.values(), row_id),
             )
             self._save_pnl(conn, {**original, **updates}, entry=entry, exit_trade=exit_trade)
+            if entry is not None and updates.get('broker_octype') == 'Cover':
+                try:
+                    fills = pnl_calendar.normalized_fills(entry)
+                    if sum(fill[3] for fill in fills) == int(updates['filled_quantity']):
+                        conn.execute("DELETE FROM pnl_fills WHERE order_id=? AND phase='cover'", (row_id,))
+                        conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+                            [(row_id, 'cover', key, str(_trade_id(entry)), at, day, qty, price)
+                             for key, at, day, qty, price in fills])
+                except (ValueError, TypeError, OverflowError, OSError):
+                    pass  # incomplete reports cannot erase previously verified fills
             conn.commit()
 
         if new_fill:
@@ -718,7 +816,7 @@ class TradingService:
 
     def _apply_breakeven(self, row: dict, price: float) -> dict:
         """Called under the shared risk lock for every fresh tick and after fill sync."""
-        if (not row.get("active") or not row.get("breakeven_enabled") or row.get("triggered_at")
+        if (row.get('broker_octype') == 'Cover' or not row.get("active") or not row.get("breakeven_enabled") or row.get("triggered_at")
                 or row.get("exit_trade_id") or row.get("exit_status")
                 or int(row["filled_quantity"]) <= int(row["exit_filled_quantity"])):
             return row
@@ -860,7 +958,7 @@ class TradingService:
 
     @risk_locked
     def _try_auto_exit(self, row: dict, reason: str) -> None:
-        if self._health_enabled and not self._broker_ready:
+        if self._position_checks_enabled() and not self._broker_ready:
             return  # unknown broker state must not produce a second closing order
         with db.session(self.db_path) as conn:
             conn.execute(
@@ -873,11 +971,16 @@ class TradingService:
         if (not self.auto_exit_enabled() or row.get("exit_trade_id")
                 or row.get("exit_status") in {"unknown", "waiting_entry_cancel", "cancelling_entry"}):
             return
+        if self._position_checks_enabled():
+            self._sync_managed_orders(force=True)
+            row = self._active_order(row['id'])
+            if not self._broker_ready or not row or not row['active'] or row.get('broker_octype') == 'Cover':
+                return
         if row.get("entry_status") not in {"Filled", "Cancelled", "Failed", "Rejected"}:
             # A partially filled entry can still add contracts after the exit
             # trigger. Cancel its unfilled remainder first, then reconcile the
             # confirmed fill count before calculating the close quantity.
-            trades = self._trades_by_id()
+            trades = self._sync_managed_orders(force=True)
             entry_trade = trades.get(str(row["entry_trade_id"]))
             if entry_trade is None:
                 with db.session(self.db_path) as conn:
@@ -992,33 +1095,25 @@ class TradingService:
     def _monitor_once(self) -> None:
         if not self._api:
             return
-        with self._lock:
-            self._validate_connected_mode()
-            try:
-                self.curve_entry.check()
-            except Exception as error:
-                self._connect_error = f"進場監控錯誤：{error}"
-                self.curve_entry.fail_pending(error)
+        self._validate_connected_mode()
         active_rows = self._active_orders()
-        if not active_rows and not self._health_enabled:
-            return
         now_mono = time.monotonic()
         if now_mono - self._last_sync >= 1.0:
-            trades = self._trades_by_id()
+            self._sync_managed_orders()
             self._last_sync = now_mono
-            for row in active_rows:
-                entry = trades.get(str(row["entry_trade_id"]))
-                exit_trade = trades.get(str(row["exit_trade_id"])) if row.get("exit_trade_id") else None
-                if entry is not None or exit_trade is not None:
-                    self._persist_trade_state(row["id"], entry=entry, exit_trade=exit_trade)
-            if self._health_enabled and self._reconcile_required:
-                self._reconcile_broker(trades)
+        try:
+            self.curve_entry.check()
+        except Exception as error:
+            self._connect_error = f"進場監控錯誤：{type(error).__name__}"
+            self.curve_entry.fail_pending(error)
         for row in active_rows:
             # A fill/status sync above may have changed the managed row (including
             # confirming a remainder cancellation), so make exit decisions from
             # the refreshed persisted state rather than the stale snapshot.
             row = self._active_order(row["id"])
             if not row or not int(row["active"]):
+                continue
+            if row.get('broker_octype') == 'Cover':
                 continue
             if int(row["filled_quantity"]) <= int(row["exit_filled_quantity"]):
                 continue
@@ -1089,12 +1184,12 @@ class TradingService:
         quotes = self._quote_health()
         quotes_ready = bool(quotes) and all(row["fresh"] for row in quotes.values())
         bars_ready = self._curve_data_ready()
-        broker_ready = self._broker_ready if self._health_enabled else connected
+        broker_ready = self._broker_ready if self._position_checks_enabled() else connected
         return {
             "simulation": self.simulation,
             "mode": "模擬環境" if self.simulation else "正式環境",
             "connected": connected and broker_ready,
-            "session_present": connected,
+            "session_present": self._api is not None,
             "quote_connected": quotes_ready,
             "quote_contracts": quotes,
             "bars_ready": bars_ready,
@@ -1102,11 +1197,13 @@ class TradingService:
             "recovery": self._recovery.snapshot(),
             "reconnect_enabled": self.health_settings.trading_reconnect_enabled,
             "protection": {"fixed_exit": quotes_ready and broker_ready and self.auto_exit_enabled(),
-                           "breakeven": quotes_ready,
+                           "breakeven": quotes_ready and broker_ready,
                            "curve_exit": quotes_ready and broker_ready and bars_ready and self.auto_exit_enabled(),
                            "curve_entry": quotes_ready and broker_ready and bars_ready and self.auto_entry_enabled(),
                            "broker_protection": "unverified"},
             "reconciliation_error": self._reconcile_error,
+            "last_position_sync_at": self._last_position_sync_at,
+            "broker_positions": self._broker_positions,
             "last_quote": None if latest is None else latest["price"],
             "last_quote_at": None if latest is None else latest["at"].isoformat(sep=" "),
             "quote_age_seconds": age,
@@ -1212,6 +1309,13 @@ class TradingService:
         if any(row["entry_status"] in {"submitting", "unknown"} or row.get("exit_status") in {"unknown", "submitting"}
                for row in self._active_orders()):
             raise ValueError("既有進場送單結果不明，請先核對券商端")
+        if self._health_enabled:
+            self.ensure_connected()
+            self._sync_managed_orders(force=True)
+        elif self._position_checks_enabled():
+            self._sync_managed_orders(force=True)
+            if not self._broker_ready:
+                raise ValueError('券商委託或部位核對尚未完成，暫停新倉')
         if self._health_enabled and (not self._curve_data_ready() or not self._broker_ready):
             raise ValueError("行情回補或券商委託核對尚未完成，暫停新倉")
         action, quantity = order_request.action, order_request.quantity
@@ -1468,6 +1572,10 @@ class TradingService:
         terminal = {"Filled", "Cancelled", "Failed", "Rejected"}
         if _trade_status(trade) in terminal:
             return self._public_order(self._active_order(row_id))
+        if self._position_checks_enabled() and self._reconcile_required:
+            self._sync_managed_orders(force=True)
+            if not self._broker_ready:
+                raise ValueError('券商委託或部位核對尚未完成，暫停撤單')
         cancelled = api.cancel_order(trade)
         self._persist_trade_state(row_id, entry=cancelled or trade)
         # Some SDK responses still say Submitted until a later report arrives.
@@ -1499,6 +1607,7 @@ class TradingService:
             "target_price", "curve_id", "auto_exit", "simulation", "entry_trade_id",
             "curve_check_from", "contract_tick", "breakeven_enabled", "breakeven_triggered_at", "breakeven_price", "risk_revision",
             "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity", "avg_exit_price",
+            "broker_octype", "reconciled_order_id", "exit_status_code",
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}
@@ -1520,13 +1629,13 @@ class TradingService:
             item.update(default_stop_price=align_tick(stop, tick), default_target_price=align_tick(target, tick))
         quote = self._fresh_risk_quote(row)
         tick_ready = quote is not None
-        broker_ready = self._broker_ready if self._health_enabled else self._api is not None
+        broker_ready = self._broker_ready if self._position_checks_enabled() else self._api is not None
         bars_ready = self._curve_data_ready()
         item["protection"] = {"tick_fresh": tick_ready, "broker_ready": broker_ready,
                               "fixed_stop": tick_ready and broker_ready and self.auto_exit_enabled(),
                               "fixed_target": tick_ready and broker_ready and self.auto_exit_enabled() and not row.get("curve_id"),
                               "curve_exit": tick_ready and broker_ready and bars_ready and self.auto_exit_enabled() and bool(row.get("curve_id")),
-                              "breakeven": tick_ready and bool(row.get("breakeven_enabled")),
+                              "breakeven": tick_ready and broker_ready and bool(row.get("breakeven_enabled")),
                               "broker_protection": "unverified"}
         if quote is not None:
             item["last_quote"] = quote

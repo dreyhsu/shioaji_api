@@ -114,6 +114,14 @@ def save_fills(conn, order, *, entry=None, exit_trade=None, multiplier=None, cur
     ):
         if trade is None:
             continue
+        if expected > 0 and not value(value(trade, 'status'), 'deals', []):
+            # A relogin's order summary can omit old deals. A previously verified
+            # ledger with exactly the same quantity remains valid evidence.
+            saved = conn.execute('SELECT sum(quantity) FROM pnl_fills WHERE order_id=? AND phase=? AND broker_trade_id=?',
+                                 (order['id'], phase, str(trade_id or ''))).fetchone()[0]
+            if saved == int(expected):
+                conn.execute(f'UPDATE pnl_order_metadata SET {phase}_error=NULL WHERE order_id=?', (order['id'],))
+                continue
         error = None
         try:
             rows = normalized_fills(trade)

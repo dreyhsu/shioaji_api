@@ -20,7 +20,7 @@ class MockBroker:
         Action=NS(Buy="Buy", Sell="Sell"),
         FuturesPriceType=NS(LMT="LMT", MKT="MKT", MKP="MKP"),
         OrderType=NS(ROD="ROD", IOC="IOC", FOK="FOK"),
-        FuturesOCType=NS(Auto="Auto", Cover="Cover"),
+        FuturesOCType=NS(Auto="Auto", New="New", Cover="Cover"),
         QuoteType=NS(Tick="Tick"), QuoteVersion=NS(v1="v1"), Order=NS,
     )
 
@@ -80,7 +80,10 @@ class MockBroker:
         if _text(order.action) not in {"Buy", "Sell"} or not isinstance(order.quantity, int) or order.quantity <= 0:
             raise ValueError("Invalid mock order")
         order.id = f"mock-{len(self.trades) + 1}"
-        trade = NS(order=order, status=NS(id=order.id, status="Submitted", deal_quantity=0, deals=[]))
+        if _text(order.octype) == 'Auto':
+            opposite = self.position > 0 if _text(order.action) == 'Sell' else self.position < 0
+            order.octype = 'Cover' if opposite else 'New'
+        trade = NS(contract=contract, order=order, status=NS(id=order.id, status="Submitted", deal_quantity=0, deals=[]))
         self.trades.append(trade)
         self._match(trade)
         return trade

@@ -282,6 +282,10 @@
   }
 
   function orderStatus(order) {
+    if (order.broker_octype === 'Cover' && !Number(order.filled_quantity)
+      && ['Cancelled', 'Failed', 'Rejected'].includes(order.entry_status)) return '平倉委託已結束 · 未成交';
+    if (order.broker_octype === 'Cover') return order.reconciled_order_id
+      ? '平倉成交 · 已歸入原部位' : '反向平倉委託 · 等待部位核對';
     if (cancellingOrders.has(order.id)) return `取消處理中 · 券商狀態：${order.entry_status}`;
     if (order.error) return order.error;
     if (order.entry_status === 'unknown' || order.entry_status === 'submitting') return '進場結果待核對，禁止自動重送';
@@ -313,6 +317,7 @@
 
   function canManageCurve(order) {
     return Boolean(Number(order.active))
+      && order.broker_octype !== 'Cover'
       && Number(order.filled_quantity) > Number(order.exit_filled_quantity)
       && !order.triggered_at && !order.exit_trade_id && !order.exit_status;
   }
@@ -530,7 +535,8 @@
     }
     list.innerHTML = state.orders.map((order) => {
       const selected = order.id === state.selectedId;
-      const side = order.action === 'Buy' ? '多單' : '空單';
+      const side = order.broker_octype === 'Cover'
+        ? (order.action === 'Buy' ? '買進平倉' : '賣出平倉') : (order.action === 'Buy' ? '多單' : '空單');
       const filled = Number(order.filled_quantity || 0);
       const entry = filled > 0 ? order.avg_fill_price : order.price;
       const entryLabel = filled > 0 ? '成交均價' : '委託價';
@@ -543,7 +549,7 @@
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
       return `<div class="managed-order ${selected ? 'selected' : ''}" data-order-id="${escapeHtml(order.id)}" tabindex="0">
         <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${filled}/${order.quantity} 口</b><br>
-          <span class="managed-order-sub">${entryLabel} ${number(entry)} · 停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} ${order.curve_kind === 'line' ? '直線' : '曲線'}；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}</span>
+          <span class="managed-order-sub">${entryLabel} ${number(entry)} · ${order.broker_octype === 'Cover' ? '券商確認為平倉委託' : `停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} ${order.curve_kind === 'line' ? '直線' : '曲線'}；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}`}</span>
         </div><span class="order-status ${order.active ? 'active' : ''}">${escapeHtml(orderStatus(order))}</span>${actionMarkup}</div>`;
     }).join('');
     list.querySelectorAll('[data-order-id]').forEach((item) => {

@@ -908,6 +908,7 @@ function tradeLevelAutoscaleInfo(original) {
 }
 
 function setTradeOrder(order) {
+  if (order?.broker_octype === 'Cover') order = null;
   const hasOpenFill = order && Number(order.filled_quantity) > Number(order.exit_filled_quantity);
   const hasLimitPreview = order && Number(order.active) && order.price_type === 'LMT'
     && Number(order.price) > 0 && Number(order.atr) > 0;

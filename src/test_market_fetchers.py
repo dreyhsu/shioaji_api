@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import json
 import sqlite3
+import threading
 from types import SimpleNamespace as NS
 
 import pandas as pd
@@ -13,6 +14,7 @@ from file_lease import LeaseUnavailable
 from kbar_fetcher import KbarFetcher
 from minute_accumulator import MinuteAccumulator
 from market_fetcher import FetcherSettings, SessionSchedule, Tick
+import market_fetcher
 import market_health as mh
 from tick_fetcher import TickFetcher
 
@@ -168,6 +170,74 @@ def test_callback_accepts_exchange_argument_and_timezone_conversion(rig):
     assert rows(service, 'market_latest_quotes')[0]['quote_at'] == '2026-10-30 09:00:00'
 
 
+def test_sdk_thread_only_enqueues_and_owner_thread_normalizes(rig, monkeypatch):
+    service = rig.create()
+    service.step()
+    owner = threading.get_ident()
+    calls = []
+    original = market_fetcher.normalize_tick
+
+    def normalize(*args):
+        calls.append(threading.get_ident())
+        return original(*args)
+
+    monkeypatch.setattr(market_fetcher, 'normalize_tick', normalize)
+    callback_thread = threading.Thread(target=rig.apis[0].tick, args=(rig.now[0], 20005))
+    callback_thread.start()
+    callback_thread.join(timeout=2)
+    assert not callback_thread.is_alive()
+    assert calls == [] and service.queue.qsize() == 1
+    assert rows(service, 'market_latest_quotes') == []
+    service.step()
+    assert calls == [owner]
+    assert rows(service, 'market_latest_quotes')[0]['price'] == 20005
+
+
+def test_tick_diagnostics_separate_receipt_queue_and_committed_publication(rig, monkeypatch):
+    service = rig.create()
+    service.step()
+    rig.advance('2026-10-30 09:00:00.100', .1)
+    rig.apis[0].tick('2026-10-30 09:00:00', 20005)
+    rig.advance('2026-10-30 09:00:00.350', .25)
+    original = service.store.quotes
+
+    def slow_write(records):
+        original(records)
+        rig.advance('2026-10-30 09:00:00.400', .05)
+
+    monkeypatch.setattr(service.store, 'quotes', slow_write)
+    service.step()
+    metric = service.health['tick_latency']['TMFR1']
+    published = service.health['quote_publish_latency']['TMFR1']
+    assert metric['receive_lag_ms'] == pytest.approx(100)
+    assert metric['queue_wait_ms'] == pytest.approx(250)
+    assert published['receive_to_publish_ms'] == pytest.approx(300)
+    assert published['quote_age_ms'] == pytest.approx(400)
+    assert rows(service, 'market_latest_quotes')[0]['received_at'] == metric['received_at']
+    assert published['published_at'].endswith('00.400000')
+    # A queued/new tick must not pretend it has already been committed to the DB.
+    rig.advance('2026-10-30 09:00:00.500', .1)
+    rig.apis[0].tick(rig.now[0], 20006)
+    service.step()
+    assert service.health['tick_latency']['TMFR1']['quote_at'].endswith('00.500000')
+    assert service.health['quote_publish_latency']['TMFR1'] == published
+    assert rows(service, 'market_latest_quotes')[0]['price'] == 20005
+
+
+def test_raw_queue_fans_out_aliases_without_losing_minute_volume(rig):
+    service = rig.create(codes=['TMFR1', 'TMFK6'])
+    service.step()
+    rig.apis[0].tick(rig.now[0], 20000, volume=2)
+    rig.apis[0].tick(rig.now[0] + pd.Timedelta(milliseconds=500), 20005, volume=3)
+    assert service.queue.qsize() == 2
+    service.step()
+    rig.advance('2026-10-30 09:01:02', 62)
+    service.step()
+    records = rows(service, 'market_stream_bars')
+    assert {record['code'] for record in records} == {'TMFR1', 'TMFK6'}
+    assert all(record['volume'] == 5 and record['close'] == 20005 and record['complete'] for record in records)
+
+
 def test_two_services_have_separate_sessions_and_can_stop_independently(rig):
     tick = rig.create()
     bar = rig.create(KbarFetcher, backfill_enabled=False)
@@ -258,6 +328,25 @@ def test_session_down_recovery_ignores_callbacks_from_old_api(rig):
     service.step()
     assert not service.down.is_set() and not service.gate.pending
     assert rows(service, 'market_latest_quotes')[0]['price'] == 20001
+
+
+def test_queued_old_generation_cannot_update_new_session_or_diagnostics(rig):
+    service = rig.create()
+    service.step()
+    rig.apis[0].tick(rig.now[0], 20001)
+    service.step()
+    generation = service.generation
+    rig.apis[0].down()
+    service.step()
+    assert service.health['tick_latency'] == service.health['quote_publish_latency'] == {}
+    rig.advance('2026-10-30 09:00:06', 6)
+    service.step()
+    service.queue.put_nowait(market_fetcher.QueuedQuote(
+        generation, NS(code='TMFK6', datetime=rig.now[0], close=1), rig.now[0], rig.mono[0]))
+    service.step()
+    assert rows(service, 'market_latest_quotes')[0]['price'] == 20001
+    assert service.health['tick_latency'] == service.health['quote_publish_latency'] == {}
+    assert not service.latest
 
 
 def test_queue_overflow_is_visible_and_requests_recovery(rig):

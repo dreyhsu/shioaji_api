@@ -212,7 +212,7 @@ class TradeRuntime:
                         window = s.window()
                     if s._api is not None:
                         s.process_market_update()
-                        if s._monotonic() - s.last_margin >= s.health_settings.order_sync_seconds:
+                        if not s._recovery.pending and s._monotonic() - s.last_margin >= s.health_settings.order_sync_seconds:
                             s.last_margin = s._monotonic()
                             s.margin_cache = s.margin()
                 self.process_commands()
@@ -298,9 +298,15 @@ def create_app(service=None, *, start_loop=True, **service_options):
                       db_path=str(runtime.service.db_path.resolve()), updated_at=row['updated_at'])
         health = mh.read_health(mh.health_path(runtime.service.db_path, 'trading', runtime.service.code))
         age = (pd.Timestamp(runtime.service._now()) - pd.Timestamp(health.get('heartbeat_at'))).total_seconds()
-        if (not -5 <= age <= runtime.service.health_settings.heartbeat_seconds
-                or health.get('state') in {'failed', 'stopped', 'logout_unconfirmed', 'recovering', 'connecting'}):
-            result['status'].update(connected=False, broker_ready=False, error='trade 背景快照已過期')
+        snapshot_age = (pd.Timestamp(runtime.service._now()) - pd.Timestamp(row['updated_at'])).total_seconds()
+        failure = health.get('state') in {'failed', 'stopped', 'logout_unconfirmed', 'recovering', 'connecting'}
+        if failure or not (-5 <= age <= runtime.service.health_settings.heartbeat_seconds
+                           and -5 <= snapshot_age <= runtime.service.health_settings.heartbeat_seconds):
+            result['status'].update(connected=False, broker_ready=False,
+                error='trade 背景工作失敗或尚未就緒' if failure else 'trade 背景快照已過期')
+            for key in ('fixed_exit', 'breakeven', 'curve_exit', 'curve_entry'):
+                if key in result['status'].get('protection', {}):
+                    result['status']['protection'][key] = False
         return result
     return app
 

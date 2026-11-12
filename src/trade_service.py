@@ -318,6 +318,8 @@ class IndependentTradingService(TradingService):
             self._broker_ready = False
             self._reconcile_required = True
             self._recovery.fail('session_down', immediate=True)
+            self._connect_error = ('session_down；等待交易連線恢復' if self.health_settings.trading_reconnect_enabled
+                                   else 'session_down；自動重連已停用，請人工核對後重啟')
         if self._recovery.due and self.health_settings.trading_reconnect_enabled:
             self._recovery.attempted()
             self._close_api()
@@ -327,10 +329,10 @@ class IndependentTradingService(TradingService):
         return (self._curve_data_ready() and self._broker_ready and not self._recovery.pending
                 and self._api is not None and self.window() is not None)
 
-    def _trades_by_id(self):
-        if self._monotonic() - self.last_rpc_sync >= self.health_settings.order_sync_seconds:
+    def _trades_by_id(self, *, force=False):
+        if force or self._monotonic() - self.last_rpc_sync >= self.health_settings.order_sync_seconds:
             self.last_rpc_sync = self._monotonic()
-            result = super()._trades_by_id()
+            result = super()._trades_by_id(force=force)
             if not self._sync_ok:
                 self._connect_error = '券商委託同步失敗，等待核對'
             return result

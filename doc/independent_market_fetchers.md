@@ -41,6 +41,31 @@ fetcher 不會覆寫策略用 `minute_bars`；由 monitor 負責統一寫入。m
 
 健康檔位於 DB 旁 `.health/<DB檔名>/tick-fetcher.json` 和 `kbar-fetcher.json`；分別使用獨占鎖，一個角色／DB 只允許一個程序，兩種角色可以同時運行。健康檔含模式、PID、世代、錯誤種類、重試狀態、行情時間及 `staged_only: true`。
 
+### Tick 接收與延遲診斷（2026-11-12）
+
+正式 tick fetcher 原本即使用 `QuoteType.Tick` 訂閱，不呼叫 snapshot 或歷史 tick API。
+SDK callback 現在只記錄接收時間與世代、將原始報價放入有上限的 queue；時間／數值驗證、合約別名映射、完整逐筆分鐘聚合及 DB 寫入均由主執行緒執行。
+每筆原始報價只占一個 queue 位置，再於主執行緒映射到所配置的連續／月份合約；不丟棄中間成交來加速分鐘 K。
+舊世代 callback 與已入列的舊世代報價都不會更新新 session。
+
+健康檔新增以下逐商品診斷；均為最近一次樣本，不是整段期間的平均或最大值：
+
+| 欄位 | 意義 |
+|---|---|
+| `tick_latency[code].receive_lag_ms` | 本機 callback 接收時間減券商 tick 時間；包含券商、網路、SDK 派送及兩端時鐘誤差 |
+| `tick_latency[code].queue_wait_ms` | 接收後到主執行緒取出原始報價的等待時間，以 monotonic clock 計算 |
+| `quote_publish_latency[code].receive_to_publish_ms` | 接收到 acquisition DB 最新價成功寫入後的時間差；包含 queue、聚合、發布節流及 DB 寫入 |
+| `quote_publish_latency[code].quote_age_ms` | acquisition DB 寫入完成時距券商 tick 時間的差值 |
+
+兩組診斷各自保留 `quote_at`、`received_at`，另有 `processed_at` 或 `published_at`。
+尚未寫入的新 tick 不會覆蓋已成功發布的診斷；DB 寫入失敗亦不宣稱發布成功。斷線後清空當前世代的診斷。
+格式化每批最新樣本，不在 callback 或逐筆路徑輸出日誌；健康檔仍最多每秒例行更新。
+
+量測前先確認 Windows／macOS 已透過 NTP 校時。券商的 tick 時間已是台灣時間，不再加 8 小時。
+無新成交時，診斷時間停在最後一筆，不代表 callback 卡住。
+`tick_publish_seconds` 仍預設 1 秒，主迴圈原有約 0.2 秒等待也保留；每秒發布最新價不等於每秒才接收 tick。
+後續 monitor 匯入與 Dashboard 刷新的延遲不包含在這些 fetcher 指標中，須分段檢查。
+
 monitor 的例行匯入／指標更新以 `operation: derive` 表示，不將上一輪已完成的 `healthy` 改成短暫 `checking`；首次驗證前仍不宣稱就緒。共用健康閘門同時檢查 `cycle_completed_at` 的時效與 `operation_started` 的操作逾時，避免工作卡住卻因心跳刷新而永遠維持就緒。完成本輪後才發布新的就緒結果；失敗仍發布 `failed`。Dashboard 不會因剛好讀到例行更新而顯示行情未就緒。
 
 日誌位於 DB 旁 `logs/tick_fetcher.log`、`kbar_fetcher.log`，UTC 時間標記為 `Z`，保留 14 天輪替；排程及行情時間仍為台北時間。日誌不輸出憑證或任意例外字串。

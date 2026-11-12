@@ -131,6 +131,14 @@ class Tick:
     amount: float
 
 
+@dataclass(frozen=True)
+class QueuedQuote:
+    generation: int
+    quote: object
+    received_at: pd.Timestamp
+    received_mono: float
+
+
 def normalize_tick(quote, code, now):
     def value(name, default=None):
         return quote.get(name, default) if isinstance(quote, dict) else getattr(quote, name, default)
@@ -192,6 +200,7 @@ class FetcherRuntime:
                        'mode': mode, 'codes': list(self.codes), 'db_path': str(self.db_path),
                        'state': 'starting', 'started_at': str(clock()), 'invalid_ticks': 0,
                        'queue_overflows': 0, 'staged_only': True}
+        self.health.update(tick_latency={}, quote_publish_latency={})
         self._last_state = None
         self._last_health = float('-inf')
         self._window = None
@@ -256,22 +265,16 @@ class FetcherRuntime:
             self._last_state = self.health['state']
 
     def _callback(self, generation, quote):
+        # Capture arrival before waiting for the lifecycle lock. No parsing,
+        # alias expansion, aggregation, storage or broker calls on SDK threads.
+        received_at, received_mono = self.clock(), self.monotonic()
         with self.lock:
             if not self.accepting or generation != self.generation:
                 return
             try:
-                alias = str(quote.get('code', '') if isinstance(quote, dict) else getattr(quote, 'code', ''))
-                for code in self.aliases.get(alias, ()):
-                    tick = normalize_tick(quote, code, pd.Timestamp(self.clock()))
-                    if tick is None:
-                        self.health['invalid_ticks'] += 1
-                        continue
-                    try:
-                        self.queue.put_nowait(tick)
-                    except Full:
-                        self.overflow.set()
-            except (ValueError, TypeError, OverflowError):
-                self.health['invalid_ticks'] += 1
+                self.queue.put_nowait(QueuedQuote(generation, quote, received_at, received_mono))
+            except Full:
+                self.overflow.set()
 
     def _open(self):
         self.publish(state='connecting', operation='login', operation_started=str(self.clock()))
@@ -346,7 +349,8 @@ class FetcherRuntime:
             self.contracts.clear()
             self.last_fresh.clear()
             self.last_received.clear()
-            self.health.update(stream_fresh=False, quote_times={})
+            self.health.update(stream_fresh=False, quote_times={},
+                               tick_latency={}, quote_publish_latency={})
             while True:
                 try:
                     self.queue.get_nowait()
@@ -480,18 +484,46 @@ class FetcherRuntime:
             LOG.error('role=%s operation=step kind=%s error_type=%s', self.role, kind, type(error).__name__)
 
     def _drain(self):
+        latency_samples = {}
         for _ in range(self.settings.queue_capacity):
             try:
-                tick = self.queue.get_nowait()
+                queued = self.queue.get_nowait()
             except Empty:
                 break
-            self.on_tick(tick)
-            previous = self.last_received.get(tick.code)
-            if previous is None or tick.at >= previous:
-                self.last_received[tick.code] = tick.at
-                if -5 <= (tick.received_at - tick.at).total_seconds() <= self.settings.tick_stale_seconds:
-                    self.last_fresh[tick.code] = self.monotonic() - max(
-                        0, (pd.Timestamp(self.clock()) - tick.received_at).total_seconds())
+            if queued.generation != self.generation:
+                continue
+            queue_wait_ms = max(0, self.monotonic() - queued.received_mono) * 1000
+            quote = queued.quote
+            try:
+                alias = str(quote.get('code', '') if isinstance(quote, dict) else getattr(quote, 'code', ''))
+            except (ValueError, TypeError, OverflowError):
+                self.health['invalid_ticks'] += 1
+                continue
+            for code in self.aliases.get(alias, ()):
+                try:
+                    tick = normalize_tick(quote, code, pd.Timestamp(queued.received_at))
+                except (ValueError, TypeError, OverflowError):
+                    tick = None
+                if tick is None:
+                    self.health['invalid_ticks'] += 1
+                    continue
+                self.on_tick(tick)
+                previous = self.last_received.get(tick.code)
+                if previous is None or tick.at >= previous:
+                    processed_at = pd.Timestamp(self.clock())
+                    latency_samples[code] = (tick, processed_at, queue_wait_ms)
+                    self.last_received[tick.code] = tick.at
+                    if -5 <= (tick.received_at - tick.at).total_seconds() <= self.settings.tick_stale_seconds:
+                        self.last_fresh[tick.code] = self.monotonic() - max(
+                            0, (processed_at - tick.received_at).total_seconds())
+        # Format only the latest sample per code per batch, not every tick.
+        for code, (tick, processed_at, queue_wait_ms) in latency_samples.items():
+            self.health['tick_latency'][code] = {
+                'quote_at': str(tick.at), 'received_at': str(tick.received_at),
+                'processed_at': str(processed_at),
+                'receive_lag_ms': (tick.received_at - tick.at).total_seconds() * 1000,
+                'queue_wait_ms': queue_wait_ms,
+            }
 
     def close(self):
         try:
