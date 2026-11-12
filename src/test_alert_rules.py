@@ -102,6 +102,32 @@ def test_box_in_out_needs_previous_close_in_and_latest_out(config, prev, close):
 
 
 # ------------------------------------------------------------------ trendlines
+@pytest.mark.parametrize("side,box,prev,close", [
+    ("support", SUPPORT, 140, 125),
+    ("support", SUPPORT, 90, 115),
+    ("resistance", RESISTANCE, 190, 205),
+    ("resistance", RESISTANCE, 240, 215),
+])
+def test_box_entry_covers_entire_box_from_both_sides(config, side, box, prev, close):
+    hits = run(config, close, boxes={side: box}, prev=prev)
+    assert rules(hits) == ["box_enter"]
+    assert "收盤進入" in hits[0].message and "[15m]" in hits[0].message
+
+
+@pytest.mark.parametrize("prev,close", [(None, 115), (115, 120), (90, 140)])
+def test_box_entry_requires_an_outside_to_inside_close(config, prev, close):
+    assert "box_enter" not in rules(run(config, close, boxes={"support": SUPPORT}, prev=prev))
+
+
+def test_box_alert_identity_survives_renumbering(config):
+    box = {**SUPPORT, "created_time": "2026-10-08 15:15"}
+    before = run(config, 125, boxes={"support": box}, prev=140)
+    after = run(config, 125, boxes={"support": {**box, "box_id": 99}}, prev=140)
+    different = run(config, 125, boxes={"support": {**box, "created_time": "2026-10-08 15:30"}}, prev=140)
+    assert before[0].key == after[0].key
+    assert before[0].key != different[0].key
+
+
 def test_line_value_and_slope_at_the_newest_bar():
     # 100 -> 110 over bars 0..1, so bar 3 sits at 130 with slope +10/bar.
     assert ar.line_now(HOURLY, line(1, (100, 110))) == (pytest.approx(130.0), pytest.approx(10.0))

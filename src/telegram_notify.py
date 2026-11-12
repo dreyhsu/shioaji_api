@@ -153,6 +153,17 @@ def format_zone_alert(
     )
 
 
+def format_box_entry_alert(
+    *, code, box_type, box_id, box_top, box_bottom, price, minute_start,
+) -> str:
+    return (
+        f"{_badge(box_type)} <b>{code} 收盤進入{SIDE_LABEL[box_type]} [15m] #{box_id}</b>\n"
+        f"{_stamp(minute_start)}\n\n"
+        f"價格：<b>{price:,.0f}</b>\n"
+        f"箱體：{box_bottom:,.0f} – {box_top:,.0f}\n\n{FOOTER}"
+    )
+
+
 def format_box_exit_alert(
     *,
     code: str,
@@ -172,7 +183,7 @@ def format_box_exit_alert(
         head = "\u2b06\ufe0f 突破" if direction == "up" else "\u2b07\ufe0f 跌破"
     edge = box_top if direction == "up" else box_bottom
     return (
-        f"{head} <b>{code} {SIDE_LABEL[box_type]} #{box_id}</b>\n"
+        f"{head} <b>{code} {SIDE_LABEL[box_type]} [15m] #{box_id}</b>\n"
         f"{_stamp(minute_start)}\n\n"
         f"價格：<b>{price:,.0f}</b>（{'箱頂' if direction == 'up' else '箱底'} {edge:,.0f}，"
         f"差 {abs(price - edge):,.0f}）\n"

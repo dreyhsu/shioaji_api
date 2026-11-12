@@ -20,9 +20,15 @@
     "enabled": true,
     "zone_min": 0.6667
   },
+  "box_enter": {
+    "_comment": "previous 1-min close outside the newest drawn 15m box, latest close anywhere inside; includes broken/retested boxes; one notification per transition",
+    "enabled": true,
+    "cooldown_minutes": 0
+  },
   "box_in_out": {
     "_comment": "previous 1-min close inside the box, latest close outside it, either side (support: up = held, down = broke; resistance: up = broke, down = held). Close only, no exit buffer",
-    "enabled": true
+    "enabled": true,
+    "cooldown_minutes": 0
   },
   "trendline_near": {
     "_comment": "close within distance_points of a drawn line; set distance_atr (e.g. 0.2) to use hourly ATR instead",

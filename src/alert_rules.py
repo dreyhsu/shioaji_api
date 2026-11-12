@@ -1,13 +1,15 @@
 """Which Telegram alerts the latest 1-minute bar has earned.
 
-Six rules, each checked on the newest minute's close and each switched on and
+Rules checked on the newest minute's close and each switched on and
 tuned from ``config/alerts.json``:
 
 * ``support_bottom_third``   -- close inside the live support box, in its bottom
   ``zone_max`` (default 1/3).
 * ``resistance_top_third``   -- close inside the live resistance box, in its top
   part (``zone_pct >= zone_min``, default 2/3).
-* ``box_in_out``             -- the previous minute closed inside a live box and
+* ``box_enter``              -- the previous minute closed outside the newest
+  drawn box and this minute closed anywhere inside it, including broken boxes.
+* ``box_in_out``             -- the previous minute closed inside a drawn box and
   this minute closed outside it, either way: a support box held (up) or broke
   (down), a resistance box broke (up) or held (down).  Close-to-close only, no
   exit buffer, so it fires on the very minute the close leaves the box.
@@ -46,6 +48,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "alert
 RULES = (
     "support_bottom_third",
     "resistance_top_third",
+    "box_enter",
     "box_in_out",
     "trendline_near",
     "trendline_break_below_up",
@@ -61,6 +64,7 @@ DEFAULTS: dict[str, Any] = {
     "cooldown_minutes": 10,
     "support_bottom_third": {"enabled": True, "zone_max": 1 / 3},
     "resistance_top_third": {"enabled": True, "zone_min": 2 / 3},
+    "box_enter": {"enabled": True},
     "box_in_out": {"enabled": True},
     "trendline_near": {
         "enabled": True,
@@ -152,6 +156,15 @@ class Candidate:
     message: str
 
 
+def _box_key(side, box):
+    # IDs are renumbered as the rolling history moves. Use the 15m box's birth
+    # timestamp for persistent deduplication when it is available.
+    created = box.get("created_time")
+    if created is not None and pd.notna(created):
+        return f"{side}:15m:{pd.Timestamp(created).isoformat()}"
+    return f"{side}:{int(box['box_id'])}"
+
+
 def _box_rules(code, close, minute_start, side, box, config: AlertConfig) -> list[Candidate]:
     if box is None:
         return []
@@ -170,7 +183,7 @@ def _box_rules(code, close, minute_start, side, box, config: AlertConfig) -> lis
     return [
         Candidate(
             rule=rule,
-            key=f"{side}:{box_id}",
+            key=_box_key(side, box),
             once=False,
             message=tg.format_zone_alert(
                 code=code,
@@ -190,6 +203,21 @@ def _in_box(price: float, box) -> bool:
     return float(box["bottom"]) <= price <= float(box["top"])
 
 
+def _entry_rules(code, close, prev_close, minute_start, boxes, config):
+    rule = "box_enter"
+    if prev_close is None or not config.enabled(rule):
+        return []
+    return [Candidate(
+        rule=rule, key=_box_key(side, box), once=False,
+        message=tg.format_box_entry_alert(
+            code=code, box_type=side, box_id=int(box["box_id"]),
+            box_top=float(box["top"]), box_bottom=float(box["bottom"]),
+            price=close, minute_start=minute_start,
+        ),
+    ) for side, box in boxes.items()
+      if box is not None and not _in_box(prev_close, box) and _in_box(close, box)]
+
+
 def _exit_rules(code, close, prev_close, minute_start, boxes, config: AlertConfig) -> list[Candidate]:
     rule = "box_in_out"
     if prev_close is None or not config.enabled(rule):
@@ -204,7 +232,7 @@ def _exit_rules(code, close, prev_close, minute_start, boxes, config: AlertConfi
         out.append(
             Candidate(
                 rule=rule,
-                key=f"{side}:{box_id}",
+                key=_box_key(side, box),
                 once=False,
                 message=tg.format_box_exit_alert(
                     code=code,
@@ -326,7 +354,8 @@ def evaluate(
 ) -> list[Candidate]:
     """Every rule the newest minute satisfies, before any throttling.
 
-    ``boxes`` maps side -> live box (or None); ``prev_minute_bar`` is the minute
+    ``boxes`` maps side -> newest drawn box (or None), even when broken;
+    ``prev_minute_bar`` is the minute
     before ``minute_bar`` (None when there is none), for the close-to-close
     ``box_in_out`` rule.
     """
@@ -338,6 +367,7 @@ def evaluate(
     for side in ("support", "resistance"):
         out += _box_rules(code, close, minute_start, side, boxes.get(side), config)
     prev_close = None if prev_minute_bar is None else float(prev_minute_bar["close"])
+    out += _entry_rules(code, close, prev_close, minute_start, boxes, config)
     out += _exit_rules(code, close, prev_close, minute_start, boxes, config)
     out += _trendline_rules(code, close, minute_start, hourly, trendlines, hourly_atr, config,
                             minute_bars=minute_bars)

@@ -19,6 +19,7 @@ import db
 import monitor
 import patterns as pt
 import snr_core as snr
+import session_bars as sb
 from box_watch import BoxWatcher, BoxWatchConfig
 
 SUPPORT_BOX = {
@@ -268,6 +269,49 @@ def test_no_bars_means_no_closed_index():
     assert monitor.last_closed_index(pd.DataFrame(), pd.Timestamp.now()) == -1
 
 
+@pytest.mark.parametrize("now,expected_boxes", [("09:50", 0), ("10:00", 1)])
+def test_snr_uses_15m_bars_and_waits_for_confirmation(conn, config, now, expected_boxes):
+    stamps = pd.date_range("2026-10-08 08:45", periods=75, freq="min")
+    closes, opens = [10, 9, 5, 9, 10], [11, 10, 6, 5, 5]
+    bars = pd.DataFrame([
+        dict(minute_start=stamp, open=opens[i // 15], close=closes[i // 15],
+             high=max(opens[i // 15], closes[i // 15]) + 1,
+             low=min(opens[i // 15], closes[i // 15]) - 1,
+             volume=1000 if i // 15 == 4 else 100, amount=0)
+        for i, stamp in enumerate(stamps)
+    ])
+    now = pd.Timestamp(f"2026-10-08 {now}")
+    db.upsert_minute_bars(conn, config.code, sb.add_sessions(bars[bars.minute_start < now]))
+    config.lookback = config.atr_length = 2
+    state = monitor.build_state(conn, config, now)
+    assert len(state.boxes) == expected_boxes
+    if expected_boxes:
+        box = state.boxes.iloc[0]
+        assert box.created_time == pd.Timestamp("2026-10-08 09:45")
+        assert box.left_time == pd.Timestamp("2026-10-08 09:15")
+        assert box.top == 5
+        assert box.atr_width == pytest.approx(
+            snr.pine_atr(sb.minute_bars_to_interval(state.minute_bars, 15), 2).iloc[-1])
+
+
+def test_switching_box_interval_preserves_hourly_risk_atr(conn, config):
+    from test_dashboard import minute_frame
+
+    bars = minute_frame("2026-10-01 08:45", 60 * 24 * 3)
+    db.upsert_minute_bars(conn, config.code, bars)
+    now = bars.minute_start.iloc[-1] + pd.Timedelta(minutes=1)
+    state = monitor.build_state(conn, config, now)
+    hourly = sb.minute_bars_to_hourly(bars)
+    pd.testing.assert_frame_equal(state.hourly, hourly)
+    assert state.hourly_atr == pytest.approx(
+        snr.pine_atr(hourly, config.atr_length).iloc[state.closed_through])
+    fifteen = sb.minute_bars_to_interval(bars, 15)
+    expected = snr.collect_snr_boxes(
+        fifteen, creation_limit=monitor.last_closed_index(fifteen, now, minutes=15))
+    assert not expected.empty
+    pd.testing.assert_frame_equal(state.boxes, expected)
+
+
 # --------------------------------------------------------------------------------------
 # Rule alerts: cooldown, once-only, wiring
 # --------------------------------------------------------------------------------------
@@ -389,6 +433,27 @@ def test_check_alerts_wires_box_rules(conn, config, alerts):
     monitor.check_alerts(conn, config, alerts, later)
     kinds = sorted(db.load_alerts(conn, "TMFR1")["kind"])
     assert kinds == ["box_in_out", "support_bottom_third"]
+
+
+def test_latest_broken_box_sends_each_entry_exit_and_deduplicates_repolls(conn, config, monkeypatch):
+    alerts = ar.AlertConfig(ar.DEFAULT_CONFIG_PATH)
+    config.enable_telegram = True
+    messages = []
+    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    # Older intact box is elsewhere; the broken newest box still extends on the chart.
+    old = dict(SUPPORT_BOX, box_id=1, top=210, bottom=200)
+    latest = dict(SUPPORT_BOX, box_id=2, top=110, bottom=100, state="broken")
+    previous = make_state(120, 120, 120, minute="2026-10-08 15:00").minute_bars
+    for stamp, close in [("15:01", 108), ("15:02", 120), ("15:03", 108), ("15:04", 99)]:
+        state = make_state(close, close, close, boxes=[old, latest], minute=f"2026-10-08 {stamp}")
+        state.minute_bars = pd.concat([previous, state.minute_bars], ignore_index=True)
+        assert monitor.check_alerts(conn, config, alerts, state) == 1
+        assert monitor.check_alerts(conn, config, alerts, state) == 0
+        previous = state.minute_bars
+    assert len(messages) == 4
+    assert all("[15m] #2" in message for message in messages)
+    assert sorted(db.load_alerts(conn, config.code)["kind"]) == [
+        "box_enter", "box_enter", "box_in_out", "box_in_out"]
 
 
 @pytest.mark.parametrize("timeframe, interval", [("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60)])

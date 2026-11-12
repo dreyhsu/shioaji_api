@@ -372,6 +372,14 @@ def bar_in_box(bar, box) -> bool:
     return bool(float(bar["low"]) <= float(box["top"]) and float(bar["high"]) >= float(box["bottom"]))
 
 
+def latest_box(boxes: pd.DataFrame, box_type: str):
+    """Newest drawn box of a side, including its broken/retest styling."""
+    if boxes is None or boxes.empty:
+        return None
+    subset = boxes[boxes["box_type"] == box_type]
+    return None if subset.empty else subset.loc[subset["box_id"].idxmax()]
+
+
 def current_box(boxes: pd.DataFrame, box_type: str):
     """The newest not-yet-broken box of ``box_type``, or None.
 

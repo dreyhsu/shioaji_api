@@ -281,6 +281,9 @@ def test_current_box_skips_broken_newest():
         }
     )
     assert int(snr.current_box(boxes, "support")["box_id"]) == 1
+    assert int(snr.latest_box(boxes, "support")["box_id"]) == 2
+    assert snr.latest_box(boxes, "resistance") is None
+    assert snr.latest_box(pd.DataFrame(), "support") is None
 
 
 def test_current_box_returns_none_when_all_broken_or_empty():

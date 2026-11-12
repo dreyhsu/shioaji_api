@@ -46,8 +46,8 @@ def client(tmp_path, monkeypatch):
     with db.session(path) as conn:
         minutes = minute_frame("2026-08-10 08:45:00", 60 * 24 * 40)
         db.upsert_minute_bars(conn, "TMFR1", minutes)
-        hourly = sb.minute_bars_to_hourly(minutes)
-        db.replace_boxes(conn, "TMFR1", snr.collect_snr_boxes(hourly))
+        snr_bars = sb.minute_bars_to_interval(minutes, 15)
+        db.replace_boxes(conn, "TMFR1", snr.collect_snr_boxes(snr_bars))
 
     monkeypatch.setitem(dashboard.CONFIG, "db_path", path)
     monkeypatch.setitem(dashboard.CONFIG, "code", "TMFR1")
@@ -130,6 +130,31 @@ def test_boxes_are_clipped_to_the_window_and_flag_the_open_one(client):
     assert any(box["open"] for box in boxes)
 
 
+@pytest.mark.parametrize("last,pivot,right", [
+    ("2026-10-08 09:45", "2026-10-08 10:00", "2026-10-08 10:30"),
+    ("2026-10-09 04:00", "2026-10-09 04:15", "2026-10-09 05:00"),
+])
+def test_15m_box_inside_latest_hour_is_visible_on_hourly_chart(last, pivot, right):
+    last, pivot, right = map(pd.Timestamp, (last, pivot, right))
+    boxes = pd.DataFrame([dict(
+        box_id=1, box_type="support", state="fresh", top=110, bottom=100,
+        left_time=pivot, right_time=right, created_time=pivot,
+        holds=0, breakouts=0, delta_volume=100,
+    )])
+    data = {"boxes": boxes, "visible": pd.DataFrame({"timestamp": [last]})}
+    result = dashboard._boxes_payload(data)
+    assert len(result) == 1
+    assert result[0]["left_time"] == dashboard._epoch(last)
+    assert result[0]["right_time"] == dashboard._epoch(last)
+    assert result[0]["open"]
+    # Projection affects display edges only; persisted box identity stays 15m.
+    assert result[0]["created_time"] == pivot.isoformat(sep=" ")
+    assert boxes.iloc[0].left_time == pivot
+
+    data.update(chart_bars=pd.DataFrame(), visible=pd.DataFrame({"timestamp": [pivot]}))
+    assert dashboard._boxes_payload(data)[0]["left_time"] == dashboard._epoch(pivot)
+
+
 def test_thin_endpoints_agree_with_the_combined_one(client):
     whole = client.get("/api/chart").json()
     assert client.get("/api/bars").json()["bars"] == whole["bars"]
@@ -138,7 +163,7 @@ def test_thin_endpoints_agree_with_the_combined_one(client):
 
 
 @pytest.mark.parametrize("timeframe,step", [("1m", 60), ("5m", 300), ("15m", 900)])
-def test_chart_timeframes_keep_hourly_boxes_and_align_volume(client, timeframe, step):
+def test_chart_timeframes_keep_15m_boxes_and_align_volume(client, timeframe, step):
     hourly = client.get("/api/chart?days=1").json()
     query = f"?days=1&timeframe={timeframe}"
     response = client.get("/api/chart" + query)

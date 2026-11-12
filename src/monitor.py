@@ -32,7 +32,7 @@ from box_watch import BoxWatcher, BoxWatchConfig
 
 SIDES = ("support", "resistance")
 # How much minute history to feed the indicator each cycle.  The boxes need
-# 2*lookback = 40 hourly bars minimum (~2.2 trading days); 90 calendar days keeps
+# 2*lookback = 40 fifteen-minute bars minimum; 90 calendar days keeps
 # a useful box history without making the per-cycle recompute expensive.
 INDICATOR_WINDOW_DAYS = 90
 
@@ -88,19 +88,22 @@ class MarketState:
         return None
 
 
-def last_closed_index(hourly: pd.DataFrame, now: pd.Timestamp) -> int:
-    """Index of the newest *finished* hourly bar, or -1.
+def last_closed_index(bars: pd.DataFrame, now: pd.Timestamp, minutes: int = 60) -> int:
+    """Index of the newest finished session-anchored interval bar, or -1.
 
     The final row is only still forming when the clock agrees it is: outside a
     session (or on a holiday) every bar on file is done.
     """
-    if hourly.empty:
+    if bars.empty:
         return -1
     current = sb.hour_start_of(now)
-    last_hour = pd.Timestamp(hourly.iloc[-1]["hour_start"])
-    if current is not None and last_hour == current:
-        return len(hourly) - 2
-    return len(hourly) - 1
+    if current is not None:
+        current += ((now - current) // pd.Timedelta(minutes=minutes)) * pd.Timedelta(minutes=minutes)
+    column = "timestamp" if "timestamp" in bars else "hour_start"
+    last_start = pd.Timestamp(bars.iloc[-1][column])
+    if current is not None and last_start == current:
+        return len(bars) - 2
+    return len(bars) - 1
 
 
 def build_state(conn, config: MonitorConfig, now: pd.Timestamp) -> MarketState:
@@ -111,19 +114,23 @@ def build_state(conn, config: MonitorConfig, now: pd.Timestamp) -> MarketState:
 
     hourly = sb.minute_bars_to_hourly(minute_bars)
     closed_through = last_closed_index(hourly, now)
+    snr_bars = sb.minute_bars_to_interval(minute_bars, 15)
+    snr_closed_through = last_closed_index(snr_bars, now, minutes=15)
 
     boxes = pd.DataFrame(columns=snr.BOX_COLUMNS)
     atr_value: float | None = None
-    if len(hourly) > 2 * config.lookback:
+    if len(snr_bars) > 2 * config.lookback:
         boxes = snr.collect_snr_boxes(
-            hourly,
+            snr_bars,
             lookback=config.lookback,
             volume_length=config.volume_length,
             atr_length=config.atr_length,
             box_width=config.box_width,
-            creation_limit=closed_through if closed_through >= 0 else None,
+            creation_limit=snr_closed_through,
             overrides=db.load_box_overrides(conn, config.code),
         )
+    # The box width uses 15m ATR internally; shared risk/alert ATR stays hourly.
+    if len(hourly) > 2 * config.lookback:
         atr_series = snr.pine_atr(hourly, config.atr_length)
         anchor = closed_through if closed_through >= 0 else len(hourly) - 1
         raw = atr_series.iloc[anchor]
@@ -214,7 +221,7 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
     candidates = ar.evaluate(
         code=config.code,
         minute_bar=minute,
-        boxes={side: snr.current_box(state.boxes, side) for side in SIDES},
+        boxes={side: snr.latest_box(state.boxes, side) for side in SIDES},
         prev_minute_bar=bars.iloc[-2] if len(bars) >= 2 else None,
         hourly=state.hourly,
         minute_bars=bars,

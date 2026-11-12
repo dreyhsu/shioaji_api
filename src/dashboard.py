@@ -254,6 +254,13 @@ def _boxes_payload(data) -> list[dict]:
     boxes, visible = data["boxes"], data["visible"]
     if boxes.empty:
         return []
+    if "chart_bars" not in data:
+        # A 15m pivot can fall inside the latest 1h candle. Project its edges
+        # onto the containing candle, so clipping/nearest-index lookup neither
+        # hides it nor shifts it forward to the next hour.
+        boxes = boxes.copy()
+        for column in ("left_time", "right_time"):
+            boxes[column] = boxes[column].map(lambda stamp: sb.hour_start_of(stamp) or stamp)
     start = visible["timestamp"].iloc[0]
     end = visible["timestamp"].iloc[-1]
     clipped = snr.clip_boxes(boxes, start, end)
