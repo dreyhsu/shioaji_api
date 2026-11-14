@@ -289,7 +289,7 @@ def fingerprint():
     sources = {}
     for name in ("monitor.py", "dashboard.py", "trading.py", "shioaji_client.py", "market_health.py", "connection_recovery.py",
                  "db.py", "orderbook.py", "session_bars.py", "market_clock.py", "curve_entry.py", "curve_entry_controller.py",
-                 "shioaji_order_adapter.py", "place_order.py", "file_lease.py"):
+                 "shioaji_order_adapter.py", "place_order.py", "file_lease.py", "external_reconciliation.py"):
         sources[name] = hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, timeout=2).stdout.strip()

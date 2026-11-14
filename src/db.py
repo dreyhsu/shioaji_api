@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS managed_orders (
   auto_exit INTEGER NOT NULL DEFAULT 1,
   simulation INTEGER NOT NULL,
   entry_trade_id TEXT NOT NULL,
+  order_origin TEXT NOT NULL DEFAULT 'dashboard',
   entry_status TEXT NOT NULL,
   broker_octype TEXT,
   reconciled_order_id TEXT,
@@ -196,10 +197,33 @@ CREATE TABLE IF NOT EXISTS managed_orders (
 CREATE INDEX IF NOT EXISTS idx_managed_orders_active
   ON managed_orders (active, code, contract_code);
 
+CREATE TABLE IF NOT EXISTS external_position_adoptions (
+  evidence_key TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL UNIQUE,
+  document TEXT NOT NULL,
+  adopted_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS order_reconciliations (
   source_order_id TEXT PRIMARY KEY,
   target_order_id TEXT NOT NULL,
   broker_trade_id TEXT NOT NULL,
+  document TEXT NOT NULL,
+  reconciled_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS broker_order_identities (
+  order_id TEXT PRIMARY KEY,
+  broker_trade_id TEXT NOT NULL,
+  account_key TEXT NOT NULL,
+  seqno TEXT NOT NULL,
+  entry_date TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  ordno TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS external_close_reconciliations (
+  order_id TEXT PRIMARY KEY,
+  evidence_key TEXT NOT NULL UNIQUE,
   document TEXT NOT NULL,
   reconciled_at TEXT NOT NULL
 );
@@ -290,6 +314,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 # Columns added after the first release.  sqlite has no "ADD COLUMN IF NOT
 # EXISTS", so each one is applied only when missing.
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("broker_order_identities", "ordno", "ALTER TABLE broker_order_identities ADD COLUMN ordno TEXT NOT NULL DEFAULT ''"),
     ("managed_orders", "broker_octype", "ALTER TABLE managed_orders ADD COLUMN broker_octype TEXT"),
     ("managed_orders", "reconciled_order_id", "ALTER TABLE managed_orders ADD COLUMN reconciled_order_id TEXT"),
     ("managed_orders", "exit_status_code", "ALTER TABLE managed_orders ADD COLUMN exit_status_code TEXT"),
@@ -299,6 +324,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
     ("trendlines", "kind", "ALTER TABLE trendlines ADD COLUMN kind TEXT NOT NULL DEFAULT 'line'"),
     ("managed_orders", "curve_check_from", "ALTER TABLE managed_orders ADD COLUMN curve_check_from TEXT"),
+    ("managed_orders", "order_origin", "ALTER TABLE managed_orders ADD COLUMN order_origin TEXT NOT NULL DEFAULT 'dashboard'"),
     ("managed_orders", "contract_tick", "ALTER TABLE managed_orders ADD COLUMN contract_tick REAL NOT NULL DEFAULT 1"),
     ("managed_orders", "breakeven_enabled", "ALTER TABLE managed_orders ADD COLUMN breakeven_enabled INTEGER NOT NULL DEFAULT 1"),
     ("managed_orders", "breakeven_trigger_points", "ALTER TABLE managed_orders ADD COLUMN breakeven_trigger_points REAL"),

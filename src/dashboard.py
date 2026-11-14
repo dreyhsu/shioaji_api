@@ -50,7 +50,7 @@ from runtime_config import RuntimeConfig, DEFAULT_RUNTIME
 from dashboard_config import DashboardConfig
 from trade_client import TradeClient, command_id
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
-                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn)
+                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
 from mock_routes import router as mock_router
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -730,6 +730,18 @@ def api_place_order(body: OrderIn) -> dict:
         raise
     except Exception as error:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post('/api/trading/external-positions/adopt')
+@_mock_locked
+def api_adopt_external_position(body: ExternalPositionIn) -> dict:
+    service = _trading_service()
+    if not isinstance(service, TradeClient):
+        raise HTTPException(422, '外部部位接管僅支援獨立 trade 服務')
+    try:
+        return service.adopt_external_position(**body.model_dump())
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
 
 
 @app.post("/api/trading/orders/{order_id}/cancel")

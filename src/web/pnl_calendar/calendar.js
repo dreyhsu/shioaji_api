@@ -78,7 +78,8 @@
       $('detail-summary').textContent=data.fills.length ? `${money(data.summary.gross_pnl)} · ${data.summary.order_count} 筆 · ${data.summary.quantity} 口 · 未扣費稅`:'當日無可認列的平倉交易。';
       for(const fill of data.fills) {
         const row=document.createElement('tr');
-        const values=[fill.filled_at.replace('T',' ').slice(0,19),fill.order_id,fill.contract_code,fill.action==='Buy'?'多單':'空單',fill.quantity,number.format(fill.entry_price),number.format(fill.exit_price),money(fill.gross_pnl)];
+        const stamp=fill.filled_at.length===10 ? `${fill.filled_at}（僅交易日）` : fill.filled_at.replace('T',' ').slice(0,19);
+        const values=[stamp,fill.order_id,fill.contract_code,fill.action==='Buy'?'多單':'空單',fill.quantity,number.format(fill.entry_price),number.format(fill.exit_price),money(fill.gross_pnl)];
         values.forEach((text,i)=>{const cell=document.createElement('td');cell.textContent=text;if(i===1) cell.title=text;if(i===7) cell.className=tone(fill.gross_pnl);row.append(cell);});
         $('fills').append(row);
       }

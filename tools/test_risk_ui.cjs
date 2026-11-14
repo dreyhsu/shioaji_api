@@ -68,5 +68,29 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   assert.equal(calls[1].payload.curve_id, 4);
   assert.equal(calls[1].payload.target_price, null);
   assert.equal(ctx.state.orders[1].curve_id, null);
+  // A legacy external adoption with ATR=0 still receives a 1h-ATR stop
+  // when selecting a profit curve. Merely displaying defaults never saves them.
+  ctx.state.atr = 120;
+  const adopted = { ...order('external', 200, 10), order_origin: 'external_position',
+    action: 'Buy', avg_fill_price: 20000, atr: 0, stop_price: null, target_price: null, auto_exit: 0 };
+  ctx.state.orders.push(adopted);
+  ctx.state.selectedId = adopted.id;
+  ctx.renderRiskEditor();
+  assert.equal(get('risk-stop').value, 19760);
+  assert.equal(get('risk-target').value, 20240);
+  ctx.changeRiskMode(adopted.id, 4);
+  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19760);
+  assert.equal(calls.length, 2);
+  assert.equal(adopted.stop_price, null);
+  ctx.riskDrafts.delete(adopted.id);
+  adopted.stop_price = 19900;
+  adopted.curve_id = 4;
+  ctx.renderRiskEditor();
+  assert.equal(get('risk-stop').value, 19900); // saved custom protection survives refresh
+  ctx.changeRiskMode(adopted.id, null);
+  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19760);
+  assert.equal(ctx.riskDrafts.get(adopted.id).target_price, 20240);
+  const short = { ...adopted, action: 'Sell', stop_price: null, target_price: null };
+  assert.equal(ctx.riskValues(short).stop_price, 20240);
   console.log('Risk editor order isolation, all curve timeframes and numeric save passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

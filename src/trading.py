@@ -30,6 +30,7 @@ from shioaji_order_adapter import ShioajiOrderAdapter
 from curve_entry_controller import CurveEntryController
 from entry_notify import EntryNotifier
 import pnl_calendar
+import external_reconciliation as er
 from position_reconciliation import plan_cover_repairs, position_totals, ReconciliationPending
 from alert_rules import DEFAULT_CONFIG_PATH as DEFAULT_ALERTS_PATH
 
@@ -222,6 +223,7 @@ class TradingService:
         self._reconcile_required = self._health_enabled
         self._reconcile_error = None
         self._sync_ok = False
+        self._last_external_sync = float('-inf')
         self._entry_rebase = self._health_enabled
         self.curve_entry = CurveEntryController(self)
         self.entry_notifier = EntryNotifier(db_path, enabled=enable_telegram, alerts_path=alerts_path)
@@ -510,6 +512,122 @@ class TradingService:
         for _, target, _, changes, _, _ in repairs:
             self.entry_notifier.notify_exit({**target, **changes})
 
+    def _remember_order_identity(self, conn, row, entry):
+        order = _value(entry, 'order')
+        seqno = str(_value(order, 'seqno', '')).strip()
+        ordno = str(_value(order, 'ordno', '')).strip()
+        day = er.trading_day(row['created_at'], self._calendar)
+        if not seqno or not ordno or set(ordno) == {'0'} or day is None:
+            return
+        account = _value(order, 'account', self._api.futopt_account)
+        key = er.account_key(account)
+        if key != er.account_key(self._api.futopt_account):
+            raise ValueError('broker order account mismatch')
+        existing = conn.execute('SELECT * FROM broker_order_identities WHERE order_id=?', (row['id'],)).fetchone()
+        identity = (str(_trade_id(entry)), key, seqno, day, ordno)
+        if existing and (tuple(existing[name] for name in ('broker_trade_id', 'account_key', 'seqno', 'entry_date')) != identity[:4]
+                         or existing['ordno'] and existing['ordno'] != ordno):
+            raise ReconciliationPending('進場委託身分已變動，暫停交易等待核對')
+        conn.execute('''INSERT INTO broker_order_identities
+            (order_id,broker_trade_id,account_key,seqno,entry_date,ordno,updated_at) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(order_id) DO UPDATE SET broker_trade_id=excluded.broker_trade_id,
+            account_key=excluded.account_key, seqno=excluded.seqno, entry_date=excluded.entry_date,
+            ordno=excluded.ordno, updated_at=excluded.updated_at''',
+            (row['id'], *identity, mh.iso(self._now())))
+
+    def _reconcile_external_closes(self, rows, actual, kwargs):
+        """Only the broker worker reads accounting; throttle unresolved mismatches."""
+        if (not callable(getattr(self._api, 'list_profit_loss', None))
+                or not callable(getattr(self._api, 'list_profit_loss_detail', None))
+                or self._monotonic() - self._last_external_sync < max(5, self.health_settings.order_sync_seconds)):
+            return
+        self._last_external_sync = self._monotonic()
+        with db.read_session(self.db_path) as conn:
+            history = [dict(row) for row in conn.execute('''SELECT * FROM managed_orders
+                WHERE simulation=? AND filled_quantity>0''', (int(self.simulation),))]
+            fills = {}
+            for fill in conn.execute('''SELECT f.* FROM pnl_fills f JOIN managed_orders o ON o.id=f.order_id
+                WHERE o.simulation=? AND f.phase='entry' AND f.broker_trade_id=o.entry_trade_id''',
+                (int(self.simulation),)):
+                fills.setdefault(fill['order_id'], []).append(dict(fill))
+            identities = {row['order_id']: dict(row) for row in conn.execute('SELECT * FROM broker_order_identities')}
+            used = {row[0] for row in conn.execute('SELECT evidence_key FROM external_close_reconciliations')}
+        dates = [fill['fill_date'] for row in rows for fill in fills.get(row['id'], [])]
+        if not dates:
+            return
+        account = self._api.futopt_account
+        key = er.account_key(account)
+        today = self._now().date().isoformat()
+        business_day = er.trading_day(self._now(), self._calendar) or today
+        ends = [today] + ([business_day] if business_day > today else [])
+        contracts = {row['contract_code'] for row in rows}
+        # Some broker accounting queries return no history when the upper bound
+        # is a future business date. Read calendar-day history independently.
+        # Each result's ephemeral detail IDs must be consumed before the next query.
+        from collections import Counter
+        merged, ranges = Counter(), []
+        for end in ends:
+            summaries = self._api.list_profit_loss(account, begin_date=min(dates), end_date=end, **kwargs)
+            records, queried = [], set()
+            for summary in summaries:
+                code = str(_value(summary, 'code', ''))
+                if self._quote_aliases.get(code, code) not in contracts:
+                    continue
+                detail_id = _value(summary, 'id')
+                if detail_id is None or detail_id in queried:
+                    continue
+                queried.add(detail_id)
+                for detail in self._api.list_profit_loss_detail(account, detail_id=detail_id, **kwargs):
+                    code = str(_value(detail, 'code', ''))
+                    if self._quote_aliases.get(code, code) in contracts:
+                        records.append(er.normalize_detail(detail, self._quote_aliases))
+            # Preserve identical actual fills; overlapping date queries do not
+            # double their multiplicity or turn a partial close into a full one.
+            merged |= Counter(json.dumps(record, sort_keys=True) for record in records)
+            ranges.append(dict(from_date=min(dates), to_date=end, detail_count=len(records)))
+        details = [json.loads(record) for record, count in merged.items() for _ in range(count)]
+        event = getattr(self, 'event', None)
+        if callable(event):
+            event('external_close_checked', ranges=ranges,
+                  account_key=key, detail_count=len(details), details=details)
+        repairs = er.plan_external_closes(rows, history, fills, identities, details, actual, key, self._calendar, used)
+        if not repairs:
+            return
+        # Accounting may take time. Recheck the whole account before committing.
+        fresh = {}
+        for position in self._api.list_positions(account, **kwargs):
+            code, action = str(_value(position, 'code', '')), _enum_text(_value(position, 'direction', ''))
+            if action not in {'Buy', 'Sell'}:
+                raise ValueError('unrecognized position direction')
+            pair = self._quote_aliases.get(code, code), action
+            fresh[pair] = fresh.get(pair, 0) + int(_value(position, 'quantity', 0))
+        if {pair: quantity for pair, quantity in fresh.items() if quantity} != actual:
+            raise ReconciliationPending('外部平倉核對期間券商部位已變動，等待重新核對')
+        stamp = mh.iso(self._now())
+        with db.session(self.db_path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            for repair in repairs:
+                row, changes = repair['before'], repair['changes']
+                updates = dict(changes, risk_revision=int(row['risk_revision']) + 1, updated_at=stamp)
+                cursor = conn.execute('UPDATE managed_orders SET ' + ','.join(f'{name}=?' for name in updates)
+                    + ' WHERE id=? AND active=1 AND risk_revision=? AND updated_at=?',
+                    (*updates.values(), row['id'], row['risk_revision'], row['updated_at']))
+                if cursor.rowcount != 1:
+                    raise ReconciliationPending('部位在外部平倉核對期間已更新，等待重新核對')
+                conn.execute('INSERT INTO external_close_reconciliations VALUES (?,?,?,?)',
+                    (row['id'], repair['evidence_key'], json.dumps(repair, ensure_ascii=False), stamp))
+                self._save_pnl(conn, {**row, **changes})
+                conn.execute("DELETE FROM pnl_fills WHERE order_id=? AND phase='exit'", (row['id'],))
+                # P&L detail supplies a business date, never an intraday timestamp.
+                conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+                    [(row['id'], 'exit', f"realized:{repair['evidence_key']}:{index}",
+                      'realized:' + repair['evidence_key'], record['date'], record['date'],
+                      record['quantity'], record['cover_price']) for index, record in enumerate(repair['details'])])
+                conn.execute('UPDATE pnl_order_metadata SET exit_error=NULL,updated_at=? WHERE order_id=?',
+                    (stamp, row['id']))
+            conn.commit()
+        # Historical external fills are accounted for without replaying alerts.
+
     def _reconcile_broker(self, trades):
         """Never clear uncertain submission claims or infer that missing means flat."""
         if not self._sync_ok:
@@ -562,8 +680,19 @@ class TradingService:
             self._apply_cover_repairs(repairs)
             expected = position_totals(self._active_orders())
             if expected != actual:
-                self._reconcile_error = "券商部位與本機管理部位不一致；請核對外部委託與部位"
-                return
+                self._reconcile_external_closes(self._active_orders(), actual, kwargs)
+                expected = position_totals(self._active_orders())
+                if expected != actual:
+                    differences = []
+                    for code, action in sorted(expected.keys() | actual.keys()):
+                        pair = code, action
+                        if expected.get(pair, 0) != actual.get(pair, 0):
+                            direction = '多單' if action == 'Buy' else '空單'
+                            differences.append(f"{code} {direction} 券商 {actual.get(pair, 0)} 口／本機 {expected.get(pair, 0)} 口")
+                    unmanaged = any(quantity > expected.get(pair, 0) for pair, quantity in actual.items())
+                    reason = '含本機未管理部位，請人工核對' if unmanaged else '等待外部平倉明細核對'
+                    self._reconcile_error = '券商部位與本機管理部位不一致：' + '；'.join(differences) + '；' + reason
+                    return
         except ReconciliationPending as error:
             self._reconcile_error = str(error)
             return
@@ -792,6 +921,8 @@ class TradingService:
             self._broker_ready = False
         assignments = ", ".join(f"{key} = ?" for key in updates)
         with db.session(self.db_path) as conn:
+            if entry is not None:
+                self._remember_order_identity(conn, original, entry)
             conn.execute(
                 f"UPDATE managed_orders SET {assignments} WHERE id = ?",
                 (*updates.values(), row_id),
@@ -1115,6 +1246,8 @@ class TradingService:
                 continue
             if row.get('broker_octype') == 'Cover':
                 continue
+            if row.get('order_origin') == 'external_position' and not row.get('auto_exit'):
+                continue  # adopted inventory waits for an explicit risk-settings save
             if int(row["filled_quantity"]) <= int(row["exit_filled_quantity"]):
                 continue
             with self._lock:
@@ -1168,7 +1301,7 @@ class TradingService:
                     raise
             return self._api
 
-    def status(self) -> dict:
+    def status(self, *, include_orders: bool = True) -> dict:
         try:
             self.ensure_connected()
             connected = True
@@ -1212,7 +1345,7 @@ class TradingService:
             **self.breakeven_settings(),
             "curve_entry": self.curve_entry.snapshot(),
             "error": error,
-            "orders": self.orders(),
+            **({"orders": self.orders()} if include_orders else {}),
         }
 
     def contracts(self) -> list[dict]:
@@ -1479,6 +1612,8 @@ class TradingService:
         desired = dict(curve_id=curve_id, stop_price=stop, target_price=target, curve_check_from=baseline,
                        breakeven_enabled=int(breakeven_enabled), breakeven_triggered_at=triggered,
                        breakeven_price=protection, levels_customized=1, **point_values)
+        if row.get('order_origin') == 'external_position':
+            desired['auto_exit'] = 1
         if all(row.get(key) == value for key, value in desired.items()):
             return self._public_order(row)
         now = self._now().isoformat(sep=" ")
@@ -1486,10 +1621,10 @@ class TradingService:
             cursor = conn.execute(
                 "UPDATE managed_orders SET curve_id = ?, stop_price = ?, target_price = ?, curve_check_from = ?, "
                 "breakeven_enabled = ?, breakeven_triggered_at = ?, breakeven_price = ?, levels_customized = 1, "
-                "breakeven_trigger_points = ?, breakeven_offset_points = ?, "
+                "breakeven_trigger_points = ?, breakeven_offset_points = ?, auto_exit = ?, "
                 "curve_armed = 0, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ? AND risk_revision = ?",
                 (curve_id, stop, target, baseline, int(breakeven_enabled), triggered, protection,
-                 point_values['breakeven_trigger_points'], point_values['breakeven_offset_points'], now, row_id, risk_revision))
+                 point_values['breakeven_trigger_points'], point_values['breakeven_offset_points'], desired.get('auto_exit', row['auto_exit']), now, row_id, risk_revision))
             if not cursor.rowcount:
                 raise RiskConflict("出場設定已更新，請重新核對")
             conn.commit()
@@ -1593,10 +1728,6 @@ class TradingService:
         result = []
         for row in rows:
             item = self._public_order(dict(row))
-            if item.get("curve_id") is not None:
-                item["curve_price"] = self._curve_value(dict(row))
-            else:
-                item["curve_price"] = None
             result.append(item)
         return result
 
@@ -1607,7 +1738,7 @@ class TradingService:
             "target_price", "curve_id", "auto_exit", "simulation", "entry_trade_id",
             "curve_check_from", "contract_tick", "breakeven_enabled", "breakeven_triggered_at", "breakeven_price", "risk_revision",
             "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity", "avg_exit_price",
-            "broker_octype", "reconciled_order_id", "exit_status_code",
+            "broker_octype", "reconciled_order_id", "exit_status_code", "order_origin",
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}
@@ -1631,11 +1762,12 @@ class TradingService:
         tick_ready = quote is not None
         broker_ready = self._broker_ready if self._position_checks_enabled() else self._api is not None
         bars_ready = self._curve_data_ready()
+        exit_enabled = bool(row.get('active') and row.get('auto_exit') and self.auto_exit_enabled())
         item["protection"] = {"tick_fresh": tick_ready, "broker_ready": broker_ready,
-                              "fixed_stop": tick_ready and broker_ready and self.auto_exit_enabled(),
-                              "fixed_target": tick_ready and broker_ready and self.auto_exit_enabled() and not row.get("curve_id"),
-                              "curve_exit": tick_ready and broker_ready and bars_ready and self.auto_exit_enabled() and bool(row.get("curve_id")),
-                              "breakeven": tick_ready and broker_ready and bool(row.get("breakeven_enabled")),
+                              "fixed_stop": tick_ready and broker_ready and exit_enabled,
+                              "fixed_target": tick_ready and broker_ready and exit_enabled and not row.get("curve_id"),
+                              "curve_exit": tick_ready and broker_ready and bars_ready and exit_enabled and bool(row.get("curve_id")),
+                              "breakeven": tick_ready and broker_ready and bool(row.get('active')) and bool(row.get("breakeven_enabled")),
                               "broker_protection": "unverified"}
         if quote is not None:
             item["last_quote"] = quote

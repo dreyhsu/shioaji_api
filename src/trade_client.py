@@ -119,6 +119,9 @@ class TradeClient:
     def place_order(self, request):
         return self._command('place_order', request)
 
+    def adopt_external_position(self, **payload):
+        return self._command('adopt_external', payload)
+
     def cancel_entry(self, row_id):
         return self._command('cancel_entry', target=row_id)
 

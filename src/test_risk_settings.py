@@ -283,8 +283,8 @@ def test_schema_migration_enables_existing_orders_idempotently(tmp_path):
     path = tmp_path / 'legacy.db'
     conn = db.connect(path)
     # Build the old table shape, including an existing inactive row's defaults.
-    conn.execute('CREATE TABLE managed_orders (id TEXT PRIMARY KEY, code TEXT, contract_code TEXT, active INTEGER, simulation INTEGER)')
-    conn.execute("INSERT INTO managed_orders VALUES ('old', 'TMFR1', 'TMFX6', 1, 1)")
+    conn.execute('CREATE TABLE managed_orders (id TEXT PRIMARY KEY, code TEXT, contract_code TEXT, active INTEGER, simulation INTEGER, entry_trade_id TEXT, exit_trade_id TEXT)')
+    conn.execute("INSERT INTO managed_orders (id,code,contract_code,active,simulation) VALUES ('old', 'TMFR1', 'TMFX6', 1, 1)")
     conn.commit()
     db.init_schema(conn)
     db.init_schema(conn)
@@ -293,6 +293,7 @@ def test_schema_migration_enables_existing_orders_idempotently(tmp_path):
     assert row['breakeven_triggered_at'] is None and row['contract_tick'] == 1
     assert row['breakeven_trigger_points'] is None and row['breakeven_offset_points'] is None
     assert row['avg_exit_price'] is None
+    assert row['order_origin'] == 'dashboard'
     conn.close()
 
 

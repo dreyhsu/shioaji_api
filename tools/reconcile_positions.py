@@ -91,6 +91,10 @@ def copy_updates(path, work, before):
             audit = planned.execute('SELECT * FROM order_reconciliations WHERE source_order_id=?', (row['id'],)).fetchone()
             if audit is not None:
                 live.execute('INSERT INTO order_reconciliations VALUES (?,?,?,?,?)', tuple(audit))
+            for table in ('broker_order_identities', 'external_close_reconciliations'):
+                record = planned.execute(f'SELECT * FROM {table} WHERE order_id=?', (row['id'],)).fetchone()
+                if record is not None:
+                    live.execute(f'INSERT OR REPLACE INTO {table} VALUES (' + ','.join('?' for _ in record) + ')', tuple(record))
         live.commit()
 
 

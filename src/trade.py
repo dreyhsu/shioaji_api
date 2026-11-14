@@ -27,18 +27,18 @@ from market_fetcher import FetcherSettings, DEFAULT_CONFIG, taipei_now
 from trade_service import IndependentTradingService
 from trading import RiskConfirmation, RiskConflict
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
-                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn)
+                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
 
 COMMAND_MODELS = dict(place_order=OrderIn, arm_curve=CurveEntryIn, subscribe=ContractSubscriptionIn,
     update_levels=TradeLevelsIn, update_risk=TradeRiskSettingsIn, update_curve=TradeCurveIn,
-    select_curve=TradeCurveSelectionIn)
+    select_curve=TradeCurveSelectionIn, adopt_external=ExternalPositionIn)
 TARGETS = {'cancel_entry', 'update_levels', 'update_risk', 'update_curve', 'select_curve'}
 
 
 class Command(BaseModel):
     id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
     name: Literal['place_order', 'arm_curve', 'cancel_curve', 'subscribe', 'cancel_entry',
-                  'update_levels', 'update_risk', 'update_curve', 'select_curve']
+                  'update_levels', 'update_risk', 'update_curve', 'select_curve', 'adopt_external']
     target: str | None = Field(default=None, max_length=128)
     payload: dict = Field(default_factory=dict)
 
@@ -133,6 +133,8 @@ class TradeRuntime:
         s, payload, target = self.service, command['payload'], command['target']
         if command['name'] == 'place_order':
             return s.place_order(payload)
+        if command['name'] == 'adopt_external':
+            return s.adopt_external_position(**payload)
         if command['name'] == 'arm_curve':
             return s.curve_entry.arm(**payload)
         if command['name'] == 'cancel_curve':

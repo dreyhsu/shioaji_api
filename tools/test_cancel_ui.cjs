@@ -31,6 +31,8 @@ function scenario(statuses, { confirmed = true, failure = false, postGate = Prom
         active: status === 'Cancelled' ? 0 : 1 }] };
     },
   };
+  ctx.tradeFetch = ctx.fetch;
+  ctx.fetchRead = ctx.fetch;
   vm.createContext(ctx);
   vm.runInContext(handler + '\nthis.runCancel = cancelEntry;', ctx);
   return { ctx, order, calls, messages, renders, margins: () => margins };
@@ -41,7 +43,8 @@ function scenario(statuses, { confirmed = true, failure = false, postGate = Prom
   const postGate = new Promise((resolve) => { release = resolve; });
   let s = scenario(['Submitted', 'Cancelled'], { postGate });
   const first = s.ctx.runCancel(s.order);
-  while (!s.calls.length) await Promise.resolve();
+  for (let attempt = 0; attempt < 20 && !s.calls.length; attempt++) await Promise.resolve();
+  assert(s.calls.length, 'cancel handler must reach the POST before waiting for its response');
   await s.ctx.runCancel(s.order);
   release();
   await first;

@@ -15,13 +15,16 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import db
+import external_positions as ep
+import external_reconciliation as er
+from position_reconciliation import position_totals
 import market_health as mh
 import shioaji_client as sc
 import trendline as tl
 from curve_entry import crossed_curve
 from curve_entry_controller import CurveEntryController
 from market_fetcher import FetcherSettings, SessionSchedule
-from trading import TradingService, _value, crossed_exit, crossed_curve_close
+from trading import TradingService, _value, _enum_text, align_tick, stop_target_prices, crossed_exit, crossed_curve_close
 
 
 class OrderSession:
@@ -87,9 +90,8 @@ class ClosedMinuteEntry(CurveEntryController):
             if config['signature'] != signature:
                 self._update(entry['id'], state='cancelled', error='曲線已修改，請重新啟用')
                 return
-            minutes = db.load_minute_bars(conn, service.code)
         now = pd.Timestamp(service._now())
-        closed = minutes[minutes['minute_start'] + pd.Timedelta(minutes=1) <= now].reset_index(drop=True)
+        closed, _ = service._curve_source(service.code, curve['timeframe'], closed=True)
         contract = service._find_contract(entry['contract_code'])
         if service._fresh_risk_quote({'contract_code': str(contract.code)}) is None:
             return
@@ -369,6 +371,48 @@ class IndependentTradingService(TradingService):
         closed = self.closed_price(row)
         return row if closed is None else super()._apply_breakeven(row, closed)
 
+    def _curve_source(self, code, timeframe, *, closed=False):
+        """Share complete source geometry until the monitor's minute revision changes.
+
+        A correction or deletion also changes the revision. Never trim history:
+        chart anchors use indices in the full source-period bar sequence.
+        """
+        if not hasattr(self, '_curve_geometry'):
+            self._curve_geometry = {}
+        with db.read_session(self.db_path) as conn:
+            conn.execute('BEGIN')
+            version = conn.execute('SELECT revision FROM market_data_versions WHERE code=?', (code,)).fetchone()
+            revision = version[0] if version else 0
+            geometry = self._curve_geometry.get(code)
+            if geometry is None or geometry['revision'] != revision:
+                geometry = dict(revision=revision, minutes=db.load_minute_bars(conn, code), sources={},
+                                closed_at=None, closed_sources={})
+                self._curve_geometry[code] = geometry
+        minutes, sources = geometry['minutes'], geometry['sources']
+        if closed:
+            cutoff = pd.Timestamp(self._now()).floor('min') - pd.Timedelta(minutes=1)
+            if geometry['closed_at'] != cutoff:
+                geometry['closed_at'] = cutoff
+                geometry['closed_minutes'] = minutes[minutes['minute_start'] <= cutoff].reset_index(drop=True)
+                geometry['closed_sources'] = {}
+            minutes, sources = geometry['closed_minutes'], geometry['closed_sources']
+        if timeframe not in sources:
+            sources[timeframe] = tl.source_bars(minutes, timeframe)
+        return minutes, sources[timeframe]
+
+    def _curve_value(self, row):
+        with db.read_session(self.db_path) as conn:
+            curve = conn.execute("SELECT anchors,timeframe,kind FROM trendlines WHERE id=? AND code=? "
+                                 "AND kind IN ('line','curve') AND enabled=1", (row['curve_id'], row['code'])).fetchone()
+        if curve is None:
+            return None
+        minutes, source = self._curve_source(row['code'], curve['timeframe'])
+        if minutes.empty:
+            return None
+        value = tl.values_at_times(source, json.loads(curve['anchors']), [minutes.iloc[-1]['minute_start']],
+                                   kind=curve['kind'], timeframe=curve['timeframe']).iloc[0]
+        return float(value) if math.isfinite(value) else None
+
     def _exit_signal(self, row, price):
         closed = self.closed_price(row)
         if closed is None or not self._curve_data_ready():
@@ -378,19 +422,20 @@ class IndependentTradingService(TradingService):
             return stop
         if not row.get('curve_id'):
             return crossed_exit(row['action'], closed, float(row['stop_price']), row['target_price'])
-        with db.session(self.db_path) as conn:
-            curves = db.load_trendlines(conn, self.code)
-            minutes = db.load_minute_bars(conn, self.code)
-        curve = next((item for item in curves if item['id'] == row['curve_id'] and item['kind'] in tl.KINDS), None)
-        bars = minutes[minutes['minute_start'] + pd.Timedelta(minutes=1) <= pd.Timestamp(self._now())]
-        if curve is None or len(bars) < 2:
+        with db.read_session(self.db_path) as conn:
+            curve = conn.execute("SELECT anchors,timeframe,kind FROM trendlines WHERE id=? AND code=? "
+                                 "AND kind IN ('line','curve') AND enabled=1", (row['curve_id'], self.code)).fetchone()
+        if curve is None:
+            return 'curve_unavailable'
+        bars, source = self._curve_source(self.code, curve['timeframe'], closed=True)
+        if len(bars) < 2:
             return 'curve_unavailable'
         pair = bars.iloc[-2:]
         if not self._calendar.consecutive_trading_minutes(pair.iloc[0]['minute_start'], pair.iloc[-1]['minute_start']):
             return 'curve_unavailable'
         if row.get('curve_check_from') and pair.iloc[-1]['minute_start'] < pd.Timestamp(row['curve_check_from']):
             return None
-        values = tl.values_at_times(tl.source_bars(bars, curve['timeframe']), curve['anchors'],
+        values = tl.values_at_times(source, json.loads(curve['anchors']),
                                     pair['minute_start'].tolist(), kind=curve['kind'], timeframe=curve['timeframe']).tolist()
         if any(not math.isfinite(value) for value in values):
             return 'curve_unavailable'
@@ -419,6 +464,121 @@ class IndependentTradingService(TradingService):
 
     def contracts(self):
         return list(self.contract_cache)
+
+    def adopt_external_position(self, *, contract_code, action, quantity, simulation, confirmed=False):
+        """The command worker adopts verified full lots, without sending orders."""
+        if simulation is not self.simulation or confirmed is not True:
+            raise ValueError('請確認接管環境與部位')
+        if self.window() is None or self._api is None or self._recovery.pending:
+            raise ValueError('交易 session 尚未就緒，無法接管')
+        with db.read_session(self.db_path) as conn:
+            if conn.execute("SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
+                            (self.code, 'simulation' if self.simulation else 'production')).fetchone():
+                raise ValueError('先前交易指令結果待核對，暫停接管')
+        self._validate_connected_mode()
+        contract = self._find_contract(contract_code)
+        code = str(contract.code)
+        if not any(str(self._find_contract(item['code']).code) == code for item in self.contracts()):
+            raise ValueError('請選擇有效的月份合約')
+        self._subscribe(contract)
+        trades = self._sync_managed_orders(force=True)
+        if not self._sync_ok:
+            raise ValueError('券商委託同步失敗，無法接管')
+        rows = self._active_orders()
+        known_ids = {str(row[key]) for row in rows for key in ('entry_trade_id', 'exit_trade_id') if row.get(key)}
+        if any(str(_value(trade.order, 'id', '')) not in known_ids
+                and _enum_text(_value(trade.status, 'status')) not in {'Filled', 'Cancelled', 'Failed', 'Rejected'}
+                for trade in trades.values()):
+            raise ValueError('券商仍有未管理的未結束委託，請先核對')
+        if any(row['entry_status'] not in {'Filled', 'Cancelled', 'Failed', 'Rejected'}
+               or row.get('exit_trade_id') or row.get('exit_status') for row in rows):
+            raise ValueError('既有委託或出場狀態待核對，無法接管')
+        expected = position_totals(rows)
+        if expected.get((code, action), 0):
+            raise ValueError('同商品同方向已有本機持倉，請先核對逐單分配')
+        kwargs = {'timeout': self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+        account = self._api.futopt_account
+        key = er.account_key(account)
+        positions = self._api.list_positions(account, **kwargs)
+        actual = ep.position_totals(positions, self._quote_aliases)
+        if actual != {**expected, (code, action): quantity}:
+            raise ValueError('券商整戶部位與接管後口數不符，請重新核對')
+        details = []
+        for item in positions:
+            raw_code = str(_value(item, 'code'))
+            if (self._quote_aliases.get(raw_code, raw_code), _enum_text(_value(item, 'direction'))) == (code, action):
+                detail_id = _value(item, 'id')
+                if detail_id is None:
+                    raise ValueError('券商未提供部位明細 ID')
+                details.extend(self._api.list_position_detail(account, detail_id=detail_id, **kwargs))
+        lots = ep.plan_lots(details, code, action, quantity, key, self._quote_aliases)
+        fresh_positions = self._api.list_positions(account, **kwargs)
+        fresh = ep.position_totals(fresh_positions, self._quote_aliases)
+        if fresh != actual:
+            raise ValueError('核對期間券商部位已改變，請重新核對')
+        # Re-read lots as well: close-and-reopen can preserve aggregate quantity.
+        confirmed_details = []
+        for item in fresh_positions:
+            raw_code = str(_value(item, 'code'))
+            if (self._quote_aliases.get(raw_code, raw_code), _enum_text(_value(item, 'direction'))) == (code, action):
+                confirmed_details.extend(self._api.list_position_detail(account, detail_id=_value(item, 'id'), **kwargs))
+        if ep.plan_lots(confirmed_details, code, action, quantity, key, self._quote_aliases) != lots:
+            raise ValueError('核對期間券商進場明細已改變，請重新核對')
+        stamp = mh.iso(self._now())
+        tick = float(_value(contract, 'tick', 1) or 1)
+        if not math.isfinite(tick) or tick <= 0:
+            raise ValueError('合約最小跳動單位無效')
+        # External accounting has no intraday entry timestamp. Capture the
+        # current shared-DB 1h ATR at adoption, never pretend it is entry-time ATR.
+        try:
+            atr, _ = self._risk_context(self.code)
+        except RuntimeError:
+            atr = 0.0  # adoption remains possible while default risk is unavailable
+        adopted = []
+        with db.session(self.db_path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            current = [dict(row) for row in conn.execute(
+                'SELECT * FROM managed_orders WHERE code=? AND simulation=? AND active=1 ORDER BY id',
+                (self.code, int(self.simulation)))]
+            if sorted(rows, key=lambda row: row['id']) != current:
+                raise ValueError('接管期間本機部位已變動')
+            for lot in lots:
+                if conn.execute('SELECT 1 FROM external_position_adoptions WHERE evidence_key=?', (lot['evidence_key'],)).fetchone():
+                    raise ValueError('此券商進場批次已接管，不能重複接管')
+                # Also exclude a previously managed and closed order of this identity.
+                if conn.execute('SELECT 1 FROM broker_order_identities WHERE account_key=? AND entry_date=? AND ordno=?',
+                                (key, lot['entry_date'], lot['ordno'])).fetchone():
+                    raise ValueError('此券商委託已存在本機歷史，請核對')
+                row_id = str(uuid.uuid4())
+                external_id = 'external-position:' + lot['evidence_key']
+                stop, target = (stop_target_prices(action, lot['price'], atr) if atr > 0 else (None, None))
+                stop = align_tick(stop, tick) if stop is not None else None
+                target = align_tick(target, tick) if target is not None else None
+                conn.execute('''INSERT INTO managed_orders
+                    (id,code,contract_code,action,quantity,filled_quantity,avg_fill_price,price,price_type,order_type,
+                     atr,auto_exit,breakeven_enabled,simulation,entry_trade_id,entry_status,broker_octype,
+                     order_origin,levels_customized,contract_tick,created_at,updated_at,stop_price,target_price)
+                    VALUES (?,?,?,?,?,?,?,0,'EXTERNAL','EXTERNAL',?,0,0,?,?,'Filled','New','external_position',1,?,?,?,?,?)''',
+                    (row_id,self.code,code,action,lot['quantity'],lot['quantity'],lot['price'],atr,int(self.simulation),external_id,tick,stamp,stamp,stop,target))
+                conn.execute('INSERT INTO broker_order_identities (order_id,broker_trade_id,account_key,seqno,entry_date,ordno,updated_at) VALUES (?,?,?,?,?,?,?)',
+                    (row_id,external_id,key,'',lot['entry_date'],lot['ordno'],stamp))
+                # Accounting provides a trading date only; do not invent entry time or SDK IDs.
+                conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+                    [(row_id,'entry',f'position:{index}',external_id,record['date'],record['date'],record['quantity'],record['price'])
+                     for index, record in enumerate(lot['details'])])
+                conn.execute('INSERT INTO pnl_order_metadata (order_id,multiplier,currency,updated_at) VALUES (?,?,?,?)',
+                    (row_id,_value(contract,'multiplier'),'TWD',stamp))
+                conn.execute('INSERT INTO external_position_adoptions VALUES (?,?,?,?)',
+                    (lot['evidence_key'],row_id,json.dumps(dict(account_key=key,contract_code=code,action=action,lot=lot,
+                        risk_defaults=dict(atr=atr,timeframe='1h',basis='adoption',observed_at=stamp)),ensure_ascii=False),stamp))
+                adopted.append(row_id)
+            conn.commit()
+        self._broker_ready = False
+        self._reconcile_required = True
+        self._reconcile_broker(trades)
+        self.event('external_position_adopted', order_ids=adopted, contract_code=code, action=action, quantity=quantity,
+                   risk_enabled=False)
+        return dict(order_ids=adopted, risk_enabled=False)
 
     def cancel_entry(self, row_id):
         if not self._broker_ready or self._recovery.pending:
@@ -450,7 +610,11 @@ class IndependentTradingService(TradingService):
         return result
 
     def snapshot(self):
-        status = super().status() if self._api is not None else dict(
+        orders = self.orders()
+        # Rendering history can take time on a revision change. Refresh quotes
+        # afterwards and build all status freshness fields from that same view.
+        self.load_quotes()
+        status = super().status(include_orders=False) if self._api is not None else dict(
             connected=False, session_present=False, simulation=self.simulation, error=self._connect_error,
             auto_entry_enabled=self.auto_entry_enabled(), auto_exit_enabled=self.auto_exit_enabled(),
             curve_entry=self.curve_entry.snapshot(), bars_ready=False, broker_ready=False)
@@ -472,4 +636,15 @@ class IndependentTradingService(TradingService):
         if 'protection' in status:
             for key in ('fixed_exit', 'breakeven', 'curve_exit'):
                 status['protection'][key] = status['protection'][key] and bool(contract_bars) and all(contract_bars.values())
-        return dict(status=status, orders=self.orders(), contracts=self.contracts(), margin=self.margin_cache)
+        for order in orders:
+            quote = super()._fresh_risk_quote(order)
+            if quote is not None:
+                order['last_quote'] = quote
+            order['protection']['tick_fresh'] = quote is not None
+            if quote is None:
+                for key in ('fixed_stop', 'fixed_target', 'curve_exit', 'breakeven'):
+                    order['protection'][key] = False
+        status['orders'] = orders
+        status['pending_external_risk'] = sum(bool(row['active'] and row.get('order_origin') == 'external_position'
+                                                   and not row['auto_exit']) for row in orders)
+        return dict(status=status, orders=orders, contracts=self.contracts(), margin=self.margin_cache)

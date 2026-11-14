@@ -63,11 +63,28 @@ def test_periodic_position_check_detects_external_flat_and_keeps_gate_closed(rig
     r.mono[0] += 61
     r.runtime.step()
     assert not r.service._broker_ready and '不一致' in r.service._reconcile_error
+    assert '券商 0 口／本機 2 口' in r.service._reconcile_error
+    assert '等待外部平倉明細核對' in r.service._reconcile_error
     assert rows(r)[opened]['active'] == 1  # flat alone does not invent an exit
     r.mono[0] += 61
     r.runtime.step()
     assert not r.service._broker_ready
     assert r.service._last_position_sync_at and r.service._broker_positions == []
+
+
+@pytest.mark.parametrize('position,direction', [(2, '多單'), (-2, '空單')])
+def test_external_new_position_reports_unmanaged_and_blocks_new_orders(rig, position, direction):
+    r = rig
+    r.broker.position = position
+    r.runtime.step()
+    assert not r.service._broker_ready
+    assert f'{r.broker.contract.code} {direction} 券商 2 口／本機 0 口' in r.service._reconcile_error
+    assert '本機未管理部位' in r.service._reconcile_error
+    assert '等待外部平倉' not in r.service._reconcile_error
+    assert request(r, identity='blocked-external').status_code == 202
+    r.runtime.step()
+    assert r.client.get('/api/commands/blocked-external').json()['state'] == 'failed'
+    assert not r.broker.trades and not rows(r)
 
 
 def test_manual_entry_forces_position_check_before_sending(rig):

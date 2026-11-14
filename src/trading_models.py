@@ -48,6 +48,14 @@ class ContractSubscriptionIn(BaseModel):
     contract_code: str = Field(min_length=1, max_length=24)
 
 
+class ExternalPositionIn(BaseModel):
+    contract_code: str = Field(min_length=1, max_length=24)
+    action: Literal['Buy', 'Sell']
+    quantity: int = Field(ge=1, le=100, strict=True)
+    simulation: StrictBool
+    confirmed: StrictBool = False
+
+
 class CurveEntryIn(BaseModel):
     action: Literal["Buy", "Sell"] = "Buy"
     curve_id: int = Field(gt=0, strict=True)

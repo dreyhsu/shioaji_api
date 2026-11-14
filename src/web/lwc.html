@@ -137,10 +137,11 @@
         <div><span>可動用保證金</span><b id="margin-available">—</b></div>
       </div>
       <div class="trade-card-head position-heading">
-        <h2>本介面委託 / 部位</h2>
+        <h2>系統管理委託 / 部位</h2>
         <span id="auto-exit-state" class="trade-muted">自動出場設定讀取中</span>
       </div>
       <div id="managed-orders" class="managed-orders"><div class="empty">尚無委託</div></div>
+      <div id="external-positions" class="managed-orders" aria-live="polite"></div>
       <div class="trade-muted order-help">點選委託後，圖表顯示該單損益區塊；持倉可編輯出場，按儲存才生效。未成交委託可取消；部分成交取消時只撤銷未成交口數。</div>
     </article>
   </section>
@@ -204,8 +205,8 @@
   <script src="/static/boxes_primitive.js?v=gap-2"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
   <script src="/static/curve_hover.js?v=1"></script>
-  <script src="/static/lwc_app.js?v=multiframe-lines-1"></script>
-  <script src="/static/trading.js?v=multiframe-lines-1"></script>
+  <script src="/static/lwc_app.js?v=volume-overlay-1"></script>
+  <script src="/static/trading.js?v=external-adoption-2"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

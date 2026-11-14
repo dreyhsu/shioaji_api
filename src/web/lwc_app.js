@@ -15,9 +15,8 @@ let REFRESH_MS = 60000;
 let INITIAL_BARS = 120; // ~6 trading days at 19 bars/day; 380 at once is unreadable
 const PANE_PRICE = 0;
 const PANE_VOLUME = 1;
-// Height is directly proportional to the stretch factor, and pane 0 ships with
-// a factor of 2 while new panes get 1 -- so both are always set explicitly.
-const PANE_STRETCH = [8, 2];
+// Volume shares the price pane, using its own scale at the bottom.
+const PANE_STRETCH = [1];
 
 const C = {
   bg: '#1a1c23',
@@ -118,7 +117,7 @@ function initChart() {
       vertLine: { color: C.muted, width: 1, style: 3, labelBackgroundColor: '#2a2d36' },
       horzLine: { color: C.muted, width: 1, style: 3, labelBackgroundColor: '#2a2d36' },
     },
-    rightPriceScale: { borderColor: C.line, scaleMargins: { top: 0.08, bottom: 0.08 } },
+    rightPriceScale: { borderColor: C.line, scaleMargins: { top: 0.08, bottom: 0.25 } },
     timeScale: {
       borderColor: C.line,
       timeVisible: true,
@@ -135,9 +134,7 @@ function initChart() {
     },
   });
 
-  // Pre-create the volume pane: addSeries(..., paneIndex) would create it, but a
-  // pane whose last series is removed is deleted, so an indicator disappearing
-  // from /api/chart would shuffle the layout.
+  // Reserve one price pane; volume uses an independent overlay scale.
   while (chart.panes().length < PANE_STRETCH.length) chart.addPane(true);
   const panes = chart.panes();
   for (let i = 0; i < PANE_STRETCH.length; i++) {
@@ -197,6 +194,11 @@ function seriesOptions(spec) {
   } else {
     options.lineWidth = spec.line_width || 1;
   }
+  if (spec.name === 'volume') {
+    options.priceScaleId = 'volume';
+    options.priceFormat = { type: 'volume', precision: 0, minMove: 1 };
+    options.lastValueVisible = false;
+  }
   // Trendlines opt out, so the price zoom fits the candles rather than a line
   // extended far above or below them.
   if (spec.autoscale === false) options.autoscaleInfoProvider = () => null;
@@ -220,16 +222,22 @@ function applySeries(specs) {
       entry = undefined;
     }
     if (!entry) {
-      const pane = spec.pane === undefined ? PANE_VOLUME : spec.pane;
+      // The API retains its volume-pane metadata; placement is a display choice.
+      const pane = spec.name === 'volume' ? PANE_PRICE : (spec.pane === undefined ? PANE_VOLUME : spec.pane);
       entry = { series: chart.addSeries(factory(), seriesOptions(spec), pane), spec: spec };
       indicators.set(spec.name, entry);
     } else {
       entry.series.applyOptions(seriesOptions(spec));
       entry.spec = spec;
     }
-    // Histogram items carry their own `color`, so the up/down colouring of delta
-    // volume stays a server-side decision.
+    // Histogram items carry the server's candle-direction colour.
     entry.series.setData(spec.data);
+    if (spec.name === 'volume') {
+      entry.series.priceScale().applyOptions({
+        visible: false,
+        scaleMargins: { top: 0.78, bottom: 0 },
+      });
+    }
   }
 
   for (const [name, entry] of indicators) {
@@ -251,7 +259,7 @@ function renderLegendRows() {
   ];
   rows.push('<span class="lg"><i style="background:#808080"></i>1h 跳空缺口</span>');
   for (const [, entry] of indicators) {
-    rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + labelText(entry.spec.label) + '</span>');
+    rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + labelText(entry.spec.name === 'volume' ? '成交量' : entry.spec.label) + '</span>');
   }
   document.getElementById('legend-series').innerHTML = rows.join('');
 }
@@ -269,13 +277,18 @@ function onCrosshairMove(param) {
   }
   const change = bar.close - bar.open;
   const cls = change >= 0 ? 'up' : 'down';
+  const volume = indicators.get('volume');
+  const volumePoint = volume ? param.seriesData.get(volume.series) : null;
+  const volumeText = volumePoint && Number.isFinite(volumePoint.value)
+    ? '　成交量 ' + volumePoint.value.toLocaleString('zh-TW', { maximumFractionDigits: 0 })
+    : '';
   el.innerHTML =
     crosshairTimeFormatter(param.time) +
     '　開 ' + bar.open.toFixed(0) +
     ' 高 ' + bar.high.toFixed(0) +
     ' 低 ' + bar.low.toFixed(0) +
     ' 收 ' + bar.close.toFixed(0) +
-    ' <b class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(0) + '</b>';
+    ' <b class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(0) + '</b>' + volumeText;
 }
 
 // ----------------------------------------------------------- curve identity

@@ -23,6 +23,45 @@
   let refreshing = false;
   let lastTradeStatusAt = 0;
   let pendingCommandResolution = null;
+  let adoptingExternal = false;
+
+  function renderExternalPositions(info) {
+    const list = $('external-positions');
+    if (!list) return;
+    const candidates = (info.broker_positions || []).filter((position) =>
+      !state.orders.some((order) => Number(order.active) && order.contract_code === position.contract_code
+        && order.action === position.action && Number(order.filled_quantity) > Number(order.exit_filled_quantity)));
+    list.replaceChildren();
+    for (const position of candidates) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `接管券商部位：${position.contract_code} ${position.action === 'Buy' ? '多單' : '空單'} ${position.quantity} 口`;
+      button.disabled = adoptingExternal || !info.session_present || info.scheduled_open === false;
+      button.addEventListener('click', () => adoptExternalPosition(position));
+      list.append(button);
+    }
+  }
+
+  async function adoptExternalPosition(position) {
+    if (adoptingExternal) return;
+    if (!await confirmOperation(`接管 ${position.contract_code} ${position.action === 'Buy' ? '多單' : '空單'} ${position.quantity} 口？\n系統會核對券商未平倉明細並建立新的管理單，不新增進場委託。\n接管後請編輯出場並儲存停損／停利，儲存後才啟用自動保護。`)) return;
+    adoptingExternal = true;
+    try {
+      const response = await tradeFetch('/api/trading/external-positions/adopt', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...position, simulation: state.simulation, confirmed: true }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || '部位接管失敗');
+      state.selectedId = result.order_ids[0];
+      message('部位已接管。請編輯出場並儲存停損／停利，儲存後啟用自動保護。');
+    } catch (error) {
+      message(error.message, true);
+    } finally {
+      adoptingExternal = false;
+      await refreshTrading();
+    }
+  }
 
   async function resolvePendingCommand(pending) {
     const status = await fetchRead('/api/trading/commands/' + encodeURIComponent(pending.id));
@@ -164,6 +203,7 @@
         ? `固定出場：${protection.fixed_exit ? '監控中' : '受影響'} · 保本：${protection.breakeven ? '監控中' : '受影響'} · 曲線出場：${protection.curve_exit ? '監控中' : '暫停'} · 券商端保護：待核對`
         : (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick');
     if (info.reconciliation_error) connection.textContent = info.reconciliation_error;
+    if (info.pending_external_risk) $('auto-exit-state').textContent += ` · ${info.pending_external_risk} 筆接管部位待設定出場（未啟用保護）`;
     state.price = displayPrice == null ? null : Number(displayPrice);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
     $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
@@ -282,6 +322,8 @@
   }
 
   function orderStatus(order) {
+    if (order.active && order.order_origin === 'external_position' && !order.auto_exit) return '券商 App 部位已接管 · 待設定出場';
+    if (!order.active && order.trigger_reason === 'external_close') return '券商 App／外部平倉 · 已自動結案';
     if (order.broker_octype === 'Cover' && !Number(order.filled_quantity)
       && ['Cancelled', 'Failed', 'Rejected'].includes(order.entry_status)) return '平倉委託已結束 · 未成交';
     if (order.broker_octype === 'Cover') return order.reconciled_order_id
@@ -323,8 +365,19 @@
   }
 
   function riskValues(order) {
-    return { curve_id: order.curve_id || null, stop_price: order.stop_price,
-      target_price: order.target_price, breakeven_enabled: Boolean(order.breakeven_enabled),
+    // Older adopted rows have no saved ATR. Fill only missing draft fields
+    // from the chart's 1h ATR; saved stop/target prices always take precedence.
+    const atr = Number(order.atr) > 0 ? Number(order.atr)
+      : order.order_origin === 'external_position' ? Number(state.atr) : 0;
+    const entry = Number(order.avg_fill_price);
+    const tick = Number(order.contract_tick) || 1;
+    const direction = order.action === 'Buy' ? 1 : -1;
+    const defaults = atr > 0 && entry > 0 ? {
+      stop: Math.round((entry - direction * 2 * atr) / tick) * tick,
+      target: Math.round((entry + direction * 2 * atr) / tick) * tick,
+    } : {};
+    return { curve_id: order.curve_id || null, stop_price: order.stop_price ?? order.default_stop_price ?? defaults.stop ?? null,
+      target_price: order.target_price ?? order.default_target_price ?? defaults.target ?? null, breakeven_enabled: Boolean(order.breakeven_enabled),
       breakeven_trigger_points: order.breakeven_trigger_points,
       breakeven_offset_points: order.breakeven_offset_points,
       risk_revision: Number(order.risk_revision) };
@@ -397,6 +450,7 @@
       $('risk-breakeven-label').textContent = `浮盈超過 ${values.breakeven_trigger_points ?? '—'} 點啟動，保留 ${values.breakeven_offset_points ?? '—'} 點`;
       const stale = Number(values.risk_revision) !== Number(order.risk_revision);
       let status = riskErrors.get(order.id) || riskNotice || (riskDrafts.has(order.id) ? '尚未儲存：系統仍沿用原出場設定。' : '已儲存；拖曳邊界或輸入價格後按儲存。');
+      if (order.order_origin === 'external_position' && !order.auto_exit) status = riskErrors.get(order.id) || '尚未啟用保護：請設定停損／停利並儲存。';
       if (stale) status = '出場設定或成交狀態已更新（可能已自動保本）。草稿已保留，請按還原重新核對。';
       else if (order.breakeven_enabled && order.breakeven_triggered_at) status += ` 保本已觸發，保護價 ${number(order.breakeven_price, 2)}；調低保留點數不會放寬既有 stop。`;
       if (values.curve_id) status += ' 線條 target 僅供顯示，依 1m 收盤穿越出場。';
@@ -415,11 +469,10 @@
     const cancelling = !curveId && Boolean(draft.curve_id);
     const patch = { curve_id: curveId };
     if (cancelling) {
-      const entry = Number(order.avg_fill_price);
       const direction = order.action === 'Buy' ? 1 : -1;
-      const tick = Number(order.contract_tick) || 1;
-      patch.stop_price = order.default_stop_price ?? Math.round((entry - direction * 2 * Number(order.atr)) / tick) * tick;
-      patch.target_price = order.default_target_price ?? Math.round((entry + direction * 2 * Number(order.atr)) / tick) * tick;
+      const defaults = riskValues({ ...order, curve_id: null, stop_price: null, target_price: null });
+      patch.stop_price = defaults.stop_price ?? draft.stop_price;
+      patch.target_price = defaults.target_price ?? draft.target_price;
       if (order.breakeven_enabled && order.breakeven_triggered_at) {
         patch.stop_price = direction > 0 ? Math.max(patch.stop_price, Number(order.stop_price)) : Math.min(patch.stop_price, Number(order.stop_price));
       }
@@ -618,12 +671,16 @@
       const info = await response.json();
       setMode(info);
       if (info.orders) acceptOrders(info.orders);
+      renderExternalPositions(info);
       await loadCurves();
       renderOrders();
       if (state.contracts.length === 0 && info.connected) await loadContracts();
       if ((state.mock || Date.now() - lastMarginAt > 30000) && info.connected) await loadAccountMargin();
       if (stateResponse) {
-        if (stateResponse.ok) state.atr = (await stateResponse.json()).hourly_atr;
+        if (stateResponse.ok) {
+          state.atr = (await stateResponse.json()).hourly_atr;
+          renderRiskEditor();
+        }
         lastStateAt = Date.now();
       }
     } catch (error) {
