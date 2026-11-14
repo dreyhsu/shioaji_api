@@ -73,10 +73,10 @@ def temporary_database_only(monkeypatch):
     import db
     original = db.connect
 
-    def connect(path=db.DEFAULT_DB_PATH):
+    def connect(path=db.DEFAULT_DB_PATH, **kwargs):
         if not Path(path).resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
             raise RuntimeError("Offline tests: databases must live in a temporary directory")
-        return original(path)
+        return original(path, **kwargs)
 
     monkeypatch.setattr(db, "connect", connect)
 

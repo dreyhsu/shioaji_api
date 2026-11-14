@@ -299,10 +299,10 @@ def _text(value: Any) -> str | None:
     return stamp.isoformat(sep=" ")
 
 
-def connect(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+def connect(path: Path | str = DEFAULT_DB_PATH, *, timeout: float = 30.0) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30.0)
+    conn = sqlite3.connect(str(path), timeout=timeout)
     conn.row_factory = sqlite3.Row
     # WAL lets the dashboard read while the monitor writes.
     conn.execute("PRAGMA journal_mode=WAL")
@@ -369,14 +369,22 @@ def _migrate_trendline_timeframes(conn):
 
 def init_schema(conn: sqlite3.Connection) -> None:
     from pnl_calendar import SCHEMA as PNL_SCHEMA
+    from latency_trace import SCHEMA as LATENCY_SCHEMA
     conn.executescript(SCHEMA)
     conn.executescript(PNL_SCHEMA)
+    conn.executescript(LATENCY_SCHEMA)
     for table, column, statement in MIGRATIONS:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:
             conn.execute(statement)
     conn.commit()
     _migrate_trendline_timeframes(conn)
+    conn.executescript('''
+        CREATE INDEX IF NOT EXISTS idx_managed_entry_trade ON managed_orders(code,entry_trade_id);
+        CREATE INDEX IF NOT EXISTS idx_managed_exit_trade ON managed_orders(code,exit_trade_id);
+        CREATE INDEX IF NOT EXISTS idx_broker_seqno ON broker_order_identities(seqno);
+        CREATE INDEX IF NOT EXISTS idx_broker_ordno ON broker_order_identities(ordno);
+    ''')
 
 
 @contextmanager

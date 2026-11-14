@@ -61,6 +61,14 @@ runtime 設定包含商品、acquisition／unified DB、trade 位址，以及行
 
 ## Monitor 歷史處理效能（2026-11-06）
 
+### Monitor 市場提醒背景傳送（2026-11-14）
+
+每個 monitor 使用一條 `monitor-telegram` 背景執行緒及最多 256 則待送提醒的佇列。行情主迴圈仍在原本規則命中時保存提醒 claim、檢查冷卻及去重；提交佇列即返回，不等待 Telegram HTTP／重試。背景傳送完成後，用自己的 SQLite 連線更新 `telegram_alerts.ok`／`sent_at`，不跨執行緒共用行情連線，也不在資料庫 transaction 中等待網路。日誌 `queued` 只表示入列，`ok=1` 才是已記錄傳送成功；`ok IS NULL` 表示結果尚未確認，並非成功。
+
+佇列滿、暫停或已關閉時拒收，不回退同步 HTTP；已 claim 的拒收提醒保留 `ok=0`，沿用冷卻／去重，不自動重送。設定檔暫停期間不建立新提醒，暫停前尚在排隊的提醒即使恢復也不補發；背景在傳送前另檢查最新總開關。`--no-telegram` 沿用保存但不傳送的行為。已進行中的 HTTP 無法撤回，可能在暫停後才完成。設定重載使用奈秒修改時間、檔案大小與檔案識別碼，避免 Windows 快速改寫時漏讀總開關。
+
+健康檔 `notifications` 顯示 `worker_alive`、`queued`、`in_flight`、`sent`、`failed`、`skipped`、`rejected` 及 `last_error`；通知失敗不關閉行情健康閘門。正常停止最多等待通知工作者 1 秒；若 HTTP 尚未完成，記錄 `shutdown_delivery_unconfirmed`，不偽造成功、不阻擋 monitor 結束。尚未送出的工作會在工作者恢復後標記未送達；若程序先結束，未確認紀錄可能維持 NULL。重啟不掃描或重播這些歷史提醒。新程式於 monitor 下次正常啟動時生效；本次不自動重啟正式服務，也不改動 trade 成交通知與交易規則。
+
 monitor 維持每秒同步最新報價、檢查 tick 健康／instance／generation 與行情時效。acquisition DB 新增每商品、每模式的 `market_bar_versions` 與資料庫識別碼；K 棒新增、修正、完整性失效或刪除才推進版本，單純報價更新與相同資料重寫不推進版本。
 
 啟動時讀取完整來源範圍；之後僅在 K 棒版本改變時重讀該範圍，以保留任意較舊分鐘的 broker 修正及 tick 撤回。寫入 unified DB 時只處理新增／內容或來源改變的分鐘，撤回失效的 tick 候選；未變動的歷史不再每秒重新讀寫。已快取但尚未收盤的分鐘仍會在收盤時重新篩選。重啟會重新建立快取，不以最後一根分鐘的時間當作修正水位。

@@ -101,6 +101,7 @@
     pending ||= { id: crypto.randomUUID(), fingerprint };
     sessionStorage.setItem(key, JSON.stringify(pending));
     let response;
+    if (typeof window === 'object') window.TradeLatency?.commandStarted(pending.id);
     try {
       response = await fetch(url, { ...options,
         headers: { ...(options.headers || {}), 'Idempotency-Key': pending.id } });
@@ -108,6 +109,8 @@
       const resolved = await resolvePendingCommand(pending).catch(() => null);
       if (resolved) { clearPendingCommand(pending.id); return resolved; }
       throw new Error(`指令 ${pending.id} 回應中斷，結果待確認；系統會查詢原指令。`);
+    } finally {
+      if (typeof window === 'object') window.TradeLatency?.commandCompleted(pending.id);
     }
     if ([502, 503, 504].includes(response.status)) {
       const resolved = await resolvePendingCommand(pending).catch(() => null);
@@ -669,11 +672,13 @@
       ]);
       if (!response.ok) throw new Error('無法確認交易服務健康狀態');
       const info = await response.json();
+      if (typeof window === 'object') window.TradeLatency?.received(info.latency);
       setMode(info);
       if (info.orders) acceptOrders(info.orders);
       renderExternalPositions(info);
       await loadCurves();
       renderOrders();
+      if (typeof window === 'object') window.TradeLatency?.rendered(info.latency, state.orders);
       if (state.contracts.length === 0 && info.connected) await loadContracts();
       if ((state.mock || Date.now() - lastMarginAt > 30000) && info.connected) await loadAccountMargin();
       if (stateResponse) {

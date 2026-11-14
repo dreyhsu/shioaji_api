@@ -10,6 +10,8 @@ import math
 import os
 from pathlib import Path
 import uuid
+import threading
+from queue import Queue, Empty, Full
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -23,8 +25,9 @@ import shioaji_client as sc
 import trendline as tl
 from curve_entry import crossed_curve
 from curve_entry_controller import CurveEntryController
+from latency_trace import LatencyRecorder, trace_scope, trace_values, order_link, identity
 from market_fetcher import FetcherSettings, SessionSchedule
-from trading import TradingService, _value, _enum_text, align_tick, stop_target_prices, crossed_exit, crossed_curve_close
+from trading import TradingService, _value, _enum_text, _fill_summary, _trade_status, align_tick, stop_target_prices, crossed_exit, crossed_curve_close
 
 
 class OrderSession:
@@ -33,7 +36,20 @@ class OrderSession:
         self.api, self.service = api, service
 
     def __getattr__(self, name):
-        return getattr(self.api, name)
+        method = getattr(self.api, name)
+        if name not in {'update_status', 'list_positions', 'margin', 'list_profit_loss', 'list_profit_loss_detail'}:
+            return method
+        def timed(*args, **kwargs):
+            began = self.service.latency.record('broker_rpc_started', phase=name, generation=self.service._generation)
+            try:
+                result = method(*args, **kwargs)
+                self.service.latency.record('broker_rpc_completed', phase=name, started=began, generation=self.service._generation)
+                return result
+            except Exception as error:
+                self.service.latency.record('broker_rpc_failed', phase=name, started=began,
+                    generation=self.service._generation, error_type=type(error).__name__)
+                raise
+        return timed
 
     def _check(self):
         if ((self.service.control and self.service.control.stop_requested)
@@ -47,7 +63,17 @@ class OrderSession:
 
     def cancel_order(self, *args, **kwargs):
         self._check()
-        return self.api.cancel_order(*args, **kwargs)
+        trade = args[0] if args else kwargs.get('trade')
+        broker_id = _value(_value(trade, 'order'), 'id')
+        began = self.service.latency.record('sdk_cancel_started', broker_trade_id=broker_id, generation=self.service._generation)
+        try:
+            result = self.api.cancel_order(*args, **kwargs)
+            self.service.latency.record('sdk_cancel_completed', started=began, generation=self.service._generation)
+            return result
+        except Exception as error:
+            self.service.latency.record('sdk_cancel_failed', started=began,
+                generation=self.service._generation, error_type=type(error).__name__)
+            raise
 
 
 def _pending_minute_indices(closed, check_from, watermark):
@@ -98,14 +124,23 @@ class ClosedMinuteEntry(CurveEntryController):
         watermark = entry.get('last_checked_minute')
         for index in _pending_minute_indices(closed, entry['check_from'], watermark):
             stamp = pd.Timestamp(closed.iloc[index]['minute_start'])
+            with db.read_session(service.db_path) as conn:
+                link = conn.execute('SELECT trace_id,command_id FROM latency_entry_links WHERE entry_id=?', (entry['id'],)).fetchone()
+            timing = dict(trace_id=link[0] if link else f'signal:{entry["id"]}:{stamp.value}',
+                          command_id=link[1] if link else None, signal_minute=mh.iso(stamp))
+            began = service.latency.record('signal_check_started', **timing,
+                closed_at=mh.iso(stamp + pd.Timedelta(minutes=1)), generation=service._generation)
             elapsed = (now - stamp - pd.Timedelta(minutes=1)).total_seconds()
             if elapsed > 60:
+                service.latency.record('signal_check_completed', started=began, state='expired', **timing)
                 self._update(entry['id'], last_checked_minute=mh.iso(stamp), error='訊號已超過收盤後 60 秒，略過')
                 continue
             through = closed.iloc[:index + 1]
             self._update(entry['id'], last_checked_minute=mh.iso(stamp))
             if not crossed_curve(through, curve['anchors'], now, entry['action'], curve['timeframe'], curve['kind']):
+                service.latency.record('signal_check_completed', started=began, state='no_crossing', **timing)
                 continue
+            service.latency.record('signal_check_completed', started=began, state='crossed', **timing)
             # Require the fresh signal quote to remain on the breakout side.
             signal_quote = service.signal_quote()
             source = tl.source_bars(through, curve['timeframe'])
@@ -129,9 +164,10 @@ class ClosedMinuteEntry(CurveEntryController):
             if not claimed:
                 return
             try:
-                result = service.place_order(dict(contract_code=entry['contract_code'], action=entry['action'],
-                    quantity=entry['quantity'], price=0, price_type='MKT', order_type='IOC',
-                    simulation=entry['simulation'], confirmed=True))
+                with trace_scope(**timing):
+                    result = service.place_order(dict(contract_code=entry['contract_code'], action=entry['action'],
+                        quantity=entry['quantity'], price=0, price_type='MKT', order_type='IOC',
+                        simulation=entry['simulation'], confirmed=True))
                 self._update(entry['id'], state='triggered', order_id=result['id'], triggered_at=mh.iso(now), error=None)
             except Exception:
                 # Keep the claim, even if the transport accepted then lost its response.
@@ -144,6 +180,9 @@ class ClosedMinuteEntry(CurveEntryController):
         with db.session(self.service.db_path) as conn:
             conn.execute('INSERT INTO trade_curve_versions VALUES (?,?)',
                          (result['id'], self._signature(curve)))
+            fields = trace_values()
+            conn.execute('INSERT OR IGNORE INTO latency_entry_links VALUES (?,?,?)',
+                         (result['id'], fields.get('trace_id') or uuid.uuid4().hex, fields.get('command_id')))
             conn.commit()
         return result
 
@@ -162,6 +201,15 @@ class IndependentTradingService(TradingService):
         self.contract_cache = []
         self.margin_cache = {'status': 'unavailable'}
         self.last_rpc_sync = float('-inf')
+        self.latency = LatencyRecorder(self.db_path, 'trade', self.code,
+            'simulation' if self.simulation else 'production', clock=self._now, monotonic=self._monotonic)
+        self.entry_notifier.latency = self.latency
+        self._wake = threading.Event()
+        self._order_events = Queue(maxsize=1024)
+        self._order_event_overflow = threading.Event()
+        self._stale_order_events = 0
+        self._report_repair_needed = False
+        self._observed_trade_states = {}
         self.last_margin = float('-inf')
         self.bar_codes = {}
         self.curve_entry = ClosedMinuteEntry(self)
@@ -222,8 +270,7 @@ class IndependentTradingService(TradingService):
                     raise RuntimeError('正式環境憑證啟用失敗')
             sc.bind_session_down(self._api, lambda: self._session_down.set() if generation == self._generation else None)
             if hasattr(self._api, 'set_order_callback'):
-                self._api.set_order_callback(lambda *args: setattr(self, '_last_order_event_at', mh.iso(self._now()))
-                                            if generation == self._generation else None)
+                self._api.set_order_callback(lambda *args: self._capture_order_event(generation, *args))
             self._api = OrderSession(self._api, self)
             self._connected_simulation = self.simulation
             self.session_started_at = pd.Timestamp(self._now())
@@ -332,13 +379,105 @@ class IndependentTradingService(TradingService):
                 and self._api is not None and self.window() is not None)
 
     def _trades_by_id(self, *, force=False):
-        if force or self._monotonic() - self.last_rpc_sync >= self.health_settings.order_sync_seconds:
+        terminal = {'Filled', 'Cancelled', 'Failed', 'Rejected'}
+        rows = self._active_orders()
+        pending = self._report_repair_needed or any(row['entry_status'] not in terminal or
+                      row['entry_status'] == 'Filled' and not row['filled_quantity'] or
+                      row.get('exit_trade_id') and row.get('exit_status') not in terminal
+                      for row in rows)
+        interval = (self.health_settings.pending_order_sync_seconds if pending
+                    else self.health_settings.order_sync_seconds)
+        if force or self._monotonic() - self.last_rpc_sync >= interval:
             self.last_rpc_sync = self._monotonic()
+            began = self.latency.record('broker_status_query_started', generation=self._generation,
+                                        reason='forced' if force else 'pending' if pending else 'periodic')
             result = super()._trades_by_id(force=force)
+            self.latency.record('broker_status_query_completed' if self._sync_ok else 'broker_status_query_failed',
+                                started=began, generation=self._generation)
             if not self._sync_ok:
                 self._connect_error = '券商委託同步失敗，等待核對'
-            return result
-        return {str(_value(item.order, 'id', _value(item.status, 'id'))): item for item in self._api.list_trades()}
+            else:
+                self._report_repair_needed = False
+            return self._observe_trades(result, rows)
+        result = {str(_value(item.order, 'id', _value(item.status, 'id'))): item for item in self._api.list_trades()}
+        return self._observe_trades(result, rows)
+
+    def _observe_trades(self, trades, rows):
+        observed = {}
+        for row in rows:
+            for phase, key in (('entry', 'entry_trade_id'), ('exit', 'exit_trade_id')):
+                trade = trades.get(str(row.get(key)))
+                if trade is None:
+                    continue
+                quantity, price = _fill_summary(trade, confirmed_price_only=True)
+                version = (_trade_status(trade), quantity, price)
+                identity_key = (row['id'], phase)
+                observed[identity_key] = version
+                if self._observed_trade_states.get(identity_key) != version:
+                    self.latency.record('broker_cache_observed', order_id=row['id'], phase=phase,
+                        broker_trade_id=row[key], state=version[0], cumulative_quantity=quantity,
+                        generation=self._generation, **order_link(self.db_path, row['id']))
+        self._observed_trade_states = observed
+        return trades
+
+    def _capture_order_event(self, generation, *args):
+        """SDK thread: no broker I/O, database access, locks on trading, or raw payload logs."""
+        if generation != self._generation:
+            self._stale_order_events += 1
+            return
+        message = args[-1] if args and isinstance(args[-1], dict) else {}
+        order = message.get('order') if isinstance(message.get('order'), dict) else {}
+        event = dict(callback_id=uuid.uuid4().hex, generation=generation,
+                     at=mh.iso(self._now()), mono=self._monotonic(),
+                     broker_trade_id=identity(order.get('id') or message.get('trade_id')),
+                     seqno=identity(order.get('seqno') or message.get('seqno')),
+                     ordno=identity(order.get('ordno') or message.get('ordno')))
+        try:
+            self._order_events.put_nowait(event)
+        except Full:
+            self._order_event_overflow.set()
+        self._wake.set()
+
+    def drain_order_events(self):
+        if self._order_event_overflow.is_set():
+            self._order_event_overflow.clear()
+            self.latency.record('broker_callback_overflow', generation=self._generation)
+            # The same worker will repair from the broker, never replay orders.
+            self._report_repair_needed = True
+        while True:
+            try:
+                event = self._order_events.get_nowait()
+            except Empty:
+                break
+            if event['generation'] != self._generation:
+                self._stale_order_events += 1
+                self._order_events.task_done()
+                continue
+            fields = {key: value for key, value in event.items() if key not in {'at', 'mono'}}
+            self._last_order_event_at = event['at']
+            with db.read_session(self.db_path) as conn:
+                matches = conn.execute('''SELECT id FROM managed_orders WHERE code=? AND entry_trade_id=?
+                    UNION SELECT id FROM managed_orders WHERE code=? AND exit_trade_id=?
+                    UNION SELECT o.id FROM broker_order_identities b JOIN managed_orders o ON o.id=b.order_id
+                          WHERE b.seqno=? AND o.code=?
+                    UNION SELECT o.id FROM broker_order_identities b JOIN managed_orders o ON o.id=b.order_id
+                          WHERE b.ordno=? AND o.code=?''',
+                    (self.code, event['broker_trade_id'], self.code, event['broker_trade_id'],
+                     event['seqno'], self.code, event['ordno'], self.code)).fetchall()
+                verified_ids = conn.execute('SELECT entry_trade_id,exit_trade_id FROM managed_orders WHERE id=?',
+                                             (matches[0][0],)).fetchone() if len(matches) == 1 else None
+            row_id = matches[0][0] if len(matches) == 1 else None
+            fields['reported_trade_id'] = event['broker_trade_id']
+            if verified_ids is None or event['broker_trade_id'] not in tuple(verified_ids):
+                fields['broker_trade_id'] = None  # never label an unverified deal ID as an SDK order ID
+            if row_id is None:
+                self._report_repair_needed = self._reconcile_required = True
+                self._broker_ready = False
+            with trace_scope(**order_link(self.db_path, row_id), order_id=row_id):
+                self.latency.record('broker_callback_received', at=event['at'], mono=event['mono'], **fields)
+                self.latency.record('broker_callback_consumed', started=event['mono'],
+                                    reason='matched' if row_id else 'unmatched', **fields)
+            self._order_events.task_done()
 
     def closed_price(self, row):
         code = self.bar_codes.get(row['contract_code'], row['contract_code'])
@@ -592,6 +731,7 @@ class IndependentTradingService(TradingService):
 
     def process_market_update(self):
         with self._lock:
+            self.drain_order_events()
             self.load_quotes()
             self._maintain_connection()
             if self._api is not None and not self._recovery.pending and self.window() is not None:
@@ -620,6 +760,8 @@ class IndependentTradingService(TradingService):
             curve_entry=self.curve_entry.snapshot(), bars_ready=False, broker_ready=False)
         status.update(signal_mode='closed_1m', scheduled_open=self.window() is not None,
                       logout_unconfirmed=self.logout_unconfirmed, market_source='monitor_db')
+        status['latency_health'] = {**self.latency.health(), 'callback_queue': self._order_events.qsize(),
+                                   'stale_callbacks': self._stale_order_events}
         status.setdefault('mode', '模擬環境' if self.simulation else '正式環境')
         status.update(self.breakeven_settings())
         contract_bars = {code: self.closed_price({'contract_code': code}) is not None for code in self._wanted}

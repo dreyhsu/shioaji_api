@@ -237,7 +237,7 @@ class FetcherRuntime:
         self.lease.acquire()
         try:
             self.control = ServiceControl(self.db_path, f'{self.role}-fetcher', self.mode, broker=True).start()
-            self.store = FetcherStore(self.db_path)
+            self.store = FetcherStore(self.db_path, clock=self.clock, role=self.role)
             self.started = True
             self.publish(state='starting')
         except BaseException:

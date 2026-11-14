@@ -64,6 +64,40 @@ def health(r):
     return mh.read_health(r.item.publisher.path)
 
 
+def test_blocked_telegram_does_not_delay_next_minute_or_health(runtime, monkeypatch):
+    import threading
+    from alert_rules import Candidate
+    r = runtime
+    started, release = threading.Event(), threading.Event()
+    def blocked_send(message):
+        started.set()
+        assert release.wait(5)
+        return True
+    r.item.notifier.send = blocked_send
+    r.config.enable_telegram = True
+    monkeypatch.setattr(monitor.ar, 'evaluate', lambda **kwargs: [Candidate('box_enter', 'realtime-test', False, 'm')])
+    try:
+        r.put()
+        r.item.step()
+        assert started.wait(3)
+        assert health(r)['state'] == 'healthy'
+        r.now[0] = pd.Timestamp('2026-10-30 09:03:03')
+        r.mono[0] += 1
+        r.put(bar_rows('2026-10-30 09:02', '2026-10-30 09:02'))
+        r.live()
+        r.item.step()
+        assert db.last_minute_start(r.conn, 'TMFR1') == pd.Timestamp('2026-10-30 09:02')
+        current = health(r)
+        assert current['state'] == 'healthy'
+        assert pd.Timestamp(current['cycle_completed_at']) == r.now[0]
+        assert current['notifications']['in_flight'] is not None
+        assert current['notifications']['worker_alive']
+        r.item.close()
+        assert health(r)['notifications']['last_error'] == 'shutdown_delivery_unconfirmed'
+    finally:
+        release.set()
+
+
 def test_broker_history_updates_unified_bars_and_indicators_without_login(runtime):
     r = runtime
     r.put()

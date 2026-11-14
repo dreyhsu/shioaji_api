@@ -256,6 +256,21 @@ def test_telegram_master_switch_reloads(tmp_path):
     assert config.telegram_enabled
 
 
+def test_master_switch_reloads_when_editor_preserves_mtime(tmp_path):
+    path = tmp_path / 'alerts.json'
+    path.write_text('{"telegram_enabled": true}')
+    os.utime(path, (1, 1))
+    config = ar.AlertConfig(path)
+    path.write_text('{"telegram_enabled": false}')
+    os.utime(path, (1, 1))
+    assert config.reload()
+    assert not config.telegram_enabled
+    path.write_text('{"telegram_enabled": true}')
+    os.utime(path, (1, 1))
+    assert config.reload()
+    assert config.telegram_enabled
+
+
 @pytest.mark.parametrize("value", ["false", "true", None, 0, 1, {}, []])
 def test_invalid_master_switch_keeps_last_good_config(tmp_path, value):
     path = tmp_path / "alerts.json"

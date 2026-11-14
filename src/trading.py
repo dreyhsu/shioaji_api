@@ -18,6 +18,7 @@ import shioaji as sj
 from dotenv import load_dotenv
 
 import db
+from latency_trace import link_order, order_link, trace_scope
 import market_clock
 import market_health as mh
 from connection_recovery import RecoveryGate, error_kind
@@ -855,6 +856,28 @@ class TradingService:
         now = self._now().isoformat(sep=" ")
         new_fill = False
         new_exit_fill = False
+        # Callback payloads never mutate orders. Reject a regressing SDK cache
+        # view as well, while allowing new partial fills after cancellation.
+        terminal = {'Filled', 'Cancelled', 'Failed', 'Rejected'}
+        for phase, trade, quantity_key, status_key in (
+            ('entry', entry, 'filled_quantity', 'entry_status'),
+            ('exit', exit_trade, 'exit_filled_quantity', 'exit_status')):
+            if trade is None:
+                continue
+            count, _ = _fill_summary(trade, confirmed_price_only=True)
+            old_count = int(original.get(quantity_key, 0))
+            if count < old_count or (count == old_count and original.get(status_key) in terminal
+                                     and _trade_status(trade) not in terminal):
+                if phase == 'entry':
+                    entry = None
+                else:
+                    exit_trade = None
+                latency = getattr(self, 'latency', None)
+                if latency:
+                    if hasattr(self, '_report_repair_needed'):
+                        self._report_repair_needed = True
+                    latency.record('broker_cache_regression_ignored', order_id=row_id, phase=phase,
+                        cumulative_quantity=count, **order_link(self.db_path, row_id))
         updates: dict[str, Any] = {"updated_at": now}
         if entry is not None:
             filled, avg = _fill_summary(entry, confirmed_price_only=True)
@@ -940,6 +963,24 @@ class TradingService:
                     pass  # incomplete reports cannot erase previously verified fills
             conn.commit()
 
+        if new_fill or new_exit_fill:
+            latency = getattr(self, 'latency', None)
+            if latency is not None:
+                fields = order_link(self.db_path, row_id)
+                for phase, changed, key in (('entry', new_fill, 'filled_quantity'),
+                                             ('exit', new_exit_fill, 'exit_filled_quantity')):
+                    if changed:
+                        broker_stamp = None
+                        try:
+                            with db.read_session(self.db_path) as conn:
+                                broker_stamp = conn.execute('SELECT MAX(filled_at) FROM pnl_fills WHERE order_id=? AND phase=?',
+                                                            (row_id, phase)).fetchone()[0]
+                        except Exception as error:
+                            latency.error = type(error).__name__
+                        latency.record('fill_persisted', order_id=row_id, phase=phase,
+                            broker_trade_id=original['entry_trade_id'] if phase == 'entry' else original.get('exit_trade_id'),
+                            cumulative_quantity=updates[key], broker_filled_at=broker_stamp,
+                            generation=self._generation, **fields)
         if new_fill:
             self.entry_notifier.notify(self._active_order(row_id))
         if new_exit_fill:
@@ -1161,6 +1202,8 @@ class TradingService:
             conn.commit()
         if not cursor.rowcount:
             return
+        began = None
+        sdk_completed = False
         try:
             contract = self._find_contract(row["contract_code"])
             action = self._sdk.Action.Sell if row["action"] == "Buy" else self._sdk.Action.Buy
@@ -1174,7 +1217,15 @@ class TradingService:
                 account=self._api.futopt_account,
             )
             kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
+            latency = getattr(self, 'latency', None)
+            timing = order_link(self.db_path, row['id']) if latency else {}
+            began = latency.record('sdk_order_started', order_id=row['id'], phase='exit',
+                                    generation=self._generation, **timing) if latency else None
             trade = self._api.place_order(contract, order, **kwargs)
+            sdk_completed = True
+            if latency:
+                latency.record('sdk_order_completed', started=began, order_id=row['id'], phase='exit',
+                    broker_trade_id=str(_trade_id(trade)), state=_trade_status(trade), generation=self._generation, **timing)
             trade_id = _trade_id(trade)
             if not trade_id:
                 raise RuntimeError("Shioaji 沒有回傳平倉委託編號")
@@ -1185,6 +1236,9 @@ class TradingService:
                 )
                 conn.commit()
         except Exception as error:  # noqa: BLE001 - don't blindly retry an uncertain order
+            if getattr(self, 'latency', None) is not None and began is not None:
+                self.latency.record('order_result_persist_failed' if sdk_completed else 'sdk_order_failed', order_id=row['id'], phase='exit',
+                    started=began, error_type=type(error).__name__, generation=self._generation, **timing)
             self._broker_ready = False
             self._reconcile_required = True
             self._reconcile_error = "出場送單結果待券商核對；不自動重送"
@@ -1500,20 +1554,33 @@ class TradingService:
                  int(self.auto_exit_enabled()), int(self.simulation), tick,
                  f"unresolved:{row_id}", "submitting", now, now),
             )
+            if getattr(self, 'latency', None) is not None:
+                link_order(conn, row_id)
             conn.commit()
         # Persist intent BEFORE broker I/O. A crash, timeout or failed DB update
         # leaves this claim visible and blocks repeat entry across restarts.
+        sdk_completed = False
         try:
+            latency = getattr(self, 'latency', None)
+            began = latency.record('sdk_order_started', order_id=row_id, phase='entry',
+                                    generation=self._generation) if latency else None
             result = place_order(
                 order_request, context=OrderContext(canonical_code, tick, self.simulation),
                 broker=ShioajiOrderAdapter(api, contract, sdk=self._sdk,
                                            timeout_ms=self.health_settings.api_timeout_ms if self.api_factory is None else None),
             )
+            sdk_completed = True
+            if latency:
+                latency.record('sdk_order_completed', started=began, order_id=row_id, phase='entry',
+                                broker_trade_id=result.trade_id, state=result.status, generation=self._generation)
             with db.session(self.db_path) as conn:
                 conn.execute("UPDATE managed_orders SET entry_trade_id = ?, entry_status = ?, price = ? WHERE id = ?",
                              (result.trade_id, result.status, result.price, row_id))
                 conn.commit()
-        except Exception:
+        except Exception as error:
+            if getattr(self, 'latency', None) is not None:
+                self.latency.record('order_result_persist_failed' if sdk_completed else 'sdk_order_failed', order_id=row_id, phase='entry',
+                                    started=began, error_type=type(error).__name__, generation=self._generation)
             self._broker_ready = False
             self._reconcile_required = True
             self._reconcile_error = "進場送單結果待券商核對；不自動重送"

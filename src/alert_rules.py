@@ -96,7 +96,7 @@ def merge_config(user: dict | None) -> dict:
 
 
 class AlertConfig:
-    """The JSON config, re-read whenever the file's mtime changes.
+    """The JSON config, re-read whenever its file version changes.
 
     Tuning a threshold should not need a monitor restart, and a typo in the file
     should not take alerts down: a file that fails to parse keeps the last good
@@ -105,7 +105,7 @@ class AlertConfig:
 
     def __init__(self, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
         self.path = Path(path)
-        self._mtime: float | None = None
+        self._version: tuple[int, int, int] | None = None
         self.data: dict = merge_config(None)
         self.last_error: str | None = None
         self.reload()
@@ -113,15 +113,16 @@ class AlertConfig:
     def reload(self) -> bool:
         """Re-read if the file changed; returns whether a new config was loaded."""
         try:
-            mtime = self.path.stat().st_mtime
+            stat = self.path.stat()
+            version = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         except FileNotFoundError:
-            if self._mtime is not None or self.last_error is None:
+            if self._version is not None or self.last_error is None:
                 self.last_error = f"{self.path} not found; using defaults"
-            self._mtime = None
+            self._version = None
             return False
-        if mtime == self._mtime:
+        if version == self._version:
             return False
-        self._mtime = mtime
+        self._version = version
         try:
             self.data = merge_config(json.loads(self.path.read_text(encoding="utf-8")))
             self.last_error = None

@@ -49,6 +49,8 @@ from service_control import ServiceControl, run_server
 from runtime_config import RuntimeConfig, DEFAULT_RUNTIME
 from dashboard_config import DashboardConfig
 from trade_client import TradeClient, command_id
+from latency_trace import LatencyRecorder, identity, order_link, trace_scope
+from starlette.concurrency import run_in_threadpool
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
                             TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
 from mock_routes import router as mock_router
@@ -113,10 +115,76 @@ app.include_router(create_pnl_router(_pnl_context))
 @app.middleware('http')
 async def trading_identity(request: Request, call_next):
     token = command_id.set(request.headers.get('Idempotency-Key'))
+    recorder = _latency_recorder() if request.url.path.startswith('/api/trading/') else None
+    trace_id = identity(request.headers.get('Idempotency-Key') or request.headers.get('X-Trace-Id'))
+    began = recorder.record('dashboard_request_received', trace_id=trace_id, command_id=command_id.get()) if recorder else None
     try:
-        return await call_next(request)
+        with trace_scope(trace_id=trace_id, command_id=command_id.get()):
+            response = await call_next(request)
+        if recorder:
+            recorder.record('dashboard_response_ready', started=began, trace_id=trace_id,
+                            command_id=command_id.get(), state=str(response.status_code))
+        return response
     finally:
         command_id.reset(token)
+        if recorder:
+            await run_in_threadpool(recorder.flush)
+
+
+def _latency_recorder():
+    key = (str(Path(CONFIG['db_path']).resolve()), CONFIG['code'], CONFIG.get('mode', 'simulation'))
+    cached = getattr(app.state, 'latency_recorder', None)
+    if cached is None or cached[0] != key:
+        cached = (key, LatencyRecorder(CONFIG['db_path'], 'dashboard', key[1], key[2], clock=_dashboard_now))
+        app.state.latency_recorder = cached
+    return cached[1]
+
+
+class BrowserLatencyIn(BaseModel):
+    event: Literal['browser_command_completed', 'browser_orders_rendered']
+    command_id: str | None = Field(default=None, max_length=128)
+    order_id: str | None = Field(default=None, max_length=128)
+    snapshot_id: str | None = Field(default=None, max_length=64)
+    client_elapsed_ms: float = Field(ge=0, le=86400000, allow_inf_nan=False)
+    client_observed_at: str = Field(max_length=64, pattern=r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\+08:00$')
+
+
+@app.post('/api/latency/browser', status_code=204)
+def api_browser_latency(body: BrowserLatencyIn):
+    # Client timing is diagnostic only; it cannot renew health or change orders.
+    if _mock_runtime() is not None:
+        return
+    with db.read_session(CONFIG['db_path']) as conn:
+        if body.event == 'browser_command_completed':
+            row = conn.execute('SELECT code,mode FROM trade_commands WHERE id=?', (body.command_id,)).fetchone()
+        else:
+            row = conn.execute('SELECT code,simulation FROM managed_orders WHERE id=?', (body.order_id,)).fetchone()
+        if row is None or row[0] != CONFIG['code']:
+            return
+        mode = row[1] if body.event == 'browser_command_completed' else ('simulation' if row[1] else 'production')
+        if mode != CONFIG.get('mode', 'simulation'):
+            return
+    fields = order_link(CONFIG['db_path'], body.order_id) if body.order_id else dict(trace_id=body.command_id, command_id=body.command_id)
+    _latency_recorder().record(body.event, order_id=body.order_id, snapshot_id=identity(body.snapshot_id),
+        client_elapsed_ms=body.client_elapsed_ms, client_observed_at=body.client_observed_at, **fields)
+    _latency_recorder().flush()
+
+
+@app.get('/api/latency')
+def api_latency(trace_id: str | None = None, order_id: str | None = None):
+    import json
+    trace_id = identity(trace_id)
+    if order_id:
+        trace_id = order_link(CONFIG['db_path'], order_id).get('trace_id')
+    if not trace_id and not order_id:
+        return []
+    clause, params = 'trace_id=?', [trace_id]
+    if order_id:
+        clause, params = '(trace_id=? OR order_id=?)', [trace_id, order_id]
+    with db.read_session(CONFIG['db_path']) as conn:
+        rows = conn.execute(f'''SELECT * FROM latency_events WHERE {clause} AND code=? AND mode=?
+            ORDER BY occurred_at,id LIMIT 500''', [*params, CONFIG['code'], CONFIG.get('mode', 'simulation')]).fetchall()
+    return [{**dict(row), 'document': json.loads(row['document'])} for row in rows]
 
 
 @app.get('/api/trading/commands/{identity}')

@@ -20,6 +20,7 @@ import monitor
 import patterns as pt
 import snr_core as snr
 import session_bars as sb
+import telegram_notify as tg
 from box_watch import BoxWatcher, BoxWatchConfig
 
 SUPPORT_BOX = {
@@ -320,6 +321,20 @@ def alerts(tmp_path):
     return ar.AlertConfig(tmp_path / "defaults.json")  # missing file = defaults
 
 
+@pytest.fixture
+def inline_notifier(conn):
+    """Deliver inline only in rule-wiring tests; real worker tests cover scheduling."""
+    class Sender:
+        def set_enabled(self, enabled):
+            pass
+        def submit(self, alert_id, message):
+            db.mark_alert_sent(conn, alert_id, tg.send_message(message))
+            return True
+        def record_error(self, reason):
+            pass
+    return Sender()
+
+
 def candidate(rule="support_bottom_third", key="support:1", once=False):
     return ar.Candidate(rule=rule, key=key, once=once, message="m")
 
@@ -329,48 +344,48 @@ def at(minute):
 
 
 @pytest.mark.parametrize("once", [False, True])
-def test_config_pause_does_not_consume_alert_history(conn, config, alerts, monkeypatch, once):
+def test_config_pause_does_not_consume_alert_history(conn, config, alerts, monkeypatch, once, inline_notifier):
     config.enable_telegram = True
     messages = []
-    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
     hit = candidate(
         rule="trendline_break_below_up" if once else "support_bottom_third",
         key="line:3" if once else "support:1",
         once=once,
     )
     alerts.data["telegram_enabled"] = False
-    assert not monitor.send_rule(conn, config, alerts, hit, at("15:00"))
+    assert not monitor.send_rule(conn, config, alerts, hit, at("15:00"), notifier=inline_notifier)
     assert db.load_alerts(conn, config.code).empty
     assert messages == []
 
     alerts.data["telegram_enabled"] = True
-    assert monitor.send_rule(conn, config, alerts, hit, at("15:01"))
+    assert monitor.send_rule(conn, config, alerts, hit, at("15:01"), notifier=inline_notifier)
     assert messages == ["m"]
     assert len(db.load_alerts(conn, config.code)) == 1
-    assert not monitor.send_rule(conn, config, alerts, hit, at("15:02"))
+    assert not monitor.send_rule(conn, config, alerts, hit, at("15:02"), notifier=inline_notifier)
     assert messages == ["m"]
 
 
-def test_check_alerts_reloads_master_switch(conn, config, tmp_path, monkeypatch):
+def test_check_alerts_reloads_master_switch(conn, config, tmp_path, monkeypatch, inline_notifier):
     config.enable_telegram = True
     path = tmp_path / "alerts.json"
     path.write_text(json.dumps({"telegram_enabled": True}))
     alerts = ar.AlertConfig(path)
     messages = []
-    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
     state = make_state(101, 103, 102)
     db.replace_boxes(conn, config.code, state.boxes)
 
     path.write_text(json.dumps({"telegram_enabled": False}))
     os.utime(path, (1, 1))
-    assert monitor.check_alerts(conn, config, alerts, state) == 0
+    assert monitor.check_alerts(conn, config, alerts, state, notifier=inline_notifier) == 0
     assert messages == []
     assert db.load_alerts(conn, config.code).empty
 
     path.write_text(json.dumps({"telegram_enabled": True}))
     os.utime(path, (2, 2))
     state = make_state(101, 103, 102, minute="2026-10-08 15:01")
-    assert monitor.check_alerts(conn, config, alerts, state) == 1
+    assert monitor.check_alerts(conn, config, alerts, state, notifier=inline_notifier) == 1
     assert len(messages) == 1
     assert list(db.load_alerts(conn, config.code)["hour_start"]) == ["2026-10-08 15:01:00"]
 
@@ -380,7 +395,7 @@ def test_no_telegram_overrides_enabled_config(conn, alerts, monkeypatch, tmp_pat
     runtime.write_text(json.dumps({"mode": "mock"}))
     config = monitor.parse_args(["--no-telegram", "--runtime-config", str(runtime)])
     messages = []
-    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
     assert alerts.telegram_enabled
     assert not monitor.send_rule(conn, config, alerts, candidate(), at("15:00"))
     assert messages == []
@@ -435,11 +450,11 @@ def test_check_alerts_wires_box_rules(conn, config, alerts):
     assert kinds == ["box_in_out", "support_bottom_third"]
 
 
-def test_latest_broken_box_sends_each_entry_exit_and_deduplicates_repolls(conn, config, monkeypatch):
+def test_latest_broken_box_sends_each_entry_exit_and_deduplicates_repolls(conn, config, monkeypatch, inline_notifier):
     alerts = ar.AlertConfig(ar.DEFAULT_CONFIG_PATH)
     config.enable_telegram = True
     messages = []
-    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
     # Older intact box is elsewhere; the broken newest box still extends on the chart.
     old = dict(SUPPORT_BOX, box_id=1, top=210, bottom=200)
     latest = dict(SUPPORT_BOX, box_id=2, top=110, bottom=100, state="broken")
@@ -447,8 +462,8 @@ def test_latest_broken_box_sends_each_entry_exit_and_deduplicates_repolls(conn, 
     for stamp, close in [("15:01", 108), ("15:02", 120), ("15:03", 108), ("15:04", 99)]:
         state = make_state(close, close, close, boxes=[old, latest], minute=f"2026-10-08 {stamp}")
         state.minute_bars = pd.concat([previous, state.minute_bars], ignore_index=True)
-        assert monitor.check_alerts(conn, config, alerts, state) == 1
-        assert monitor.check_alerts(conn, config, alerts, state) == 0
+        assert monitor.check_alerts(conn, config, alerts, state, notifier=inline_notifier) == 1
+        assert monitor.check_alerts(conn, config, alerts, state, notifier=inline_notifier) == 0
         previous = state.minute_bars
     assert len(messages) == 4
     assert all("[15m] #2" in message for message in messages)
@@ -458,11 +473,11 @@ def test_latest_broken_box_sends_each_entry_exit_and_deduplicates_repolls(conn, 
 
 @pytest.mark.parametrize("timeframe, interval", [("1m", 1), ("5m", 5), ("15m", 15), ("1h", 60)])
 def test_check_alerts_sends_saved_curves_once_in_each_timeframe(
-    conn, config, alerts, monkeypatch, timeframe, interval,
+    conn, config, alerts, monkeypatch, timeframe, interval, inline_notifier,
 ):
     config.enable_telegram = True
     messages = []
-    monkeypatch.setattr(monitor.tg, "send_message", lambda message: messages.append(message) or True)
+    monkeypatch.setattr(tg, "send_message", lambda message: messages.append(message) or True)
     start = at("15:00")
     line_id = db.insert_trendline(conn, config.code, [
         {"time": int((start + pd.Timedelta(minutes=i * interval)).timestamp()), "price": 100 + i * 10}
@@ -476,7 +491,7 @@ def test_check_alerts_sends_saved_curves_once_in_each_timeframe(
         for column in ("open", "high", "low", "close", "volume"):
             state.minute_bars[column] = 50.0
         state.hourly = monitor.sb.minute_bars_to_hourly(state.minute_bars)
-        assert monitor.check_alerts(conn, config, alerts, state) == expected
+        assert monitor.check_alerts(conn, config, alerts, state, notifier=inline_notifier) == expected
     assert len(messages) == 1
     assert f"[{timeframe}]" in messages[0]
     history = db.load_alerts(conn, config.code)

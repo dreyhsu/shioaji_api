@@ -1,8 +1,35 @@
 # 獨立 trade 服務
 
-
 模式改由 `config/runtime.json` 控制（預設 Mock），不接受模式命令列參數。整體啟動與設定以 [runtime_and_dashboard.md](runtime_and_dashboard.md) 為準；以下個別服務命令只會在設定為非 Mock 時連線。
 2026-11-01。使用 conda `tss`，支援 macOS／Windows；正式部署於 Windows laptop。本次只做離線開發與測試，未登入券商、送單或部署。
+
+## 延遲追蹤與成交回報喚醒（2026-11-14，P2）
+
+`latency_events` 保存新的端到端診斷事件，`latency_order_links`／`latency_entry_links` 保存本機委託及啟用曲線與原指令的關聯。手動委託沿用持久化 command ID 作 trace ID；曲線進場沿用啟用指令的 trace，另記 `signal_minute`。舊單沒有歷史 trace 時仍可按本機 order ID 查新事件，不補造舊時間或 SDK ID。
+
+時間點包含 Dashboard 收到請求／回應就緒、command accepted／processing／completed、訊號判斷開始／完成、SDK 進出場與撤單開始／完成／失敗、券商查詢、SDK cache 首次觀察到狀態變更、callback 接收／消化、成交成功保存、快照發布、瀏覽器呈現及 Telegram 開始／完成。追蹤區分 SDK 成功後的本機保存失敗，不把後者記為券商拒單。`snapshot_published` 表示已提交快照；每單狀態版本改變另記 `order_snapshot_published`。
+
+所有服務端 `occurred_at` 明確使用 Asia/Taipei `+08:00`。每筆有追蹤 recorder 的 `instance`，交易事件另記 session generation；fetcher／monitor 保留來源 instance／generation。`monotonic_ns` 與 `elapsed_ms` 只可在同一 recorder instance 內比較；重啟不延用舊 monotonic 起點，跨程序採事件牆鐘，須考慮系統校時。SDK cache 的事件表示本機第一次讀到該版本，不代表能觀察到 SDK 內部真正改寫的瞬間。
+
+callback 僅擷取白名單識別欄位、接收時間並放入最多 1,024 筆的記憶體佇列，設定 wake event；不執行券商 I/O、SQLite 或持有風控鎖。原 `independent-trade` worker 在喚醒後消化事件、讀 SDK cache、保存成交與發布快照。重複／亂序 callback 不直接修改成交，舊世代丟棄；SDK cache 的累計成交口數或已終結狀態若倒退，不覆蓋已確認結果。佇列滿會留下診斷並要求原 worker 補查；不從 callback 下單或重送。
+
+`config/market_health.json` 新增 `pending_order_sync_seconds`，預設 2 秒。只有未終結／未完整確認委託或需要回報修復時採此間隔補查；終結後回到原 `order_sync_seconds`，正常 callback 仍優先讀 cache。既有新倉前強制核對保持不變。喚醒可省去閒置時的 0.5 秒輪詢等待，無法中斷正在等待的 SDK 呼叫，也不改收定 1 分 K 規則。
+
+追蹤使用每 recorder 最多 4,096 筆的記憶體緩衝及短 SQLite 等待；儲存故障／滿載只記診斷 error／dropped，不阻斷送單、通知或登出。`status.latency_health` 顯示緩衝及 callback 資訊。無憑證、帳號或任意 exception／callback 全文；只保存白名單識別及狀態。診斷表目前不自動輪替，需納入 DB 容量管理；來源原始稽核事件維持既有保存規則。
+
+fetcher 在 acquisition DB 記錄 `bar_published` 與理論 `closed_at`，monitor 在 unified DB 記錄採用／就緒及來源發布時間；可依商品與分鐘串連。理論 K 收盤時間是 metadata，不冒充曾在該瞬間收到事件；舊 fetcher 無紀錄時保留未知。Telegram 完成表示本機記錄傳送結果，不是手機彈出時間。瀏覽器透過兩次 animation frame 回報呈現取樣與 `performance.now()` 間隔；背景分頁可延遲取樣，客戶端資料僅作診斷，不更新健康或作交易判斷。P3 的畫面等待拆分及 SSE 尚未實作。
+
+唯讀查詢（不登入券商）：
+
+```text
+conda run -n tss python tools/trace_latency.py --order-id <本機委託ID>
+conda run -n tss python tools/trace_latency.py --command-id <指令ID>
+conda run -n tss python tools/trace_latency.py --signal-minute "2026-11-13 12:28:00" --code TMFR1 --fetcher-db data/market_fetchers.db
+conda run -n tss python tools/trace_latency.py --snapshot-id <快照ID>
+```
+
+Dashboard `GET /api/latency?order_id=...` 或 `?trace_id=...` 只讀本模式／商品的紀錄；瀏覽器回報使用 `POST /api/latency/browser`，只接收既有指令／委託的診斷欄位。服務下次正常啟動後生效；本次未登入券商、下單或重啟正式服務。測試寫入同樣經過 `db.connect` 的暫存 DB 保護，並另測正式 DB 路徑會被拒絕。
+
 
 ## 分工
 

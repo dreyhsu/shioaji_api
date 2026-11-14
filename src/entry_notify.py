@@ -13,6 +13,7 @@ import threading
 import db
 from alert_rules import AlertConfig, DEFAULT_CONFIG_PATH
 import telegram_notify as tg
+from latency_trace import order_link
 
 
 class EntryNotifier:
@@ -21,6 +22,7 @@ class EntryNotifier:
         self.enabled = enabled
         self.config = AlertConfig(alerts_path)
         self.dispatch = dispatch or self._background
+        self.latency = None
 
     @staticmethod
     def _background(task):
@@ -55,12 +57,17 @@ class EntryNotifier:
                     box_id=None, visit_id=None, kind=f"{phase}_fill", message=message,
                 )
             if alert_id is not None:
-                self.dispatch(lambda: self._deliver(alert_id, message))
+                timing = dict(order_id=row['id'], phase=phase, alert_id=alert_id,
+                              cumulative_quantity=quantity, **order_link(self.db_path, row['id']))
+                if self.latency:
+                    self.latency.record('notification_queued', **timing)
+                self.dispatch(lambda: self._deliver(alert_id, message, timing))
         except Exception as error:  # notification failures cannot interrupt trading
             print(f"[Telegram] {phase} notification failed: {type(error).__name__}")
 
-    def _deliver(self, alert_id, message):
+    def _deliver(self, alert_id, message, timing=None):
         ok = False
+        began = self.latency.record('notification_started', **(timing or {})) if self.latency else None
         try:
             ok = tg.send_message(message)
         except Exception as error:
@@ -70,3 +77,7 @@ class EntryNotifier:
                 db.mark_alert_sent(conn, alert_id, ok)
         except Exception as error:
             print(f"[Telegram] Fill delivery status failed: {type(error).__name__}")
+        if self.latency:
+            self.latency.record('notification_completed', started=began,
+                                state='succeeded' if ok else 'failed', **(timing or {}))
+            self.latency.flush()

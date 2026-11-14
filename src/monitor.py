@@ -25,7 +25,8 @@ import patterns as pt
 import session_bars as sb
 import snr_core as snr
 import gap_zones
-import telegram_notify as tg
+from monitor_notify import MonitorNotifier
+from latency_trace import LatencyRecorder
 import market_health as mh
 from connection_recovery import error_kind
 from box_watch import BoxWatcher, BoxWatchConfig
@@ -168,8 +169,21 @@ class BookRecorder:
         pass
 
 
-def send_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar.Candidate, minute_start) -> bool:
-    """Send one rule hit unless it is inside its cooldown or already sent once.
+def send_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar.Candidate, minute_start,
+              *, notifier=None) -> bool:
+    try:
+        return _enqueue_rule(conn, config, alerts, candidate, minute_start, notifier=notifier)
+    except Exception as error:
+        reason = f'notification_claim_{type(error).__name__}'
+        if notifier is not None:
+            notifier.record_error(reason)
+        log(f"  telegram {candidate.rule}: {reason}")
+        return False
+
+
+def _enqueue_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar.Candidate, minute_start,
+                  *, notifier=None) -> bool:
+    """Claim and enqueue a rule hit; True means accepted, not delivered.
 
     Both checks read the alert rows back, measured on the triggering minute
     rather than the wall clock, so a restart or a replay throttles the same way.
@@ -200,18 +214,22 @@ def send_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate: ar
         db.mark_alert_sent(conn, alert_id, False)
         log(f"  [telegram disabled] would send {candidate.rule} ({candidate.key})")
         return False
-    ok = tg.send_message(candidate.message)
-    db.mark_alert_sent(conn, alert_id, ok)
-    log(f"  telegram {candidate.rule} ({candidate.key}): {'sent' if ok else 'FAILED'}")
-    return ok
+    if notifier is not None and notifier.submit(alert_id, candidate.message):
+        log(f"  telegram {candidate.rule} ({candidate.key}): queued alert={alert_id}")
+        return True
+    db.mark_alert_sent(conn, alert_id, False)
+    log(f"  telegram {candidate.rule} ({candidate.key}): not queued alert={alert_id}")
+    return False
 
 
-def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "MarketState") -> int:
-    """Evaluate every rule on the newest minute and send what is owed."""
+def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "MarketState", *, notifier=None) -> int:
+    """Evaluate the newest minute; delivery never runs on this thread."""
     if alerts.reload():
         log(f"  alert config loaded from {alerts.path}")
     if alerts.last_error:
         log(f"  WARNING alert config: {alerts.last_error}")
+    if notifier is not None:
+        notifier.set_enabled(config.enable_telegram and alerts.telegram_enabled)
     if not alerts.telegram_enabled:
         return 0
     minute = state.latest_minute
@@ -233,7 +251,7 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
         gap_zones.collect(state.hourly, market_clock.now()), config.code,
         minute['minute_start'], alerts))
     return sum(
-        send_rule(conn, config, alerts, candidate, minute["minute_start"])
+        send_rule(conn, config, alerts, candidate, minute["minute_start"], notifier=notifier)
         for candidate in candidates
     )
 
@@ -399,7 +417,7 @@ def detect_reversals(
 
 def run_cycle(
     api, contract, conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder,
-    alerts: ar.AlertConfig, *, fresh=None, allow_signals=True,
+    alerts: ar.AlertConfig, *, fresh=None, allow_signals=True, notifier=None,
 ) -> MarketState:
     now = market_clock.now()
 
@@ -432,7 +450,7 @@ def run_cycle(
         for box_type in SIDES:
             handle_side(conn, config, state, watchers[box_type], recorder)
         detect_reversals(conn, config, state, watchers, recorder)
-        check_alerts(conn, config, alerts, state)
+        check_alerts(conn, config, alerts, state, notifier=notifier)
     return state
 
 
@@ -472,7 +490,12 @@ class MonitorRuntime:
     """Unify fetcher data and audit events without a broker connection."""
     def __init__(self, conn, config, *, settings=None, calendar=None,
                  clock=market_clock.now, monotonic=time.monotonic, publisher=None):
+        self._closed = False
         self.conn, self.config = conn, config
+        self.latency = LatencyRecorder(config.db_path, 'monitor', config.code, config.mode,
+                                       clock=clock, monotonic=monotonic)
+        self._latency_minute = None
+        self._published_marks = []
         self.settings = settings or mh.load_settings(config.health_config)
         self.calendar = calendar
         self.clock, self.monotonic = clock, monotonic
@@ -530,6 +553,13 @@ class MonitorRuntime:
         try:
             self.control = ServiceControl(config.db_path, f'monitor-{config.code}', config.mode).start()
         except BaseException:
+            self.publisher.close()
+            raise
+        try:
+            self.notifier = MonitorNotifier(config.db_path, config.alerts_config,
+                enabled=config.enable_telegram and self.alerts.telegram_enabled, logger=log)
+        except BaseException:
+            self.control.close()
             self.publisher.close()
             raise
 
@@ -618,6 +648,10 @@ class MonitorRuntime:
                     (self.config.code, self.config.mode, mh.iso(self.since))).fetchall()
             quotes = source.execute('SELECT * FROM market_latest_quotes WHERE mode=?',
                                     (self.config.mode,)).fetchall()
+            if source.execute("SELECT 1 FROM sqlite_master WHERE name='latency_events'").fetchone():
+                self._published_marks = [dict(row) for row in source.execute('''SELECT occurred_at,document,instance,generation
+                    FROM latency_events WHERE code=? AND mode=? AND event='bar_published'
+                    ORDER BY rowid DESC LIMIT 8''', (self.config.code, self.config.mode))]
         minute = now.floor('min')
         if not reload and minute == self._source_minute:
             return self._source_frame, quotes
@@ -702,9 +736,15 @@ class MonitorRuntime:
         return True, None
 
     def step(self):
+        if self._closed:
+            return
         now = pd.Timestamp(self.clock())
         try:
             self._audit_events()  # audit survives even when the acquisition DB is unavailable
+            # Observe pauses even when no new minute triggers an indicator cycle.
+            if self.alerts.reload():
+                log(f"  alert config loaded from {self.alerts.path}")
+            self.notifier.set_enabled(self.config.enable_telegram and self.alerts.telegram_enabled)
             if self.monotonic() - self.last_fetch < self.config.poll_seconds:
                 return
             calendar = self._load_calendar()
@@ -717,6 +757,7 @@ class MonitorRuntime:
                 VALUES (?,?,?,?,?,?,?,?)''', [tuple(row) for row in quotes])
             self.conn.commit()
             self._applied_frame, self._applied_rows = fresh, applied_rows
+            adopted_at, adopted_mono = self.clock(), self.monotonic()
             version = (db.chart_versions(self.conn, self.config.code)[0], self.since)
             if version != self._validation_version:
                 self._validation_bars = db.load_minute_bars(self.conn, self.config.code, since=mh.iso(self.since))
@@ -730,7 +771,7 @@ class MonitorRuntime:
             ready = validation['ready'] and stream_ready
             if self.last_frame is None or (fresh is not self.last_frame and not fresh.equals(self.last_frame)) or (ready and not self.signals_ready):
                 self.last_state = run_cycle(None, None, self.conn, self.config, self.watchers, self.recorder,
-                                           self.alerts, fresh=pd.DataFrame(), allow_signals=ready)
+                                           self.alerts, fresh=pd.DataFrame(), allow_signals=ready, notifier=self.notifier)
             self.last_frame = fresh
             self.signals_ready = ready
             state = self.last_state
@@ -741,8 +782,33 @@ class MonitorRuntime:
                 unverified_stream_minutes=unverified, ready_since=self.ready_since,
                 stream_ready=stream_ready, stream_error=stream_error,
                 incomplete_tick_minutes=len(self.incomplete_stream_minutes),
+                notifications=self.notifier.snapshot(),
                 fetcher_db=str(Path(self.config.fetcher_db).resolve()), cycle_completed_at=mh.iso(self.clock()),
                 book={'required': False, 'fresh': None, 'error': 'fetcher bidask integration pending'})
+            if not fresh.empty:
+                latest = fresh.iloc[-1]
+                minute_start = str(pd.Timestamp(latest['minute_start']))
+                key = (minute_start, version, ready)
+                if key != self._latency_minute:
+                    import json
+                    fields = dict(trace_id=f'market:{self.config.code}:{minute_start}', minute_start=minute_start,
+                                  source=latest['source'], closed_at=str(pd.Timestamp(minute_start) + pd.Timedelta(minutes=1)))
+                    for mark in self._published_marks:
+                        try:
+                            details = json.loads(mark['document'])
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(details, dict):
+                            continue
+                        if details.get('minute_start') == minute_start and details.get('source') == latest['source']:
+                            fields.update(published_at=mark['occurred_at'], source_instance=details.get('source_instance'),
+                                          source_generation=mark['generation'])
+                            break
+                    self.latency.record('monitor_adopted', at=adopted_at, mono=adopted_mono, source_revision=version[0], **fields)
+                    if ready:
+                        self.latency.record('monitor_ready', started=adopted_mono, ready_at=mh.iso(self.clock()), **fields)
+                    self._latency_minute = key
+            self.latency.flush()
             return state
         except Exception as error:
             self.conn.rollback()
@@ -751,13 +817,21 @@ class MonitorRuntime:
             log(f'fetch monitor failed: {error_kind(error)}: {type(error).__name__}')
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._audit_events()
         finally:
             try:
-                self.control.close()
+                self.notifier.close()
+                self.latency.flush()
+                self.publisher.publish(notifications=self.notifier.snapshot())
             finally:
-                self.publisher.close()
+                try:
+                    self.control.close()
+                finally:
+                    self.publisher.close()
 
 def parse_args(argv: list[str] | None = None) -> MonitorConfig:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])

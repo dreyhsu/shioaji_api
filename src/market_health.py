@@ -39,6 +39,7 @@ class HealthSettings:
     book_stale_seconds: float = 60
     heartbeat_seconds: float = 180
     order_sync_seconds: float = 60
+    pending_order_sync_seconds: float = 2
     operation_timeout_seconds: float = 120
     api_timeout_ms: int = 30000
     recovery_failure_threshold: int = 2
@@ -289,7 +290,8 @@ def fingerprint():
     sources = {}
     for name in ("monitor.py", "dashboard.py", "trading.py", "shioaji_client.py", "market_health.py", "connection_recovery.py",
                  "db.py", "orderbook.py", "session_bars.py", "market_clock.py", "curve_entry.py", "curve_entry_controller.py",
-                 "shioaji_order_adapter.py", "place_order.py", "file_lease.py", "external_reconciliation.py"):
+                 "shioaji_order_adapter.py", "place_order.py", "file_lease.py", "external_reconciliation.py",
+                 "monitor_notify.py", "alert_rules.py", "latency_trace.py", "trade.py", "trade_service.py"):
         sources[name] = hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, timeout=2).stdout.strip()

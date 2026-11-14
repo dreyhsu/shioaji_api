@@ -6,6 +6,7 @@
   "book_stale_seconds": 60,
   "heartbeat_seconds": 180,
   "order_sync_seconds": 60,
+  "pending_order_sync_seconds": 2,
   "operation_timeout_seconds": 120,
   "api_timeout_ms": 30000,
   "recovery_failure_threshold": 2,

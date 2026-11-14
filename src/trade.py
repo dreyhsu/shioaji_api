@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 import threading
+import uuid
 
 import pandas as pd
 
@@ -25,6 +26,7 @@ from service_control import ServiceControl, run_server
 from runtime_config import RuntimeConfig, DEFAULT_RUNTIME, skip_mock
 from market_fetcher import FetcherSettings, DEFAULT_CONFIG, taipei_now
 from trade_service import IndependentTradingService
+from latency_trace import trace_scope, order_link, link_order
 from trading import RiskConfirmation, RiskConflict
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
                             TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
@@ -76,15 +78,22 @@ class TradeRuntime:
         self.thread = None
         self.closed = False
         self.last_window = None
+        self._accepted_mono = {}
+        self._timing_lock = threading.Lock()
+        self._published_order_versions = {}
         service._health = mh.HealthPublisher(service.db_path, 'trading', service.code, self.mode, clock=service._now)
         service._health.acquire()  # also excludes the legacy embedded trading owner
         try:
             service.control = ServiceControl(service.db_path, f'trading-{service.code}', self.mode, broker=True).start()
             with db.session(service.db_path) as conn:
                 conn.executescript(SCHEMA)
+                interrupted = conn.execute("SELECT id FROM trade_commands WHERE state='processing' AND code=? AND mode=?",
+                                           (service.code, self.mode)).fetchall()
                 conn.execute("UPDATE trade_commands SET state='unknown', result=?, http_status=409 WHERE state='processing' AND code=? AND mode=?",
                              (json.dumps({'detail': '程序中斷，指令結果待核對；不自動重送'}), service.code, self.mode))
                 conn.commit()
+            for row in interrupted:
+                service.latency.record('command_recovered_unknown', trace_id=row[0], command_id=row[0], state='unknown')
             self.save_snapshot()
         except BaseException:
             if service.control:
@@ -96,10 +105,24 @@ class TradeRuntime:
     def save_snapshot(self):
         service = self.service
         snapshot = service.snapshot()
+        snapshot_id = uuid.uuid4().hex
+        snapshot['status']['latency'] = dict(snapshot_id=snapshot_id,
+                                            generated_at=mh.iso(service._now()))
         with db.session(service.db_path) as conn:
             conn.execute('INSERT OR REPLACE INTO trade_snapshots VALUES (?,?,?,?)',
                          (service.code, self.mode, mh.iso(service._now()), json.dumps(snapshot, ensure_ascii=False, allow_nan=False)))
             conn.commit()
+        service.latency.record('snapshot_published', snapshot_id=snapshot_id, generation=service._generation)
+        for order in snapshot['orders']:
+            version = tuple(order.get(key) for key in ('risk_revision', 'entry_status', 'exit_status',
+                                                      'filled_quantity', 'exit_filled_quantity'))
+            if self._published_order_versions.get(order['id']) != version:
+                service.latency.record('order_snapshot_published', snapshot_id=snapshot_id,
+                    order_id=order['id'], generation=service._generation, **order_link(service.db_path, order['id']))
+                self._published_order_versions[order['id']] = version
+        present = {order['id'] for order in snapshot['orders']}
+        self._published_order_versions = {key: value for key, value in self._published_order_versions.items() if key in present}
+        service.latency.flush()
 
     def submit(self, command):
         if self.service.control and self.service.control.stop_requested:
@@ -116,7 +139,14 @@ class TradeRuntime:
                 now = mh.iso(self.service._now())
                 conn.execute('INSERT INTO trade_commands VALUES (?,?,?,?,?,?,?,?,?)',
                     (command.id, self.service.code, self.mode, document, 'accepted', now, now, None, None))
-                conn.commit()
+                with self._timing_lock:
+                    conn.commit()
+                    if len(self._accepted_mono) >= 4096:
+                        self._accepted_mono.pop(next(iter(self._accepted_mono)))
+                    self._accepted_mono[command.id] = self.service.latency.record(
+                        'command_accepted', trace_id=command.id, command_id=command.id, order_id=command.target,
+                        generation=self.service._generation, state='accepted')
+        self.service._wake.set()
         return self.command(command.id)
 
     def command(self, command_id):
@@ -163,10 +193,29 @@ class TradeRuntime:
             conn.commit()
         if not claimed:
             return
+        with self._timing_lock:
+            accepted = self._accepted_mono.pop(row['id'], None)
+        began = self.service.latency.record('command_processing', trace_id=row['id'], command_id=row['id'],
+            order_id=json.loads(row['request']).get('target'), started=accepted,
+            generation=self.service._generation, state='processing')
         state, status = 'succeeded', 200
         try:
-            with self.service._lock:
+            with self.service._lock, trace_scope(trace_id=row['id'], command_id=row['id'],
+                                                order_id=json.loads(row['request']).get('target')):
                 result = self.execute(json.loads(row['request']))
+                if isinstance(result, dict):
+                    identities = result.get('order_ids', [])
+                    if 'entry_trade_id' in result:
+                        identities = [*identities, result['id']]
+                    if identities:
+                        try:
+                            with db.session(self.service.db_path) as conn:
+                                for local_id in identities:
+                                    if not link_order(conn, local_id):
+                                        self.service.latency.error = 'OrderLinkWriteFailed'
+                                conn.commit()
+                        except Exception as error:
+                            self.service.latency.error = type(error).__name__
         except (RiskConfirmation, RiskConflict) as error:
             state, status = 'failed', 409
             result = {'detail': {'code': 'confirmation_required' if isinstance(error, RiskConfirmation) else 'risk_conflict',
@@ -184,6 +233,9 @@ class TradeRuntime:
                          (state, json.dumps(result, ensure_ascii=False, allow_nan=False), status,
                           mh.iso(self.service._now()), row['id']))
             conn.commit()
+        self.service.latency.record('command_completed', trace_id=row['id'], command_id=row['id'],
+            order_id=result.get('id') if isinstance(result, dict) and 'entry_trade_id' in result else json.loads(row['request']).get('target'),
+            started=began, state=state)
 
     def step(self):
         s = self.service
@@ -238,11 +290,12 @@ class TradeRuntime:
     def start(self):
         def run():
             while not self.stop.is_set():
+                self.service._wake.clear()
                 try:
                     self.step()
                 except Exception as error:
                     print(f'trade worker failed: {type(error).__name__}', flush=True)
-                self.stop.wait(.5)
+                self.service._wake.wait(.5)
         self.thread = threading.Thread(target=run, name='independent-trade', daemon=True)
         self.thread.start()
 
@@ -251,11 +304,13 @@ class TradeRuntime:
             return
         self.closed = True
         self.stop.set()
+        self.service._wake.set()
         if self.thread:
             self.thread.join()  # keep ownership until in-flight broker calls finish
         try:
             self.service.close()  # no automatic close/cancel of broker positions
         finally:
+            self.service.latency.flush()
             if self.service.control:
                 self.service.control.close()
 

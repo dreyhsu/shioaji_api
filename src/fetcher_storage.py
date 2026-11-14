@@ -72,7 +72,10 @@ END;
 
 
 class FetcherStore:
-    def __init__(self, path):
+    def __init__(self, path, *, clock=None, role='acquisition'):
+        from latency_trace import LatencyRecorder
+        self.latency = LatencyRecorder(path, role, '', '', clock=clock)
+        self._published = {}
         self.conn = db.connect(path)
         try:
             self.conn.executescript(SCHEMA)
@@ -123,6 +126,20 @@ class FetcherStore:
                     "INSERT OR REPLACE INTO market_bar_checks VALUES (?,?,?,?,?)",
                     (code, mode, stamp, result, json.dumps(differences, allow_nan=False)),
                 )
+        complete = [row for row in rows if row['complete']]
+        if complete:
+            row = max(complete, key=lambda row: pd.Timestamp(row['minute_start']))
+            stamp = pd.Timestamp(row['minute_start'])
+            actual_generation = row.get('generation', generation)
+            signature = (str(stamp), instance, actual_generation, *(row[key] for key in ('open','high','low','close','volume','amount')))
+            key = (code, mode, source)
+            if self._published.get(key) != signature:
+                self._published[key] = signature
+                self.latency.record('bar_published', code=code, mode=mode,
+                    trace_id=f'market:{code}:{stamp}', minute_start=str(stamp), source=source,
+                    source_instance=instance, generation=actual_generation,
+                    closed_at=str(stamp + pd.Timedelta(minutes=1)))
+                self.latency.flush()
 
     def invalidate(self, code, mode, stamps):
         with self.conn:

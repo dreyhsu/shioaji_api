@@ -1,0 +1,30 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+let now = 100;
+const requests = [], frames = [];
+const context = { window: {}, Date, performance: { now: () => now },
+  fetch: (url, options) => { requests.push({url, body: JSON.parse(options.body)}); return Promise.resolve({ok:true}); },
+  requestAnimationFrame: fn => frames.push(fn) };
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/web/latency.js'), 'utf8'), context);
+const tracker = context.window.TradeLatency;
+tracker.commandStarted('same-command'); now += 125; tracker.commandCompleted('same-command');
+assert.equal(requests[0].body.command_id, 'same-command');
+assert.equal(requests[0].body.client_elapsed_ms, 125);
+assert(requests[0].body.client_observed_at.endsWith('+08:00'));
+const snapshot = {snapshot_id: 'snapshot-1'}, orders = [{id: 'order-1', risk_revision: 1, filled_quantity: 1}];
+tracker.received(snapshot); now += 50; tracker.rendered(snapshot, orders);
+assert.equal(requests.length, 1, 'render sample must wait for animation frames');
+frames.shift()(); frames.shift()();
+assert.equal(requests[1].body.snapshot_id, 'snapshot-1');
+assert.equal(requests[1].body.order_id, 'order-1');
+assert.equal(requests[1].body.client_elapsed_ms, 50);
+tracker.received(snapshot); tracker.rendered(snapshot, orders); frames.shift()(); frames.shift()();
+assert.equal(requests.length, 2, 'unchanged state is not reported every poll');
+orders[0].filled_quantity = 2;
+tracker.received(snapshot); tracker.rendered(snapshot, orders); frames.shift()(); frames.shift()();
+assert.equal(requests.length, 3);
+assert(requests.every(request => request.url === '/api/latency/browser'));
+console.log('Browser command/render timing, Taipei timezone, frame sampling and deduplication passed');
