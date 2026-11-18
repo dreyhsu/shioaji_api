@@ -341,6 +341,7 @@
     if (order.active && Number(order.filled_quantity) > Number(order.exit_filled_quantity) && order.protection) {
       if (!order.protection.broker_ready) return '券商委託／部位待核對 · 自動送單暫停';
       if (!order.protection.tick_fresh) return '此合約 tick 過期 · 本機自動保護受影響';
+      if (order.protection.closed_1m_ready === false) return '已收定 1 分 K 未就緒 · 自動出場／保本受限';
       if (order.curve_id && !order.protection.curve_exit) return '曲線停利暫停 · 固定停損依設定監控';
     }
     if (order.entry_status === 'CancelRequested') return '取消送出中';
