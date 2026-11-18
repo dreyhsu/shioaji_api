@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from contextlib import closing
 from pathlib import Path
 import uuid
 import threading
@@ -28,6 +29,8 @@ from curve_entry_controller import CurveEntryController
 from latency_trace import LatencyRecorder, trace_scope, trace_values, order_link, identity
 from market_fetcher import FetcherSettings, SessionSchedule
 from trading import TradingService, _value, _enum_text, _fill_summary, _trade_status, align_tick, stop_target_prices, crossed_exit, crossed_curve_close
+
+PROFIT_LOCK_TICK_BATCH = 256
 
 
 class OrderSession:
@@ -210,6 +213,7 @@ class IndependentTradingService(TradingService):
         self._stale_order_events = 0
         self._report_repair_needed = False
         self._observed_trade_states = {}
+        self._profit_lock_backlog = {}
         self.last_margin = float('-inf')
         self.bar_codes = {}
         self.curve_entry = ClosedMinuteEntry(self)
@@ -336,6 +340,7 @@ class IndependentTradingService(TradingService):
             rows = conn.execute('SELECT * FROM market_latest_quotes WHERE mode=?', (mode,)).fetchall() if exists else []
         self._quotes.clear()
         self._quote_received.clear()
+        self._quote_sources = {}
         for row in rows:
             try:
                 stamp, received = pd.Timestamp(row['quote_at']), pd.Timestamp(row['received_at'])
@@ -349,6 +354,7 @@ class IndependentTradingService(TradingService):
                 if previous and previous['at'] >= stamp:
                     continue
                 self._quotes[code] = {'price': price, 'at': stamp}
+                self._quote_sources[code] = (row['instance'], row['generation'])
                 self._quote_received[code] = self._monotonic() - max(0, (pd.Timestamp(self._now()) - received).total_seconds())
                 self.bar_codes[code] = row['code']
             except (TypeError, ValueError):
@@ -502,13 +508,123 @@ class IndependentTradingService(TradingService):
         return float(last['close'])
 
     def _fresh_risk_quote(self, row):
-        if super()._fresh_risk_quote(row) is None:
+        tick = super()._fresh_risk_quote(row)
+        if tick is None:
             return None
         return self.closed_price(row)
 
+    def _monitor_risk_quote(self, row):
+        if row.get('profit_lock_enabled') and self.closed_price({'contract_code': row['contract_code']}) is not None:
+            return super()._fresh_risk_quote(row)
+        return self._fresh_risk_quote(row)
+
     def _apply_breakeven(self, row, price):
+        row = self._apply_tick_profit_lock(row)
         closed = self.closed_price(row)
-        return row if closed is None else super()._apply_breakeven(row, closed)
+        if closed is None:
+            return row
+        # The ordinary fixed breakeven still uses the closed minute. Its call
+        # into the shared helper must not feed a candle into the tick peak.
+        fixed_row = {**row, 'profit_lock_enabled': 0}
+        fixed = super()._apply_breakeven(fixed_row, closed)
+        return row if fixed is fixed_row else fixed
+
+    def _profit_lock_quote(self, row, price):
+        if row.get('profit_lock_enabled') and self._profit_lock_backlog.get(row['id']):
+            return None  # a later quote cannot be inserted ahead of pending ticks
+        if not self._curve_data_ready() or self.closed_price({'contract_code': row['contract_code']}) is None:
+            return None
+        return super()._fresh_risk_quote(row)
+
+    def _apply_tick_profit_lock(self, row):
+        if (not row.get('profit_lock_enabled') or not row.get('active') or row.get('triggered_at')
+                or row.get('exit_trade_id') or row.get('exit_status')
+                or int(row['filled_quantity']) <= int(row['exit_filled_quantity'])):
+            return row
+        latest = super()._fresh_risk_quote(row)
+        if latest is None or self.closed_price({'contract_code': row['contract_code']}) is None or not self._curve_data_ready():
+            return row
+        now = pd.Timestamp(self._now())
+        since = pd.Timestamp(row.get('profit_lock_started_at') or now)
+        if row.get('created_at'):
+            since = max(since, pd.Timestamp(row['created_at']))
+        code = self.bar_codes.get(row['contract_code'], row['contract_code'])
+        mode = 'simulation' if self.simulation else 'production'
+        threshold = self.profit_lock_settings()['profit_lock_trigger_points']
+        with db.read_session(self.db_path) as conn:
+            conn.execute('BEGIN')
+            state = conn.execute('SELECT * FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
+            cursor, hit = (state['tick_seq'], state['hit_at']) if state else (0, None)
+            last_stamp = pd.Timestamp(state['quote_at']) if state and state['quote_at'] else since
+            exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='market_risk_ticks'").fetchone()
+            cutoff = mh.iso(max(since, now - pd.Timedelta(seconds=self.health_settings.tick_stale_seconds)))
+            head = 2**63 - 1
+            if exists and conn.execute("SELECT 1 FROM sqlite_master WHERE name='market_risk_tick_heads'").fetchone():
+                published = conn.execute('''SELECT q.quote_at,q.price,q.instance,q.generation,h.seq
+                    FROM market_latest_quotes q LEFT JOIN market_risk_tick_heads h USING(code,mode)
+                    WHERE q.code=? AND q.mode=?''', (code, mode)).fetchone()
+                quote = self._quotes[row['contract_code']]
+                if (published is None or pd.Timestamp(published['quote_at']) != quote['at']
+                        or published['price'] != quote['price']
+                        or (published['instance'], published['generation']) != self._quote_sources.get(row['contract_code'])):
+                    self._wake.set()  # reload a coherent quote/head next cycle
+                    return row
+                if published['seq'] is not None:
+                    head = published['seq']
+            if exists:
+                # Seek past obsolete history using the receive-time index, then
+                # consume a bounded suffix through the sequence index.
+                old = conn.execute('''SELECT seq FROM market_risk_ticks
+                    WHERE code=? AND mode=? AND received_at<? AND seq<=?
+                    ORDER BY received_at DESC,seq DESC LIMIT 1''', (code, mode, cutoff, head)).fetchone()
+                cursor = max(cursor, old['seq'] if old else 0)
+            ticks = conn.execute('''SELECT * FROM market_risk_ticks WHERE code=? AND mode=? AND seq>? AND seq<=?
+                ORDER BY seq LIMIT ?''', (code, mode, cursor, head, PROFIT_LOCK_TICK_BATCH + 1)).fetchall() if exists else []
+        more = len(ticks) > PROFIT_LOCK_TICK_BATCH
+        self._profit_lock_backlog[row['id']] = more
+        if more:
+            self._wake.set()  # resume without the normal .5s sleep; commands get priority each cycle
+        updated = dict(row)
+        prices = []
+        for tick in ticks[:PROFIT_LOCK_TICK_BATCH]:
+            cursor = tick['seq']
+            stamp, received = pd.Timestamp(tick['quote_at']), pd.Timestamp(tick['received_at'])
+            if ((tick['instance'], tick['generation']) != self._quote_sources.get(row['contract_code'])
+                    or stamp < since or received < since or stamp < last_stamp
+                    or not all(-5 <= (now - at).total_seconds() <= self.health_settings.tick_stale_seconds for at in (stamp, received))
+                    or not -5 <= (received - stamp).total_seconds() <= self.health_settings.tick_stale_seconds):
+                continue
+            last_stamp = stamp
+            prices.append((float(tick['price']), str(stamp)))
+        latest_at = self._quotes[row['contract_code']]['at']
+        if not more and latest_at >= max(since, last_stamp):
+            prices.append((latest, str(latest_at)))
+            last_stamp = latest_at
+        for price, stamp in prices:
+            if hit:
+                break
+            if not math.isfinite(price) or price <= 0:
+                continue
+            updated.update(super()._profit_lock_updates(updated, price, trigger_points=threshold))
+            protection = updated.get('profit_lock_price')
+            if protection is not None and crossed_exit(row['action'], price, protection, None):
+                hit = stamp
+        changes = {key: value for key, value in updated.items() if row.get(key) != value}
+        if not row.get('profit_lock_started_at'):
+            changes['profit_lock_started_at'] = str(since)
+        next_state = (cursor, hit, str(last_stamp))
+        previous_state = tuple(state[key] for key in ('tick_seq', 'hit_at', 'quote_at')) if state else None
+        if not changes and next_state == previous_state:
+            return row
+        # Parsing/calculation above holds no writer lock. Schema setup already
+        # happened at service startup; persist just the changed order and cursor.
+        with closing(db.connect(self.db_path)) as conn, conn:
+            if changes:
+                conn.execute('UPDATE managed_orders SET ' + ','.join(f'{key}=?' for key in changes)
+                    + ',risk_revision=risk_revision+1,updated_at=? WHERE id=?',
+                    (*changes.values(), str(now), row['id']))
+            conn.execute('INSERT OR REPLACE INTO managed_profit_lock_ticks VALUES (?,?,?,?)', (row['id'], *next_state))
+        return {**row, **changes, 'risk_revision': row['risk_revision'] + 1, 'updated_at': str(now)} if changes else row
 
     def _curve_source(self, code, timeframe, *, closed=False):
         """Share complete source geometry until the monitor's minute revision changes.
@@ -553,14 +669,28 @@ class IndependentTradingService(TradingService):
         return float(value) if math.isfinite(value) else None
 
     def _exit_signal(self, row, price):
-        closed = self.closed_price(row)
-        if closed is None or not self._curve_data_ready():
+        if not self._curve_data_ready():
             return None
-        stop = crossed_exit(row['action'], closed, float(row['stop_price']), None)
+        if row.get('profit_lock_enabled') and row.get('profit_lock_price') is not None:
+            tick = super()._fresh_risk_quote(row)
+            if tick is not None and self.closed_price({'contract_code': row['contract_code']}) is not None:
+                with db.read_session(self.db_path) as conn:
+                    state = conn.execute('SELECT hit_at FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
+                if (state and state['hit_at']) or crossed_exit(row['action'], tick, row['profit_lock_price'], None):
+                    return 'stop'
+        closed = self.closed_price(row)
+        if closed is None:
+            return None
+        fixed_stop = float(row['stop_price'])
+        if row.get('profit_lock_enabled') and row.get('profit_lock_price') == fixed_stop:
+            # A freshly raised tick floor cannot be compared to an older close.
+            # Tighter manual/fixed breakeven stops still use their original rule.
+            fixed_stop = float('-inf') if row['action'] == 'Buy' else float('inf')
+        stop = crossed_exit(row['action'], closed, fixed_stop, None)
         if stop:
             return stop
         if not row.get('curve_id'):
-            return crossed_exit(row['action'], closed, float(row['stop_price']), row['target_price'])
+            return crossed_exit(row['action'], closed, fixed_stop, row['target_price'])
         with db.read_session(self.db_path) as conn:
             curve = conn.execute("SELECT anchors,timeframe,kind FROM trendlines WHERE id=? AND code=? "
                                  "AND kind IN ('line','curve') AND enabled=1", (row['curve_id'], self.code)).fetchone()
@@ -729,7 +859,7 @@ class IndependentTradingService(TradingService):
             return
         return super()._try_auto_exit(row, reason)
 
-    def process_market_update(self):
+    def process_market_update(self, *, before_protection=None):
         with self._lock:
             self.drain_order_events()
             self.load_quotes()
@@ -738,13 +868,19 @@ class IndependentTradingService(TradingService):
                 self._curve_cache.clear()
                 self._curve_break_cache.clear()
                 self._last_sync = float('-inf')  # consume callback cache once each cycle; RPC remains throttled
-                self._monitor_once()  # exactly one reconciliation cycle
+                self._monitor_once(before_protection=before_protection)  # exactly one reconciliation cycle
+                return True
+            return False
 
     def _public_order(self, row):
         result = super()._public_order(row)
         current = super()._fresh_risk_quote(row)
         result['protection']['closed_1m_ready'] = self.closed_price(row) is not None
         result['protection']['tick_fresh'] = current is not None
+        result['protection']['profit_lock'] = bool(current is not None and self._broker_ready
+            and not self._recovery.pending and row.get('active') and row.get('profit_lock_enabled')
+            and row.get('auto_exit') and self.auto_exit_enabled() and self._curve_data_ready()
+            and self.closed_price({'contract_code': row['contract_code']}) is not None)
         if current is not None:
             result['last_quote'] = current
         return result
@@ -759,11 +895,13 @@ class IndependentTradingService(TradingService):
             auto_entry_enabled=self.auto_entry_enabled(), auto_exit_enabled=self.auto_exit_enabled(),
             curve_entry=self.curve_entry.snapshot(), bars_ready=False, broker_ready=False)
         status.update(signal_mode='closed_1m', scheduled_open=self.window() is not None,
-                      logout_unconfirmed=self.logout_unconfirmed, market_source='monitor_db')
+                      logout_unconfirmed=self.logout_unconfirmed, market_source='monitor_db',
+                      profit_lock_signal_mode='tick')
         status['latency_health'] = {**self.latency.health(), 'callback_queue': self._order_events.qsize(),
                                    'stale_callbacks': self._stale_order_events}
         status.setdefault('mode', '模擬環境' if self.simulation else '正式環境')
         status.update(self.breakeven_settings())
+        status.update(self.profit_lock_settings())
         contract_bars = {code: self.closed_price({'contract_code': code}) is not None for code in self._wanted}
         market_quotes = {code: dict(price=quote['price'], at=mh.iso(quote['at']),
             fresh=-5 <= (pd.Timestamp(self._now()) - quote['at']).total_seconds() <= self.health_settings.tick_stale_seconds)
@@ -784,7 +922,7 @@ class IndependentTradingService(TradingService):
                 order['last_quote'] = quote
             order['protection']['tick_fresh'] = quote is not None
             if quote is None:
-                for key in ('fixed_stop', 'fixed_target', 'curve_exit', 'breakeven'):
+                for key in ('fixed_stop', 'fixed_target', 'curve_exit', 'breakeven', 'profit_lock'):
                     order['protection'][key] = False
         status['orders'] = orders
         status['pending_external_risk'] = sum(bool(row['active'] and row.get('order_origin') == 'external_position'

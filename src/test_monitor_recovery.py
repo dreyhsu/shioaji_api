@@ -64,6 +64,50 @@ def health(r):
     return mh.read_health(r.item.publisher.path)
 
 
+def test_risk_tick_tape_import_is_ordered_filtered_and_durable(runtime):
+    r = runtime
+    r.put()
+    ticks = [dict(tick_id=f'offline:1:{i}', code='TMFR1', mode='simulation', price=price,
+                  quote_at=str(r.now[0]), received_at=str(r.now[0]), instance='offline', generation=1)
+             for i, price in enumerate((20000, 20800, 20400, 20700))]
+    r.store.quotes([], [dict(ticks[0], tick_id='wrong-code', code='OTHER'),
+                       dict(ticks[0], tick_id='wrong-mode', mode='production'), *ticks])
+    r.item.step()
+    assert [row[0] for row in r.conn.execute('SELECT price FROM market_risk_ticks ORDER BY seq')] == [20000, 20800, 20400, 20700]
+    assert r.conn.execute('SELECT seq FROM monitor_tick_offsets').fetchone()[0] == 6
+    r.mono[0] += 1
+    r.item.step()
+    assert r.conn.execute('SELECT COUNT(*) FROM market_risk_ticks').fetchone()[0] == 4
+
+
+def test_tick_staging_releases_writer_and_only_publishes_complete_head(runtime):
+    r = runtime
+    r.put()
+    ticks = [dict(tick_id=f'chunk:{i}', code='TMFR1', mode='simulation', price=20000 + i,
+        quote_at=str(r.now[0]), received_at=str(r.now[0]), instance='offline', generation=1)
+        for i in range(600)]
+    r.store.quotes([], ticks)
+    r.item._read_source(r.now[0])
+    statements = []
+    r.conn.set_trace_callback(statements.append)
+    r.item._stage_risk_ticks()
+    r.conn.set_trace_callback(None)
+    batch, sizes = 0, []
+    for statement in statements:
+        if statement.startswith('INSERT OR IGNORE INTO market_risk_ticks'):
+            batch += 1
+        elif statement == 'COMMIT' and batch:
+            sizes.append(batch)
+            batch = 0
+    assert sizes == [256, 256, 88]
+    assert r.conn.execute('SELECT seq FROM market_risk_tick_heads').fetchone()[0] == 0
+    assert r.conn.execute('SELECT COUNT(*) FROM market_risk_ticks').fetchone()[0] == 600
+    assert r.conn.execute('SELECT COUNT(*) FROM monitor_tick_offsets').fetchone()[0] == 0
+    r.item.step()  # retry staged rows; publish the head and offset just once
+    assert r.conn.execute('SELECT seq FROM market_risk_tick_heads').fetchone()[0] > 0
+    assert r.conn.execute('SELECT COUNT(*) FROM market_risk_ticks').fetchone()[0] == 600
+
+
 def test_blocked_telegram_does_not_delay_next_minute_or_health(runtime, monkeypatch):
     import threading
     from alert_rules import Candidate

@@ -34,11 +34,19 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   ctx.renderRiskEditor();
   assert.equal(get('risk-breakeven-trigger').value, 100);
   assert.equal(get('risk-breakeven-offset').value, 5);
-  ctx.updateRiskDraft('a', { breakeven_trigger_points: '60', breakeven_offset_points: '8' });
+  assert.equal(get('risk-profit-lock').checked, false);
+  assert.match(get('risk-profit-lock-label').textContent, /500/);
+  ctx.state.orders[0].profit_lock_trigger_points = 600;
+  ctx.renderRiskEditor();
+  assert.match(get('risk-profit-lock-label').textContent, /600/);
+  assert.match(get('risk-profit-lock-state').textContent, /600.*300/);
+  ctx.updateRiskDraft('a', { breakeven_trigger_points: '60', breakeven_offset_points: '8', profit_lock_enabled: true });
+  assert.equal(get('risk-profit-lock').checked, true);
   ctx.state.selectedId = 'b';
   ctx.renderRiskEditor();
   assert.equal(get('risk-breakeven-trigger').value, 150);
   assert.equal(get('risk-breakeven-offset').value, 10);
+  assert.equal(get('risk-profit-lock').checked, false);
   ctx.updateRiskDraft('b', { breakeven_offset_points: '12' });
   ctx.state.selectedId = 'a';
   ctx.renderRiskEditor();
@@ -48,6 +56,9 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   assert.equal(calls[0].url, '/api/trading/orders/a/risk-settings');
   assert.equal(calls[0].payload.breakeven_trigger_points, 60);
   assert.equal(calls[0].payload.breakeven_offset_points, 8);
+  assert.equal(calls[0].payload.profit_lock_enabled, true);
+  assert.equal(calls[0].payload.profit_lock_trigger_points, undefined); // config is read-only in this editor
+  assert.equal(ctx.state.orders[1].profit_lock_enabled, undefined);
   assert(!ctx.riskDrafts.has('a'));
   assert.equal(ctx.riskDrafts.get('b').breakeven_offset_points, '12');
   assert.equal(ctx.state.orders[1].breakeven_offset_points, 10);
@@ -92,5 +103,20 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   assert.equal(ctx.riskDrafts.get(adopted.id).target_price, 20240);
   const short = { ...adopted, action: 'Sell', stop_price: null, target_price: null };
   assert.equal(ctx.riskValues(short).stop_price, 20240);
-  console.log('Risk editor order isolation, all curve timeframes and numeric save passed');
+  // Changing away from a curve must retain a triggered profit-lock stop.
+  ctx.riskDrafts.delete(adopted.id);
+  Object.assign(adopted, { profit_lock_enabled: true, profit_lock_peak_points: 800,
+    profit_lock_triggered_at: '2026-11-17 09:05:00', profit_lock_price: 20400,
+    stop_price: 20400, breakeven_enabled: false, curve_id: 4 });
+  ctx.renderRiskEditor();
+  assert.equal(get('risk-profit-lock').checked, true);
+  assert.match(get('risk-profit-lock-state').textContent, /800.*20400/);
+  ctx.changeRiskMode(adopted.id, null);
+  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 20400);
+  // A new protected snapshot invalidates a stale draft without losing the draft.
+  adopted.risk_revision += 1;
+  ctx.renderRiskEditor();
+  assert.equal(get('risk-save').disabled, true);
+  assert.equal(ctx.riskDrafts.get(adopted.id).profit_lock_enabled, true);
+  console.log('Risk editor order isolation, profit lock, all curve timeframes and numeric save passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

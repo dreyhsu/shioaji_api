@@ -383,6 +383,7 @@
       target_price: order.target_price ?? order.default_target_price ?? defaults.target ?? null, breakeven_enabled: Boolean(order.breakeven_enabled),
       breakeven_trigger_points: order.breakeven_trigger_points,
       breakeven_offset_points: order.breakeven_offset_points,
+      profit_lock_enabled: Boolean(order.profit_lock_enabled),
       risk_revision: Number(order.risk_revision) };
   }
 
@@ -446,6 +447,14 @@
       $('risk-target').required = !values.curve_id;
       $('risk-target').placeholder = values.curve_id && target == null ? '線條暫不可用' : '';
       $('risk-breakeven').checked = values.breakeven_enabled;
+      $('risk-profit-lock').checked = values.profit_lock_enabled;
+      const profitLockTrigger = order.profit_lock_trigger_points ?? 500;
+      $('risk-profit-lock-label').textContent = `獲利回撤保本：達 ${number(profitLockTrigger)} 點後，保留最高浮盈 50%`;
+      $('risk-profit-lock-state').textContent = order.profit_lock_enabled
+        ? (order.profit_lock_triggered_at
+          ? `已啟動：每口最高浮盈 ${number(order.profit_lock_peak_points, 2)} 點，保護價 ${number(order.profit_lock_price, 2)}；tick 碰價觸發平倉，成交可能有延遲與滑價。`
+          : `等待每口浮盈達 ${number(profitLockTrigger)} 點；目前最高 ${number(order.profit_lock_peak_points || 0, 2)} 點。追蹤 tick，多單最高價／空單最低價。`)
+        : `逐單啟用並儲存後追蹤 tick；多單最高價／空單最低價，達 ${number(profitLockTrigger)} 點保留 ${number(profitLockTrigger * 0.5)} 點，回撤碰價觸發平倉。`;
       for (const [id, value] of [['trigger', values.breakeven_trigger_points], ['offset', values.breakeven_offset_points]]) {
         const input = $('risk-breakeven-' + id);
         if (document.activeElement !== input) input.value = value ?? '';
@@ -476,12 +485,12 @@
       const defaults = riskValues({ ...order, curve_id: null, stop_price: null, target_price: null });
       patch.stop_price = defaults.stop_price ?? draft.stop_price;
       patch.target_price = defaults.target_price ?? draft.target_price;
-      if (order.breakeven_enabled && order.breakeven_triggered_at) {
+      if ((order.breakeven_enabled && order.breakeven_triggered_at) || (order.profit_lock_enabled && order.profit_lock_triggered_at)) {
         patch.stop_price = direction > 0 ? Math.max(patch.stop_price, Number(order.stop_price)) : Math.min(patch.stop_price, Number(order.stop_price));
       }
     }
     updateRiskDraft(id, patch);
-    if (cancelling && order.breakeven_enabled && order.breakeven_triggered_at) {
+    if (cancelling && ((order.breakeven_enabled && order.breakeven_triggered_at) || (order.profit_lock_enabled && order.profit_lock_triggered_at))) {
       riskNotice = '已帶入 ±2 ATR 預設值，stop 保留已觸發的保本保護；儲存後才生效。';
       renderRiskEditor();
     }
@@ -889,6 +898,7 @@
     $('risk-' + key).addEventListener('input', (event) => updateRiskDraft(state.selectedId, { [key + '_price']: event.target.value }));
   }
   $('risk-breakeven').addEventListener('change', (event) => updateRiskDraft(state.selectedId, { breakeven_enabled: event.target.checked }));
+  $('risk-profit-lock').addEventListener('change', (event) => updateRiskDraft(state.selectedId, { profit_lock_enabled: event.target.checked }));
   for (const [id, key] of [['trigger', 'breakeven_trigger_points'], ['offset', 'breakeven_offset_points']]) {
     $('risk-breakeven-' + id).addEventListener('input', (event) => updateRiskDraft(state.selectedId, { [key]: event.target.value }));
   }

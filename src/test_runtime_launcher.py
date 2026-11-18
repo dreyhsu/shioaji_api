@@ -41,7 +41,9 @@ def test_bad_runtime_configuration_is_rejected(tmp_path, values):
 
 
 @pytest.mark.parametrize('values', [dict(default_timeframe='2h'), dict(initial_bars=0),
-    dict(history_days=366), dict(refresh_seconds=0), dict(curve_hover_pixels=0), dict(port=True)])
+    dict(history_days=366), dict(refresh_seconds=0), dict(curve_hover_pixels=0), dict(port=True),
+    dict(default_entry_quantity=0), dict(default_entry_quantity=101), dict(default_entry_quantity=True),
+    dict(default_entry_quantity=1.5), dict(default_entry_quantity='2')])
 def test_bad_dashboard_configuration_is_rejected(values):
     with pytest.raises(ValidationError):
         DashboardConfig.model_validate(values)

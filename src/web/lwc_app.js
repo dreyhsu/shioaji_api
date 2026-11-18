@@ -43,6 +43,11 @@ let chart = null;
 let candles = null;
 let boxes = null;
 let gaps = null;
+let supertrend = null;
+let supertrendPriceLabel = null;
+let supertrendAi = null;
+let supertrendAiEnabled = true;
+try { supertrendAiEnabled = localStorage.getItem('dashboard.supertrendAi15m.visible') !== 'false'; } catch (_) {}
 let framed = false;
 const indicators = new Map(); // name -> { series, spec }
 let lastBars = [];
@@ -160,6 +165,20 @@ function initChart() {
   candles.attachPrimitive(boxes);
   gaps = new BoxesPrimitive({ showLabels: false });
   candles.attachPrimitive(gaps);
+  supertrend = new SupertrendPrimitive();
+  candles.attachPrimitive(supertrend);
+  supertrendAi = new SupertrendPrimitive({ upColor: '#00897b', downColor: '#ff5252', fill: false });
+  candles.attachPrimitive(supertrendAi);
+  supertrendAi.setVisible(supertrendAiEnabled);
+  const aiToggle = document.getElementById('supertrend-ai-toggle');
+  aiToggle.checked = supertrendAiEnabled;
+  aiToggle.addEventListener('change', () => {
+    supertrendAiEnabled = aiToggle.checked;
+    try { localStorage.setItem('dashboard.supertrendAi15m.visible', String(supertrendAiEnabled)); } catch (_) {}
+    supertrendAi.setVisible(supertrendAiEnabled && displayedTimeframe === '15m');
+    document.getElementById('legend-ohlc').textContent = '';
+    renderLegendRows();
+  });
   pnlPrimitive = new PnlPrimitive();
   candles.attachPrimitive(pnlPrimitive);
 
@@ -258,6 +277,15 @@ function renderLegendRows() {
     '<span class="lg"><i style="background:' + C.up + '"></i>' + (CODE || 'TMF') + ' ' + (displayedTimeframe || timeframe) + '</span>',
   ];
   rows.push('<span class="lg"><i style="background:#808080"></i>1h 跳空缺口</span>');
+  const trend = supertrend?.latest();
+  const trendColor = trend?.direction === 1 ? '#4caf50' : '#ff4054';
+  const trendText = Number.isFinite(trend?.value)
+    ? (trend.direction === 1 ? '多頭 ' : '空頭 ') + trend.value.toFixed(0) : '暖機中／資料不足';
+  rows.push('<span class="lg" title="使用已收定 1 小時 K；小週期於該小時收定後更新"><i style="background:'
+    + trendColor + '"></i>Supertrend · 1h · 10 / 3 · ' + trendText + '</span>');
+  if (displayedTimeframe === '15m' && supertrendAiEnabled) {
+    rows.push('<span class="lg" title="LuxAlgo SuperTrend AI · 已收定 15m · Best"><i style="background:#00897b"></i>SuperTrend AI · 15m</span>');
+  }
   for (const [, entry] of indicators) {
     rows.push('<span class="lg"><i style="background:' + (entry.spec.color || C.muted) + '"></i>' + labelText(entry.spec.name === 'volume' ? '成交量' : entry.spec.label) + '</span>');
   }
@@ -282,13 +310,19 @@ function onCrosshairMove(param) {
   const volumeText = volumePoint && Number.isFinite(volumePoint.value)
     ? '　成交量 ' + volumePoint.value.toLocaleString('zh-TW', { maximumFractionDigits: 0 })
     : '';
+  const trendPoint = supertrend?.pointAt(param.time);
+  const trendText = Number.isFinite(trendPoint?.value)
+    ? '　ST 1h ' + (trendPoint.direction === 1 ? '多 ' : '空 ') + trendPoint.value.toFixed(0) : '';
+  const aiPoint = displayedTimeframe === '15m' && supertrendAiEnabled ? supertrendAi?.pointAt(param.time) : null;
+  const aiText = Number.isFinite(aiPoint?.value)
+    ? '　ST AI 15m ' + (aiPoint.direction === 1 ? '多 ' : '空 ') + aiPoint.value.toFixed(0) : '';
   el.innerHTML =
     crosshairTimeFormatter(param.time) +
     '　開 ' + bar.open.toFixed(0) +
     ' 高 ' + bar.high.toFixed(0) +
     ' 低 ' + bar.low.toFixed(0) +
     ' 收 ' + bar.close.toFixed(0) +
-    ' <b class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(0) + '</b>' + volumeText;
+    ' <b class="' + cls + '">' + (change >= 0 ? '+' : '') + change.toFixed(0) + '</b>' + volumeText + trendText + aiText;
 }
 
 // ----------------------------------------------------------- curve identity
@@ -1217,6 +1251,21 @@ async function refreshChart() {
   // bars under the cursor stay put, so there is no visible-range save/restore.
   candles.setData(lastBars);
   applySeries(payload.series || []);
+  supertrend.setData(payload.supertrend);
+  supertrendAi.setData(payload.supertrend_ai);
+  supertrendAi.setVisible(supertrendAiEnabled && displayedTimeframe === '15m');
+  document.getElementById('supertrend-ai-control').hidden = displayedTimeframe !== '15m';
+  if (supertrendPriceLabel) {
+    candles.removePriceLine(supertrendPriceLabel);
+    supertrendPriceLabel = null;
+  }
+  const latestTrend = supertrend.latest();
+  if (Number.isFinite(latestTrend?.value)) {
+    supertrendPriceLabel = candles.createPriceLine({
+      price: latestTrend.value, color: latestTrend.direction === 1 ? '#4caf50' : '#ff4054',
+      lineVisible: false, axisLabelVisible: true, title: 'ST 1h',
+    });
+  }
   hideCurveHover();
   hoverCurves = (payload.trendlines || []).filter(line => ['line', 'curve'].includes(line.kind)).flatMap(line => {
     const entry = indicators.get('trendline_' + line.id);

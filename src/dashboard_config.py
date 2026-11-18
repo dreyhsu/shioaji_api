@@ -10,6 +10,7 @@ class DashboardConfig(BaseModel):
     host: Literal['127.0.0.1', '::1'] = '127.0.0.1'
     port: int = Field(default=8765, ge=1, le=65535, strict=True)
     default_timeframe: Literal['1m', '5m', '15m', '1h'] = '1h'
+    default_entry_quantity: int = Field(default=2, ge=1, le=100, strict=True)
     history_days: int = Field(default=30, ge=1, le=365, strict=True)
     initial_bars: int = Field(default=120, ge=1, le=10000, strict=True)
     refresh_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)

@@ -25,6 +25,7 @@ import patterns as pt
 import session_bars as sb
 import snr_core as snr
 import gap_zones
+import supertrend_alerts
 from monitor_notify import MonitorNotifier
 from latency_trace import LatencyRecorder
 import market_health as mh
@@ -250,6 +251,8 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
     candidates.extend(gap_zones.alert_candidates(
         gap_zones.collect(state.hourly, market_clock.now()), config.code,
         minute['minute_start'], alerts))
+    candidates.extend(supertrend_alerts.alert_candidates(
+        bars, state.hourly, config.code, minute['minute_start'], market_clock.now(), alerts))
     return sum(
         send_rule(conn, config, alerts, candidate, minute["minute_start"], notifier=notifier)
         for candidate in candidates
@@ -648,6 +651,22 @@ class MonitorRuntime:
                     (self.config.code, self.config.mode, mh.iso(self.since))).fetchall()
             quotes = source.execute('SELECT * FROM market_latest_quotes WHERE mode=?',
                                     (self.config.mode,)).fetchall()
+            self._risk_ticks = []
+            self._risk_tick_offset = None
+            if source.execute("SELECT 1 FROM sqlite_master WHERE name='market_risk_ticks'").fetchone():
+                identity = source.execute('SELECT identity FROM market_storage_identity WHERE singleton=1').fetchone()[0]
+                key = (str(path) + ':' + identity, self.config.code, self.config.mode)
+                offset = self.conn.execute('SELECT seq FROM monitor_tick_offsets WHERE source=? AND code=? AND mode=?', key).fetchone()
+                # Recovery must not replay obsolete ticks as live exits, or
+                # let an old backlog delay the current tape and latest quote.
+                self._risk_ticks = source.execute('''SELECT * FROM market_risk_ticks
+                    WHERE code=? AND mode=? AND seq>? AND received_at>=? ORDER BY seq''',
+                    (self.config.code, self.config.mode, offset[0] if offset else 0,
+                     mh.iso(now - pd.Timedelta(seconds=self.settings.tick_stale_seconds)))).fetchall()
+                high = source.execute('SELECT MAX(seq) FROM market_risk_ticks WHERE code=? AND mode=?',
+                                      (self.config.code, self.config.mode)).fetchone()[0]
+                if high is not None:
+                    self._risk_tick_offset = (*key, high)
             if source.execute("SELECT 1 FROM sqlite_master WHERE name='latency_events'").fetchone():
                 self._published_marks = [dict(row) for row in source.execute('''SELECT occurred_at,document,instance,generation
                     FROM latency_events WHERE code=? AND mode=? AND event='bar_published'
@@ -699,6 +718,26 @@ class MonitorRuntime:
             self.conn.executemany('INSERT OR REPLACE INTO monitor_bar_sources VALUES (?,?,?)',
                 [(self.config.code, mh.iso(row.minute_start), row.source) for row in delta.itertuples()])
         return rows
+
+    def _stage_risk_ticks(self):
+        """Release the shared DB writer between small tick batches.
+
+        Consumers use the head committed with the quote below, so partially
+        staged ticks stay invisible to protection even across a failed import.
+        """
+        if not self._risk_ticks:
+            return
+        pair = (self.config.code, self.config.mode)
+        with self.conn:
+            self.conn.execute('''INSERT OR IGNORE INTO market_risk_tick_heads
+                SELECT ?,?,COALESCE(MAX(seq),0) FROM market_risk_ticks WHERE code=? AND mode=?''', (*pair, *pair))
+        columns = ('tick_id','code','mode','price','quote_at','received_at','instance','generation')
+        for start in range(0, len(self._risk_ticks), 256):
+            rows = [tuple(row[key] for key in columns) for row in self._risk_ticks[start:start + 256]]
+            with self.conn:
+                self.conn.executemany('''INSERT OR IGNORE INTO market_risk_ticks
+                    (tick_id,code,mode,price,quote_at,received_at,instance,generation)
+                    VALUES (?,?,?,?,?,?,?,?)''', rows)
 
     def _stream_readiness(self, frame, quotes, now):
         """Allow a complete live tail once broker history reaches its start."""
@@ -752,9 +791,15 @@ class MonitorRuntime:
             # Routine work does not invalidate the last completed validation.
             # Consumers bound its age and the duration of this operation.
             self.publisher.publish(operation='derive', operation_started=mh.iso(now))
+            self._stage_risk_ticks()
             applied_rows = self._sync_bars(fresh)
             self.conn.executemany('''INSERT OR REPLACE INTO market_latest_quotes
-                VALUES (?,?,?,?,?,?,?,?)''', [tuple(row) for row in quotes])
+                VALUES (?,?,?,?,?,?,?,?)''', [tuple(row) for row in quotes if row['code'] == self.config.code])
+            if self._risk_tick_offset:
+                self.conn.execute('INSERT OR REPLACE INTO monitor_tick_offsets VALUES (?,?,?,?)', self._risk_tick_offset)
+                self.conn.execute('''INSERT OR REPLACE INTO market_risk_tick_heads
+                    SELECT ?,?,MAX(seq) FROM market_risk_ticks WHERE code=? AND mode=?''',
+                    (self.config.code, self.config.mode, self.config.code, self.config.mode))
             self.conn.commit()
             self._applied_frame, self._applied_rows = fresh, applied_rows
             adopted_at, adopted_mono = self.clock(), self.monotonic()

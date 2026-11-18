@@ -6,6 +6,10 @@
   "gap_formed": {"enabled": true},
   "gap_entered": {"enabled": true},
   "gap_filled": {"enabled": true},
+  "supertrend_opposite": {
+    "_comment": "At each completed 15m close, notify once when confirmed 1h and 15m Supertrends enter opposite directions (both ATR 10 / multiplier 3). No repeating or historical replay.",
+    "enabled": true
+  },
 
   "_utc_offset_comment": "the market clock (TAIFEX = Taiwan, UTC+8). Every 'now' in the monitor and dashboard is UTC + this, whatever the computer's own timezone, so travelling (e.g. Japan, UTC+9) needs no change. Read at startup: restart monitor.py and dashboard.py after changing it.",
   "utc_offset_hours": 8,

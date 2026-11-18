@@ -23,6 +23,8 @@ class TickFetcher(FetcherRuntime):
         self.latest = {}
         self.dirty = set()
         self.last_publish = float('-inf')
+        self.pending_ticks = []
+        self.tick_sequence = 0
 
     def on_connected(self):
         self.accumulators = {code: MinuteAccumulator(self.connected_at.ceil('min'),
@@ -41,6 +43,10 @@ class TickFetcher(FetcherRuntime):
         self.last_publish = float('-inf')
 
     def on_tick(self, tick):
+        self.tick_sequence += 1
+        self.pending_ticks.append(dict(tick_id=f'{self.instance}:{self.generation}:{self.tick_sequence}',
+            code=tick.code, mode=self.mode, price=tick.price, quote_at=str(tick.at),
+            received_at=str(tick.received_at), instance=self.instance, generation=self.generation))
         if tick.code in self.accumulators:
             self.accumulators[tick.code].add(tick)
         previous = self.latest.get(tick.code)
@@ -65,13 +71,14 @@ class TickFetcher(FetcherRuntime):
         ready_ids = {id(row) for _, row in ready}
         self.pending_rows = [(code, row) for code, row in self.pending_rows if id(row) not in ready_ids]
         self.pending_invalidated.clear()
-        if not self.dirty or (not force and self.monotonic() - self.last_publish < self.settings.tick_publish_seconds):
+        if (not self.dirty and not self.pending_ticks) or (not force and self.monotonic() - self.last_publish < self.settings.tick_publish_seconds):
             return
         rows = [{'code': code, 'mode': self.mode, 'price': self.latest[code].price,
                  'volume': self.latest[code].volume, 'quote_at': str(self.latest[code].at),
                  'received_at': str(self.latest[code].received_at), 'instance': self.instance,
                  'generation': self.generation} for code in sorted(self.dirty)]
-        self.store.quotes(rows)
+        self.store.quotes(rows, self.pending_ticks)
+        self.pending_ticks.clear()  # acknowledge the full batch only after commit
         published_at = pd.Timestamp(self.clock())
         for row in rows:
             self.health['quote_publish_latency'][row['code']] = {

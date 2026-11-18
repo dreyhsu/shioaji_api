@@ -138,7 +138,7 @@ def plan_external_closes(rows, history, fills, identities, details, actual, acco
         evidence_key, records = matches[0]
         quantity = sum(record['quantity'] for record in records)
         average = sum(record['quantity'] * record['cover_price'] for record in records) / quantity
-        changes = dict(active=0, auto_exit=0, breakeven_enabled=0, curve_armed=0,
+        changes = dict(active=0, auto_exit=0, breakeven_enabled=0, profit_lock_enabled=0, curve_armed=0,
             exit_trade_id=None, exit_status='Filled', exit_status_code=None, triggered_at=None,
             exit_filled_quantity=quantity, avg_exit_price=average,
             trigger_reason='external_close', error=None)

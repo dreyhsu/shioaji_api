@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from queue import Queue
 import threading
 from types import SimpleNamespace as NS
@@ -12,6 +13,7 @@ import telegram_notify as tg
 from trade_client import TradeClient
 from test_independent_trade import rig, request
 from test_monitor_recovery import runtime as market_runtime
+from test_profit_lock import enable_tick_lock
 
 
 def events(r):
@@ -24,6 +26,42 @@ def events(r):
 def callback(r, trade):
     r.service._capture_order_event(r.service._generation, 'FuturesDeal',
         {'order': {'id': trade.order.id}, 'account': {'secret': 'never-record-this'}})
+
+
+def test_accepted_order_reaches_broker_before_tick_protection_and_margin(rig, monkeypatch):
+    r = rig
+    enable_tick_lock(r)
+    calls = []
+    place = r.broker.place_order
+    protect = r.service._apply_tick_profit_lock
+    curve_check = r.service.curve_entry.check
+    margin = r.service.margin
+    reads = []
+    read_session = db.read_session
+    @contextmanager
+    def traced_read(*args, **kwargs):
+        with read_session(*args, **kwargs) as conn:
+            conn.set_trace_callback(reads.append)
+            yield conn
+    def submit(*args, **kwargs):
+        assert not any('market_risk_tick' in sql for sql in reads)
+        calls.append('sdk')
+        return place(*args, **kwargs)
+    def tick_protection(*args, **kwargs):
+        calls.append('ticks')
+        assert 'sdk' in calls
+        return protect(*args, **kwargs)
+    monkeypatch.setattr(r.broker, 'place_order', submit)
+    monkeypatch.setattr(db, 'read_session', traced_read)
+    monkeypatch.setattr(r.service, '_apply_tick_profit_lock', tick_protection)
+    monkeypatch.setattr(r.service.curve_entry, 'check', lambda: calls.append('curve') or curve_check())
+    monkeypatch.setattr(r.service, 'margin', lambda: calls.append('margin') or margin())
+    r.service.last_margin = float('-inf')
+    assert request(r, identity='priority-order').status_code == 202
+    r.runtime.step()
+    assert calls.index('curve') < calls.index('sdk') < calls.index('ticks') < calls.index('margin')
+    assert r.client.get('/api/commands/priority-order').json()['state'] == 'succeeded'
+    assert len(r.broker.trades) == 2
 
 
 def test_command_sdk_fill_snapshot_and_browser_keep_one_trace(rig, monkeypatch):

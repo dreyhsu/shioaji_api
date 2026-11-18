@@ -20,9 +20,12 @@ without a browser; read-only ``/api/health`` never refreshes service heartbeats.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
+from collections import OrderedDict
+from threading import Lock
 from functools import wraps
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
@@ -32,7 +35,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictBool
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -43,6 +46,8 @@ import market_health as mh
 import session_bars as sb
 import snr_core as snr
 import gap_zones
+from supertrend import confirmed_supertrend
+from supertrend_ai import confirmed_supertrend_ai, DEFAULTS as SUPERTREND_AI_DEFAULTS
 import trendline as tl
 import trading
 from service_control import ServiceControl, run_server
@@ -75,6 +80,8 @@ TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
 # of requests into a single read while never showing a stale price.
 _LOAD_TTL_SECONDS = 5.0
 _LOAD_CACHE: dict[tuple[str, int], tuple[float, object]] = {}
+_AI_CACHE = OrderedDict()
+_AI_CACHE_LOCK = Lock()
 
 CONFIG = {"code": "TMFR1", "db_path": db.DEFAULT_DB_PATH, "days": 30}
 _TRADING_SERVICE: trading.TradingService | TradeClient | None = None
@@ -465,6 +472,87 @@ def _series_payload(data) -> list[dict]:
     return out
 
 
+def _supertrend_payload(data, timeframe):
+    """One confirmed 1h calculation, projected at each displayed candle's close.
+
+    A 09:45 hourly result first becomes available at 10:45. On a 5m chart
+    that is the 10:40 candle, never the earlier minutes in that hour. The
+    current partial display candle is capped at the last stored minute's close.
+    """
+    visible = data['visible']
+    times = _epochs(visible['timestamp'])
+    payload = dict(timeframe='1h', atr_length=10, multiplier=3.0,
+                   confirmed_only=True, data=[{'time': stamp} for stamp in times])
+    if visible.empty:
+        return payload
+    cutoff = min(_dashboard_now(), pd.Timestamp(data['last_minute']['minute_start'])
+                 + pd.Timedelta(minutes=1))
+    hourly = data['hourly']
+    # A missing minute must not masquerade as a complete hourly input. Keep a
+    # NaN event for that hour so projection does not silently carry an old trend.
+    closed = hourly.loc[hourly['timestamp'] + pd.Timedelta(hours=1) <= cutoff].copy()
+    if closed.empty:
+        return payload
+    cache = data['supertrend_cache']
+    if cache.get('closed_count') == len(closed):
+        closed = cache['closed']
+    else:
+        closed = confirmed_supertrend(closed, cutoff)
+        cache.update(closed_count=len(closed), closed=closed)
+    display = pd.DataFrame({'display_time': visible['timestamp'].to_numpy()})
+    display['known_at'] = (display['display_time']
+                          + pd.Timedelta(minutes=TIMEFRAME_MINUTES[timeframe])).clip(upper=cutoff)
+    projected = pd.merge_asof(display, closed[['available_at', 'timestamp', 'supertrend',
+                                              'supertrend_direction']],
+                              left_on='known_at', right_on='available_at', direction='backward')
+    midpoint = ((visible['open'] + visible['close']) / 2).to_numpy()
+    for i, row in enumerate(projected.itertuples(index=False)):
+        if pd.notna(row.supertrend):
+            payload['data'][i].update(value=float(row.supertrend),
+                                      direction=int(row.supertrend_direction),
+                                      source_time=_epoch(row.timestamp),
+                                      midpoint=float(midpoint[i]))
+    return payload
+
+
+def _supertrend_ai_payload(data, timeframe):
+    """LuxAlgo trailing stop on its own closed 15m grid; no signal scores."""
+    if timeframe != '15m':
+        return None
+    visible = data['visible']
+    payload = dict(timeframe='15m', indicator='LuxAlgo SuperTrend AI',
+                   parameters=SUPERTREND_AI_DEFAULTS, confirmed_only=True,
+                   data=[{'time': stamp} for stamp in _epochs(visible['timestamp'])])
+    if visible.empty:
+        return payload
+    cutoff = min(_dashboard_now(), pd.Timestamp(data['last_minute']['minute_start']) + pd.Timedelta(minutes=1))
+    bars = data['chart_bars']
+    closed = bars.loc[bars['timestamp'] + pd.Timedelta(minutes=15) <= cutoff]
+    # Independent of the display-window cache: intermediate minute updates do
+    # not re-run clustering, while closed-bar corrections invalidate the hash.
+    fields = ['timestamp', 'session_id', 'high', 'low', 'close', 'minutes']
+    key = hashlib.sha256(pd.util.hash_pandas_object(closed[fields], index=False).values.tobytes()).digest()
+    with _AI_CACHE_LOCK:
+        calculated = _AI_CACHE.get(key)
+        if calculated is not None:
+            _AI_CACHE.move_to_end(key)
+    if calculated is None:
+        calculated = confirmed_supertrend_ai(closed, cutoff)
+        with _AI_CACHE_LOCK:
+            _AI_CACHE[key] = calculated
+            _AI_CACHE.move_to_end(key)
+            while len(_AI_CACHE) > 4:
+                _AI_CACHE.popitem(last=False)
+    by_time = calculated.set_index('timestamp')
+    for point, row in zip(payload['data'], visible.itertuples(index=False)):
+        if row.timestamp not in by_time.index:
+            continue
+        value = by_time.loc[row.timestamp]
+        if pd.notna(value.supertrend):
+            point.update(value=float(value.supertrend), direction=int(value.supertrend_direction))
+    return payload
+
+
 def _json_safe(value):
     """pandas/numpy scalars and NaT/NaN are not JSON-serialisable as-is."""
     if value is None:
@@ -531,6 +619,7 @@ def _load(code: str, days: int, *, need_minutes=False):
         "minute_count": summary[0],
         "last_minute": dict(last),
         "hourly": hourly,
+        "supertrend_cache": {},
         "visible": visible,
         "boxes": boxes_db,
         "reversals": reversals,
@@ -558,8 +647,10 @@ def api_dashboard_config():
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "lwc.html")
+def index() -> HTMLResponse:
+    page = (WEB_DIR / "lwc.html").read_text(encoding='utf-8')
+    page = page.replace('{{default_entry_quantity}}', str(dashboard_settings().default_entry_quantity))
+    return HTMLResponse(page)
 
 
 @app.get("/api/chart")
@@ -582,7 +673,12 @@ def api_chart(
         if runtime is not None and code == runtime.code and runtime.cursor == 0:
             return {"code": code, "timeframe": timeframe,
                     "generated_at": _dashboard_now().isoformat(sep=" "),
-                    "bars": [], "gaps": [], "boxes": [], "series": [], "trendlines": []}
+                    "bars": [], "gaps": [], "boxes": [], "series": [], "trendlines": [],
+                    "supertrend": {"timeframe": "1h", "atr_length": 10, "multiplier": 3.0,
+                                   "confirmed_only": True, "data": []},
+                    "supertrend_ai": {"timeframe": "15m", "indicator": "LuxAlgo SuperTrend AI",
+                                      "parameters": SUPERTREND_AI_DEFAULTS, "confirmed_only": True,
+                                      "data": []} if timeframe == '15m' else None}
         raise HTTPException(status_code=404, detail=f"no minute bars stored for {code}")
     if timeframe != "1h":
         bars = sb.minute_bars_to_interval(_minutes(data), TIMEFRAME_MINUTES[timeframe])
@@ -597,6 +693,8 @@ def api_chart(
         "boxes": _boxes_payload(data),
         "gaps": _gaps_payload(data),
         "series": _series_payload(data),
+        "supertrend": _supertrend_payload(data, timeframe),
+        "supertrend_ai": _supertrend_ai_payload(data, timeframe),
         "trendlines": data.get("trendlines") or [],
     }
 

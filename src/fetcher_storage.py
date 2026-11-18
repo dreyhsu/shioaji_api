@@ -1,7 +1,7 @@
 """Isolated acquisition tables: never overwrite the monitor's strategy bars.
 
 Live aggregates are candidates until checked against broker historical bars.
-No raw tick history or broker credentials are persisted here.
+Validated ticks are retained for tick-based protection; no credentials are persisted.
 """
 from __future__ import annotations
 
@@ -14,6 +14,22 @@ import db
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS market_risk_ticks (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, tick_id TEXT NOT NULL UNIQUE,
+    code TEXT NOT NULL, mode TEXT NOT NULL, price REAL NOT NULL,
+    quote_at TEXT NOT NULL, received_at TEXT NOT NULL,
+    instance TEXT NOT NULL, generation INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS market_risk_ticks_code ON market_risk_ticks(code,mode,seq);
+CREATE INDEX IF NOT EXISTS market_risk_ticks_received ON market_risk_ticks(code,mode,received_at,seq);
+CREATE TABLE IF NOT EXISTS monitor_tick_offsets (
+    source TEXT NOT NULL, code TEXT NOT NULL, mode TEXT NOT NULL, seq INTEGER NOT NULL,
+    PRIMARY KEY(source,code,mode)
+);
+CREATE TABLE IF NOT EXISTS market_risk_tick_heads (
+    code TEXT NOT NULL, mode TEXT NOT NULL, seq INTEGER NOT NULL,
+    PRIMARY KEY(code,mode)
+);
 CREATE TABLE IF NOT EXISTS market_latest_quotes (
     code TEXT NOT NULL, mode TEXT NOT NULL, price REAL NOT NULL,
     volume REAL NOT NULL, quote_at TEXT NOT NULL, received_at TEXT NOT NULL,
@@ -84,8 +100,11 @@ class FetcherStore:
             self.conn.close()
             raise
 
-    def quotes(self, rows):
+    def quotes(self, rows, ticks=()):
         with self.conn:
+            self.conn.executemany('''INSERT OR IGNORE INTO market_risk_ticks
+                (tick_id,code,mode,price,quote_at,received_at,instance,generation)
+                VALUES (:tick_id,:code,:mode,:price,:quote_at,:received_at,:instance,:generation)''', ticks)
             self.conn.executemany(
                 "INSERT INTO market_latest_quotes VALUES (:code,:mode,:price,:volume,:quote_at,"
                 ":received_at,:instance,:generation) ON CONFLICT(code,mode) DO UPDATE SET "
@@ -93,6 +112,9 @@ class FetcherStore:
                 "received_at=excluded.received_at,instance=excluded.instance,generation=excluded.generation",
                 rows,
             )
+            for code, mode in {(row['code'], row['mode']) for row in ticks}:
+                self.conn.execute('''INSERT OR REPLACE INTO market_risk_tick_heads
+                    SELECT ?,?,MAX(seq) FROM market_risk_ticks WHERE code=? AND mode=?''', (code, mode, code, mode))
 
     def bars(self, code, mode, rows, source, instance, generation):
         if not rows:

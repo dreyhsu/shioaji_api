@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 8765,
   "default_timeframe": "1h",
+  "default_entry_quantity": 2,
   "history_days": 30,
   "initial_bars": 120,
   "refresh_seconds": 60,

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TMF S/R 監控</title>
-  <link rel="stylesheet" href="/static/style.css?v=curve-draft-1">
+  <link rel="stylesheet" href="/static/style.css?v=supertrend-ai-1">
   <script src="/static/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -92,7 +92,7 @@
             <input id="trade-price" type="number" min="0" step="1" inputmode="decimal" placeholder="輸入價格">
           </label>
           <label class="trade-field">口數
-            <input id="trade-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+            <input id="trade-quantity" type="number" min="1" max="100" step="1" value="{{default_entry_quantity}}" inputmode="numeric">
           </label>
         </div>
         <div class="trade-field">停利方式
@@ -115,7 +115,7 @@
           </div>
         </div>
         <label class="trade-field">口數
-          <input id="entry-quantity" type="number" min="1" max="100" step="1" value="1" inputmode="numeric">
+          <input id="entry-quantity" type="number" min="1" max="100" step="1" value="{{default_entry_quantity}}" inputmode="numeric">
         </label>
         <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損、停利預設各 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。成交後可編輯出場，自動保本依交易設定。</div>
         <button id="entry-arm" class="trade-submit" type="button" disabled>啟用一次突破做多</button>
@@ -150,6 +150,10 @@
     <div class="chart-head">
       <div id="legend-series" class="legend"></div>
       <div class="chart-tools">
+        <label id="supertrend-ai-control" class="indicator-switch" hidden>
+          <input id="supertrend-ai-toggle" type="checkbox" role="switch" checked>
+          <span>15m SuperTrend AI</span>
+        </label>
         <div id="timeframes" class="timeframes" role="group" aria-label="K 棒週期">
           <button type="button" data-timeframe="1m" aria-pressed="false">1m</button>
           <button type="button" data-timeframe="5m" aria-pressed="false">5m</button>
@@ -172,6 +176,8 @@
       <label class="risk-check"><input id="risk-breakeven" type="checkbox"><span id="risk-breakeven-label">自動保本</span></label>
       <label>浮盈觸發點數 <input id="risk-breakeven-trigger" required type="number" min="0" step="any" aria-label="浮盈觸發點數"></label>
       <label>保留獲利點數 <input id="risk-breakeven-offset" required type="number" min="0" step="any" aria-label="保留獲利點數"></label>
+      <label class="risk-check"><input id="risk-profit-lock" type="checkbox"><span id="risk-profit-lock-label">獲利回撤保本：保留最高浮盈 50%</span></label>
+      <span id="risk-profit-lock-state" aria-live="polite"></span>
       <button id="risk-save" type="submit">儲存</button>
       <button id="risk-reset" type="button">還原</button>
       <span id="risk-state" role="status" aria-live="polite"></span>
@@ -205,7 +211,8 @@
   <script src="/static/boxes_primitive.js?v=gap-2"></script>
   <script src="/static/pnl_primitive.js?v=pnl-hover-2"></script>
   <script src="/static/curve_hover.js?v=1"></script>
-  <script src="/static/lwc_app.js?v=volume-overlay-1"></script>
+  <script src="/static/supertrend_primitive.js?v=ai-toggle-1"></script>
+  <script src="/static/lwc_app.js?v=supertrend-ai-1"></script>
   <script src="/static/latency.js?v=1"></script>
   <script src="/static/trading.js?v=latency-1"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>

@@ -53,7 +53,12 @@ class Command(BaseModel):
         if model:
             if self.payload.keys() - model.model_fields.keys():
                 raise ValueError('指令包含不支援的欄位')
-            return model.model_validate(self.payload).model_dump()
+            payload = model.model_validate(self.payload).model_dump()
+            if self.name == 'update_risk' and payload.get('profit_lock_enabled') is None:
+                # Keep pre-feature command documents identical across upgrades.
+                # Omission means preserve the setting; explicit False means disable.
+                payload.pop('profit_lock_enabled', None)
+            return payload
         if self.payload:
             raise ValueError('此指令不接受額外參數')
         return {}
@@ -244,6 +249,7 @@ class TradeRuntime:
             return
         with s._lock:
             try:
+                commands_processed = False
                 window = s.window()
                 if window is not None and self.last_window is None:
                     s._recovery.success()  # a new scheduled session still requires broker reconciliation
@@ -265,11 +271,12 @@ class TradeRuntime:
                         s._close_api()
                         window = s.window()
                     if s._api is not None:
-                        s.process_market_update()
+                        commands_processed = s.process_market_update(before_protection=self.process_commands)
                         if not s._recovery.pending and s._monotonic() - s.last_margin >= s.health_settings.order_sync_seconds:
                             s.last_margin = s._monotonic()
                             s.margin_cache = s.margin()
-                self.process_commands()
+                if not commands_processed:
+                    self.process_commands()
                 s._publish_health(state=('scheduled_closed' if window is None else 'healthy' if s._broker_ready and not s._recovery.pending else 'degraded'),
                     operation=None, cycle_completed_at=mh.iso(s._now()))
                 self.save_snapshot()

@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS managed_orders (
   breakeven_offset_points REAL,
   breakeven_triggered_at TEXT,
   breakeven_price REAL,
+  profit_lock_enabled INTEGER NOT NULL DEFAULT 0,
+  profit_lock_peak_points REAL NOT NULL DEFAULT 0,
+  profit_lock_triggered_at TEXT,
+  profit_lock_price REAL,
+  profit_lock_started_at TEXT,
   risk_revision INTEGER NOT NULL DEFAULT 0,
   auto_exit INTEGER NOT NULL DEFAULT 1,
   simulation INTEGER NOT NULL,
@@ -196,6 +201,10 @@ CREATE TABLE IF NOT EXISTS managed_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_managed_orders_active
   ON managed_orders (active, code, contract_code);
+
+CREATE TABLE IF NOT EXISTS managed_profit_lock_ticks (
+  order_id TEXT PRIMARY KEY, tick_seq INTEGER NOT NULL DEFAULT 0, hit_at TEXT, quote_at TEXT
+);
 
 CREATE TABLE IF NOT EXISTS external_position_adoptions (
   evidence_key TEXT PRIMARY KEY,
@@ -331,6 +340,11 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("managed_orders", "breakeven_offset_points", "ALTER TABLE managed_orders ADD COLUMN breakeven_offset_points REAL"),
     ("managed_orders", "breakeven_triggered_at", "ALTER TABLE managed_orders ADD COLUMN breakeven_triggered_at TEXT"),
     ("managed_orders", "breakeven_price", "ALTER TABLE managed_orders ADD COLUMN breakeven_price REAL"),
+    ("managed_orders", "profit_lock_enabled", "ALTER TABLE managed_orders ADD COLUMN profit_lock_enabled INTEGER NOT NULL DEFAULT 0"),
+    ("managed_orders", "profit_lock_peak_points", "ALTER TABLE managed_orders ADD COLUMN profit_lock_peak_points REAL NOT NULL DEFAULT 0"),
+    ("managed_orders", "profit_lock_triggered_at", "ALTER TABLE managed_orders ADD COLUMN profit_lock_triggered_at TEXT"),
+    ("managed_orders", "profit_lock_price", "ALTER TABLE managed_orders ADD COLUMN profit_lock_price REAL"),
+    ("managed_orders", "profit_lock_started_at", "ALTER TABLE managed_orders ADD COLUMN profit_lock_started_at TEXT"),
     ("managed_orders", "risk_revision", "ALTER TABLE managed_orders ADD COLUMN risk_revision INTEGER NOT NULL DEFAULT 0"),
 )
 

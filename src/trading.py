@@ -250,8 +250,13 @@ class TradingService:
             return True
 
     def breakeven_settings(self) -> dict[str, float]:
+        return self._point_settings({"breakeven_trigger_points": 100.0, "breakeven_offset_points": 5.0})
+
+    def profit_lock_settings(self) -> dict[str, float]:
+        return self._point_settings({'profit_lock_trigger_points': 500.0})
+
+    def _point_settings(self, defaults: dict[str, float]) -> dict[str, float]:
         """Reload point settings like the existing trading switches; retain safe defaults."""
-        defaults = {"breakeven_trigger_points": 100.0, "breakeven_offset_points": 5.0}
         try:
             config = json.loads(self.settings_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -986,27 +991,62 @@ class TradingService:
         if new_exit_fill:
             self.entry_notifier.notify_exit(self._active_order(row_id))
 
+    def _profit_lock_updates(self, row: dict, price: float | None, *, trigger_points=None) -> dict:
+        """Retain half the observed per-contract peak after the configured threshold."""
+        if not row.get('profit_lock_enabled') or row.get('avg_fill_price') is None:
+            return {}
+        direction = 1 if row['action'] == 'Buy' else -1
+        peak = float(row.get('profit_lock_peak_points') or 0)
+        if price is not None:
+            peak = max(peak, direction * (price - row['avg_fill_price']))
+        updates = {}
+        if peak != float(row.get('profit_lock_peak_points') or 0):
+            updates['profit_lock_peak_points'] = peak
+        if not row.get('profit_lock_triggered_at'):
+            threshold = self.profit_lock_settings()['profit_lock_trigger_points'] if trigger_points is None else trigger_points
+            if peak < threshold:
+                return updates
+        protection = align_tick(row['avg_fill_price'] + direction * peak * 0.5,
+                                float(row.get('contract_tick') or 1), direction)
+        previous = row.get('profit_lock_price')
+        if previous is not None:
+            protection = max(previous, protection) if direction > 0 else min(previous, protection)
+        stop = row.get('stop_price')
+        stop = protection if stop is None else max(stop, protection) if direction > 0 else min(stop, protection)
+        desired = dict(profit_lock_price=protection, stop_price=stop, levels_customized=1,
+                       profit_lock_triggered_at=row.get('profit_lock_triggered_at') or self._now().isoformat(sep=' '))
+        updates.update({key: value for key, value in desired.items() if row.get(key) != value})
+        return updates
+
+    def _profit_lock_quote(self, row, price):
+        return price
+
     def _apply_breakeven(self, row: dict, price: float) -> dict:
-        """Called under the shared risk lock for every fresh tick and after fill sync."""
-        if (row.get('broker_octype') == 'Cover' or not row.get("active") or not row.get("breakeven_enabled") or row.get("triggered_at")
+        """Apply both protections under the risk lock; independent trade passes closed 1m prices."""
+        if (row.get('broker_octype') == 'Cover' or not row.get("active") or row.get("triggered_at")
                 or row.get("exit_trade_id") or row.get("exit_status")
                 or int(row["filled_quantity"]) <= int(row["exit_filled_quantity"])):
             return row
-        if row.get("breakeven_triggered_at"):
-            return row
         entry = row.get("avg_fill_price")
         direction = 1 if row["action"] == "Buy" else -1
-        settings = self._order_breakeven_settings(row)
-        if entry is None or direction * (price - entry) <= settings["breakeven_trigger_points"]:
+        updates = {}
+        if row.get('breakeven_enabled') and not row.get('breakeven_triggered_at'):
+            settings = self._order_breakeven_settings(row)
+            if entry is not None and direction * (price - entry) > settings['breakeven_trigger_points']:
+                protection = align_tick(entry + direction * settings['breakeven_offset_points'],
+                                        float(row.get('contract_tick') or 1), direction)
+                stop = row.get('stop_price')
+                stop = protection if stop is None else max(stop, protection) if direction > 0 else min(stop, protection)
+                updates.update(stop_price=stop, breakeven_price=protection, levels_customized=1,
+                               breakeven_triggered_at=self._now().isoformat(sep=' '))
+        updates.update(self._profit_lock_updates({**row, **updates}, price))
+        if not updates:
             return row
-        protection = align_tick(entry + direction * settings["breakeven_offset_points"], float(row.get("contract_tick") or 1), direction)
-        stop = row.get("stop_price")
-        stop = protection if stop is None else max(stop, protection) if direction > 0 else min(stop, protection)
-        now = self._now().isoformat(sep=" ")
+        updates['updated_at'] = self._now().isoformat(sep=' ')
+        assignments = ', '.join(f'{key} = ?' for key in updates)
         with db.session(self.db_path) as conn:
-            conn.execute("UPDATE managed_orders SET stop_price = ?, breakeven_price = ?, breakeven_triggered_at = ?, "
-                         "levels_customized = 1, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ?",
-                         (stop, protection, now, now, row["id"]))
+            conn.execute(f'UPDATE managed_orders SET {assignments}, risk_revision = risk_revision + 1 WHERE id = ?',
+                         (*updates.values(), row['id']))
             conn.commit()
         return self._active_order(row["id"])
 
@@ -1277,7 +1317,7 @@ class TradingService:
                                  cycle_completed_at=mh.iso(self._now()), error=self._connect_error)
 
     @risk_locked
-    def _monitor_once(self) -> None:
+    def _monitor_once(self, *, before_protection=None) -> None:
         if not self._api:
             return
         self._validate_connected_mode()
@@ -1291,6 +1331,8 @@ class TradingService:
         except Exception as error:
             self._connect_error = f"進場監控錯誤：{type(error).__name__}"
             self.curve_entry.fail_pending(error)
+        if before_protection is not None:
+            before_protection()
         for row in active_rows:
             # A fill/status sync above may have changed the managed row (including
             # confirming a remainder cancellation), so make exit decisions from
@@ -1308,7 +1350,7 @@ class TradingService:
                 quote = self._quotes.get(row["contract_code"])
             if not quote:
                 continue
-            if self._fresh_risk_quote(row) is None:
+            if self._monitor_risk_quote(row) is None:
                 continue
             with db.session(self.db_path) as conn:
                 conn.execute(
@@ -1397,6 +1439,7 @@ class TradingService:
             "auto_exit_enabled": self.auto_exit_enabled(),
             "auto_entry_enabled": self.auto_entry_enabled(),
             **self.breakeven_settings(),
+            **self.profit_lock_settings(),
             "curve_entry": self.curve_entry.snapshot(),
             "error": error,
             **({"orders": self.orders()} if include_orders else {}),
@@ -1611,13 +1654,21 @@ class TradingService:
             return float(quote["price"])
         return None
 
+    def _monitor_risk_quote(self, row):
+        return self._fresh_risk_quote(row)
+
     @risk_locked
     def update_risk_settings(self, row_id: str, *, curve_id: int | None, stop_price: float,
                              target_price: float | None, breakeven_enabled: bool,
                              risk_revision: int, confirmed: bool = False,
                              breakeven_trigger_points: float | None = None,
-                             breakeven_offset_points: float | None = None) -> dict:
+                             breakeven_offset_points: float | None = None,
+                             profit_lock_enabled: bool | None = None) -> dict:
         row = self._editable_risk_order(row_id)
+        if profit_lock_enabled is None:
+            profit_lock_enabled = bool(row.get('profit_lock_enabled'))
+        elif not isinstance(profit_lock_enabled, bool):
+            raise ValueError('獲利回撤保本啟用狀態必須是布林值')
         point_values = dict(breakeven_trigger_points=breakeven_trigger_points,
                             breakeven_offset_points=breakeven_offset_points)
         for key, value in point_values.items():
@@ -1658,6 +1709,9 @@ class TradingService:
             floor = row["stop_price"]
             if direction * (stop - floor) < -tick * 1e-7:
                 raise ValueError("保本已觸發，請先關閉保本並儲存，再放寬 stop")
+        if row.get('profit_lock_enabled') and row.get('profit_lock_triggered_at'):
+            if direction * (stop - row['stop_price']) < -tick * 1e-7:
+                raise ValueError('獲利回撤保本已觸發，請先關閉獲利回撤保本並儲存，再放寬 stop')
         triggered = row.get("breakeven_triggered_at") if breakeven_enabled else None
         protection = row.get("breakeven_price") if breakeven_enabled else None
         settings = self._order_breakeven_settings({**row, **point_values})
@@ -1667,18 +1721,29 @@ class TradingService:
             protection = new_protection if protection is None else max(protection, new_protection) if direction > 0 else min(protection, new_protection)
             stop = max(stop, protection) if direction > 0 else min(stop, protection)
             triggered = triggered or self._now().isoformat(sep=" ")
+        lock_values = dict(profit_lock_enabled=int(profit_lock_enabled),
+                           profit_lock_started_at=(row.get('profit_lock_started_at') or self._now().isoformat(sep=' ')) if profit_lock_enabled else None,
+                           profit_lock_peak_points=float(row.get('profit_lock_peak_points') or 0) if profit_lock_enabled else 0.,
+                           profit_lock_triggered_at=row.get('profit_lock_triggered_at') if profit_lock_enabled else None,
+                           profit_lock_price=row.get('profit_lock_price') if profit_lock_enabled else None)
+        lock_updates = self._profit_lock_updates({**row, **lock_values, 'stop_price': stop}, self._profit_lock_quote(row, quote))
+        stop = lock_updates.pop('stop_price', stop)
+        lock_updates.pop('levels_customized', None)
+        lock_values.update(lock_updates)
         if curve_id is None and direction * (target - stop) <= 0:
             raise ValueError("套用保本後 stop 與 target 次序不符，請調整 target")
-        if quote is not None:
-            reason = crossed_exit(row["action"], quote, stop, target)
+        confirmation_quote = (self._profit_lock_quote(row, quote)
+                              if profit_lock_enabled and lock_values['profit_lock_price'] == stop else quote)
+        if confirmation_quote is not None:
+            reason = crossed_exit(row["action"], confirmation_quote, stop, target)
             if reason and not confirmed:
-                raise RiskConfirmation(f"最新行情 {quote:g} 已達新設定的{'停損' if reason == 'stop' else '停利'}價，儲存後可能立即出場。確認儲存？")
+                raise RiskConfirmation(f"最新行情 {confirmation_quote:g} 已達新設定的{'停損' if reason == 'stop' else '停利'}價，儲存後可能立即出場。確認儲存？")
         changed_curve = curve_id != row.get("curve_id")
         baseline = (pd.Timestamp(self._now()).ceil("min").isoformat(sep=" ")
                     if curve_id is not None and changed_curve else row.get("curve_check_from") if curve_id is not None else None)
         desired = dict(curve_id=curve_id, stop_price=stop, target_price=target, curve_check_from=baseline,
                        breakeven_enabled=int(breakeven_enabled), breakeven_triggered_at=triggered,
-                       breakeven_price=protection, levels_customized=1, **point_values)
+                       breakeven_price=protection, levels_customized=1, **point_values, **lock_values)
         if row.get('order_origin') == 'external_position':
             desired['auto_exit'] = 1
         if all(row.get(key) == value for key, value in desired.items()):
@@ -1689,11 +1754,16 @@ class TradingService:
                 "UPDATE managed_orders SET curve_id = ?, stop_price = ?, target_price = ?, curve_check_from = ?, "
                 "breakeven_enabled = ?, breakeven_triggered_at = ?, breakeven_price = ?, levels_customized = 1, "
                 "breakeven_trigger_points = ?, breakeven_offset_points = ?, auto_exit = ?, "
+                "profit_lock_enabled = ?, profit_lock_peak_points = ?, profit_lock_triggered_at = ?, profit_lock_price = ?, profit_lock_started_at = ?, "
                 "curve_armed = 0, risk_revision = risk_revision + 1, updated_at = ? WHERE id = ? AND risk_revision = ?",
                 (curve_id, stop, target, baseline, int(breakeven_enabled), triggered, protection,
-                 point_values['breakeven_trigger_points'], point_values['breakeven_offset_points'], desired.get('auto_exit', row['auto_exit']), now, row_id, risk_revision))
+                 point_values['breakeven_trigger_points'], point_values['breakeven_offset_points'], desired.get('auto_exit', row['auto_exit']),
+                 lock_values['profit_lock_enabled'], lock_values['profit_lock_peak_points'],
+                 lock_values['profit_lock_triggered_at'], lock_values['profit_lock_price'], lock_values['profit_lock_started_at'], now, row_id, risk_revision))
             if not cursor.rowcount:
                 raise RiskConflict("出場設定已更新，請重新核對")
+            if not profit_lock_enabled or not row.get('profit_lock_enabled'):
+                conn.execute('DELETE FROM managed_profit_lock_ticks WHERE order_id=?', (row_id,))
             conn.commit()
         self._curve_break_cache.clear()
         return self._public_order(self._active_order(row_id))
@@ -1804,12 +1874,14 @@ class TradingService:
             "avg_fill_price", "price", "price_type", "order_type", "atr", "stop_price",
             "target_price", "curve_id", "auto_exit", "simulation", "entry_trade_id",
             "curve_check_from", "contract_tick", "breakeven_enabled", "breakeven_triggered_at", "breakeven_price", "risk_revision",
+            "profit_lock_enabled", "profit_lock_peak_points", "profit_lock_triggered_at", "profit_lock_price",
             "entry_status", "exit_trade_id", "exit_status", "exit_filled_quantity", "avg_exit_price",
             "broker_octype", "reconciled_order_id", "exit_status_code", "order_origin",
             "triggered_at", "trigger_reason", "last_quote", "last_quote_at", "active",
             "error", "created_at", "updated_at",
         )}
         item.update(self._order_breakeven_settings(row))
+        item.update(self.profit_lock_settings())
         item['curve_timeframe'] = None
         item['curve_kind'] = None
         if row.get('curve_id') is not None:
@@ -1835,6 +1907,7 @@ class TradingService:
                               "fixed_target": tick_ready and broker_ready and exit_enabled and not row.get("curve_id"),
                               "curve_exit": tick_ready and broker_ready and bars_ready and exit_enabled and bool(row.get("curve_id")),
                               "breakeven": tick_ready and broker_ready and bool(row.get('active')) and bool(row.get("breakeven_enabled")),
+                              "profit_lock": tick_ready and broker_ready and bars_ready and exit_enabled and bool(row.get('profit_lock_enabled')),
                               "broker_protection": "unverified"}
         if quote is not None:
             item["last_quote"] = quote

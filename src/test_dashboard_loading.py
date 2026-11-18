@@ -1,5 +1,6 @@
 """Ensure fast hourly reads preserve the exact full-minute reference output."""
 import json
+import re
 
 import pandas as pd
 import pytest
@@ -13,6 +14,21 @@ import session_bars as sb
 from test_dashboard import minute_frame
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize('values, expected', [({}, 2), ({'default_entry_quantity': 3}, 3),
+    ({'default_entry_quantity': 1}, 1), ({'default_entry_quantity': 100}, 100)])
+def test_entry_quantity_config_reaches_both_forms(tmp_path, monkeypatch, values, expected):
+    path = tmp_path / 'dashboard.json'
+    path.write_text(json.dumps(values), encoding='utf-8')
+    monkeypatch.setitem(dashboard.CONFIG, 'dashboard_settings', DashboardConfig.load(path))
+    client = TestClient(dashboard.app)
+    assert client.get('/api/dashboard-config').json()['default_entry_quantity'] == expected
+    page = client.get('/')
+    assert page.status_code == 200
+    for field in ('trade-quantity', 'entry-quantity'):
+        assert re.search(rf'<input id="{field}"[^>]*value="{expected}"', page.text)
+    assert '{{default_entry_quantity}}' not in page.text
 
 
 @pytest.fixture

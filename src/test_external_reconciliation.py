@@ -48,12 +48,15 @@ def test_full_external_close_reconciles_persists_and_never_resubmits(rig, action
     r = rig
     opened = enter(r, 'open', action)
     records = evidence(r, opened, legacy=legacy)
+    with db.session(r.path) as conn:
+        conn.execute('UPDATE managed_orders SET profit_lock_enabled=1 WHERE id=?', (opened,))
+        conn.commit()
     calls = install(r, records)
     r.broker.position = 0
     r.service._sync_managed_orders(force=True)
     closed = rows(r)[opened]
     assert r.service._broker_ready and not r.service._reconcile_error, (r.service._reconcile_error, calls, r.service._quote_aliases)
-    assert closed['active'] == closed['auto_exit'] == closed['breakeven_enabled'] == 0
+    assert closed['active'] == closed['auto_exit'] == closed['breakeven_enabled'] == closed['profit_lock_enabled'] == 0
     assert closed['avg_exit_price'] == 19900 and closed['exit_filled_quantity'] == 2
     assert closed['trigger_reason'] == 'external_close' and closed['exit_trade_id'] is None
     assert closed['triggered_at'] is None  # a business date is not a fill timestamp

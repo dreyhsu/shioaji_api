@@ -2,5 +2,6 @@
   "auto_entry_enabled": true,
   "auto_exit_enabled": true,
   "breakeven_trigger_points": 200,
-  "breakeven_offset_points": 10
+  "breakeven_offset_points": 10,
+  "profit_lock_trigger_points": 500
 }

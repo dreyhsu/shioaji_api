@@ -44,7 +44,7 @@ def test_adoption_persists_full_lots_waits_for_risk_save_and_exits_once(rig, act
     row = rows(r)[row_id]
     assert row['order_origin'] == 'external_position' and row['active'] == 1
     assert row['filled_quantity'] == 2 and row['avg_fill_price'] == 20000.5
-    assert row['auto_exit'] == row['breakeven_enabled'] == 0
+    assert row['auto_exit'] == row['breakeven_enabled'] == row['profit_lock_enabled'] == 0
     assert row['atr'] == 120 and row['triggered_at'] is None
     assert row['stop_price'] == (19760 if action == 'Buy' else 20240)
     assert row['target_price'] == (20240 if action == 'Buy' else 19760)

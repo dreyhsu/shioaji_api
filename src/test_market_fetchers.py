@@ -145,7 +145,21 @@ def test_tick_latest_is_published_per_second_without_inventing_timestamps(rig):
     service.step()
     assert rows(service, 'market_latest_quotes')[0]['quote_at'] == record['quote_at']
     assert service.health['stream_fresh'] is False
+    tape = rows(service, 'market_risk_ticks')
+    assert [row['price'] for row in tape] == [20000, 20005]
+    assert len({row['tick_id'] for row in tape}) == 2
     assert not service.store.conn.execute("SELECT name FROM sqlite_master WHERE name='minute_bars'").fetchone()
+
+
+def test_tick_tape_retains_peak_and_retrace_between_latest_publications(rig):
+    service = rig.create()
+    service.step()
+    api = rig.apis[0]
+    for price in (20000, 20800, 20400, 20700):
+        api.tick(rig.now[0], price)
+    service.step()
+    assert rows(service, 'market_latest_quotes')[0]['price'] == 20700
+    assert [row['price'] for row in rows(service, 'market_risk_ticks')] == [20000, 20800, 20400, 20700]
 
 
 def test_late_quote_does_not_replace_latest_and_invalid_ticks_are_ignored(rig):
@@ -201,8 +215,8 @@ def test_tick_diagnostics_separate_receipt_queue_and_committed_publication(rig, 
     rig.advance('2026-10-30 09:00:00.350', .25)
     original = service.store.quotes
 
-    def slow_write(records):
-        original(records)
+    def slow_write(records, ticks=()):
+        original(records, ticks)
         rig.advance('2026-10-30 09:00:00.400', .05)
 
     monkeypatch.setattr(service.store, 'quotes', slow_write)
@@ -365,7 +379,7 @@ def test_db_lock_does_not_relogin_or_discard_pending_quotes(rig, monkeypatch):
     api = rig.apis[0]
     api.tick(rig.now[0], 20001)
     original = service.store.quotes
-    def blocked(_):
+    def blocked(*_):
         raise sqlite3.OperationalError('database is locked')
     monkeypatch.setattr(service.store, 'quotes', blocked)
     service.step()
@@ -373,6 +387,7 @@ def test_db_lock_does_not_relogin_or_discard_pending_quotes(rig, monkeypatch):
     monkeypatch.setattr(service.store, 'quotes', original)
     service.step()
     assert len(rig.apis) == 1 and rows(service, 'market_latest_quotes')[0]['price'] == 20001
+    assert [row['price'] for row in rows(service, 'market_risk_ticks')] == [20001]
 
 
 def test_ohlcv_uses_tick_event_order_and_delays_close():
