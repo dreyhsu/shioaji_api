@@ -126,14 +126,81 @@ def test_incomplete_or_conflicting_evidence_keeps_gate_closed(rig, corruption):
         assert conn.execute('SELECT COUNT(*) FROM external_close_reconciliations').fetchone()[0] == 0
 
 
-def test_partial_external_close_is_not_falsely_finalized(rig):
+@pytest.mark.parametrize('action', ['Buy', 'Sell'])
+def test_partial_external_close_preserves_remaining_risk_and_exits_only_one(rig, action):
+    r = rig
+    opened = enter(r, 'open', action)
+    records = evidence(r, opened)[:1]
+    before = rows(r)[opened]
+    install(r, records)
+    r.broker.position = 1 if action == 'Buy' else -1
+    r.service._sync_managed_orders(force=True)
+    row = rows(r)[opened]
+    assert r.service._broker_ready and row['exit_filled_quantity'] == row['external_exit_quantity'] == 1
+    assert row['active'] == 1 and row['exit_status'] is None
+    assert all(row[key] == before[key] for key in ('auto_exit', 'breakeven_enabled', 'profit_lock_enabled', 'stop_price', 'target_price'))
+    assert len(r.broker.trades) == 1
+    for _ in range(2):
+        r.service._sync_managed_orders(force=True)
+    assert rows(r)[opened]['exit_filled_quantity'] == 1
+    notifications = []
+    r.service.entry_notifier.notify_exit = lambda row: notifications.append(row)
+    r.service._try_auto_exit(rows(r)[opened], 'stop')
+    r.service._sync_managed_orders(force=True)
+    assert len(r.broker.trades) == 2 and r.broker.trades[-1].order.quantity == 1
+    row = rows(r)[opened]
+    assert row['active'] == 0 and row['exit_filled_quantity'] == 2
+    assert len(notifications) == 1 and notifications[0]['filled_quantity'] == notifications[0]['exit_filled_quantity'] == 1
+    with db.read_session(r.path) as conn:
+        assert conn.execute("SELECT SUM(quantity) FROM pnl_fills WHERE order_id=? AND phase='exit'", (opened,)).fetchone()[0] == 2
+        report, _, pending, _, _ = pnl_calendar.report(conn, 'simulation', '2026-10')
+        assert pending == 0 and sum(item['quantity'] for item in report) == 2
+
+
+def test_repeated_external_partial_then_full_close_is_cumulative_and_restart_safe(rig):
+    r = rig
+    opened = enter(r, 'open', 'Sell', quantity=3)
+    records = evidence(r, opened)
+    install(r, records[:1])
+    r.broker.position = -2
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and rows(r)[opened]['external_exit_quantity'] == 1
+    r.service.close()
+    service = r.create()
+    service.ensure_connected()
+    service._sync_managed_orders(force=True)
+    assert service._broker_ready and rows(r)[opened]['external_exit_quantity'] == 1
+    for quantity in (2, 3):
+        install(r, records[:quantity])
+        r.broker.position = -(3 - quantity)
+        r.mono[0] += 61
+        service._sync_managed_orders(force=True)
+        assert service._broker_ready and rows(r)[opened]['external_exit_quantity'] == quantity
+    with db.read_session(r.path) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM position_sync_events').fetchone()[0] == 3
+        assert conn.execute('SELECT COUNT(*) FROM external_close_reconciliations').fetchone()[0] == 1
+    assert len(r.broker.trades) == 1 and rows(r)[opened]['active'] == 0
+
+
+def test_partial_close_rollback_and_unknown_command_never_change_local_quantity(rig):
     r = rig
     opened = enter(r, 'open')
     install(r, evidence(r, opened)[:1])
+    with db.session(r.path) as conn:
+        conn.execute("INSERT INTO trade_commands VALUES ('uncertain','TMFR1','simulation','{}','unknown','t','t',NULL,NULL)")
+        conn.commit()
     r.broker.position = 1
     r.service._sync_managed_orders(force=True)
-    assert not r.service._broker_ready and rows(r)[opened]['exit_filled_quantity'] == 0
-    assert len(r.broker.trades) == 1
+    assert not r.service._broker_ready and rows(r)[opened]['external_exit_quantity'] == 0
+    with db.session(r.path) as conn:
+        conn.execute("UPDATE trade_commands SET state='failed' WHERE id='uncertain'")
+        conn.execute("CREATE TRIGGER fail_sync BEFORE INSERT ON position_sync_events BEGIN SELECT RAISE(ABORT,'offline'); END")
+        conn.commit()
+    r.mono[0] += 61
+    r.service._sync_managed_orders(force=True)
+    assert not r.service._broker_ready and rows(r)[opened]['external_exit_quantity'] == 0
+    with db.read_session(r.path) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM external_close_reconciliations').fetchone()[0] == 0
 
 
 def test_realized_query_failure_is_throttled_and_recovers(rig):

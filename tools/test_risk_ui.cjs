@@ -35,13 +35,21 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   assert.equal(get('risk-breakeven-trigger').value, 100);
   assert.equal(get('risk-breakeven-offset').value, 5);
   assert.equal(get('risk-profit-lock').checked, false);
-  assert.match(get('risk-profit-lock-label').textContent, /500/);
+  assert.match(get('risk-profit-lock-label').textContent, /300/);
   ctx.state.orders[0].profit_lock_trigger_points = 600;
+  Object.assign(ctx.state.orders[0], { profit_lock_trigger_retained_points: 400,
+    profit_lock_tier_from_points: 600, profit_lock_tier_to_points: 800,
+    profit_lock_giveback_ratio: 1 / 3 });
   ctx.renderRiskEditor();
   assert.match(get('risk-profit-lock-label').textContent, /600/);
-  assert.match(get('risk-profit-lock-state').textContent, /600.*300/);
+  assert.match(get('risk-profit-lock-state').textContent, /600.*400/);
   ctx.updateRiskDraft('a', { breakeven_trigger_points: '60', breakeven_offset_points: '8', profit_lock_enabled: true });
   assert.equal(get('risk-profit-lock').checked, true);
+  assert.match(get('risk-profit-lock-state').textContent, /600.*800.*33.333/);
+  ctx.state.orders[0].profit_lock_config_error = 'invalid_config';
+  ctx.renderRiskEditor();
+  assert.match(get('risk-profit-lock-state').textContent, /沿用上一份有效設定/);
+  ctx.state.orders[0].profit_lock_config_error = null;
   ctx.state.selectedId = 'b';
   ctx.renderRiskEditor();
   assert.equal(get('risk-breakeven-trigger').value, 150);

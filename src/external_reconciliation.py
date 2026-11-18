@@ -1,4 +1,4 @@
-"""Plan full external closes from broker realized-P&L evidence, without writes."""
+"""Plan cumulative external closes from broker realized-P&L evidence, without writes."""
 from collections import Counter, defaultdict
 from datetime import datetime
 from decimal import Decimal
@@ -81,7 +81,7 @@ def normalize_detail(item, aliases):
     return record
 
 
-def plan_external_closes(rows, history, fills, identities, details, actual, account, calendar, used=()):
+def plan_external_closes(rows, history, fills, identities, details, actual, account, calendar, used=(), *, entry_lots=None):
     """Require a complete unique original entry and a reconciled whole portfolio.
 
     Legacy rows without a saved order number require an exact, unique per-price entry
@@ -94,20 +94,26 @@ def plan_external_closes(rows, history, fills, identities, details, actual, acco
         groups[key].append(detail)
     fingerprints = {row['id']: entry_fingerprint(fills.get(row['id'], []), calendar) for row in history}
     planned = {row['id']: dict(row) for row in rows}
+    baseline = position_totals(rows)
     repairs, claimed = [], set(used)
     for row in rows:
         pair = row['contract_code'], row['action']
-        # Full closes only. An external partial close never guesses allocation.
-        if (not row['active'] or actual.get(pair, 0) or row.get('broker_octype') == 'Cover'
+        external_quantity = int(row.get('external_exit_quantity', 0))
+        identity = identities.get(row['id'])
+        broker_lot = None
+        if entry_lots is not None and identity and identity.get('ordno'):
+            broker_lot = entry_lots.get((*pair, identity['entry_date'], identity['ordno']), {'quantity': 0, 'details': []})
+        reducing = (broker_lot['quantity'] < int(row['filled_quantity']) - int(row['exit_filled_quantity'])
+                    if broker_lot is not None else actual.get(pair, 0) < baseline.get(pair, 0))
+        if (not row['active'] or not reducing or row.get('broker_octype') == 'Cover'
                 or int(row['filled_quantity']) <= 0 or row['entry_status'] not in TERMINAL
-                or int(row['exit_filled_quantity']) != 0
+                or int(row['exit_filled_quantity']) != external_quantity
                 or row.get('exit_trade_id') and row.get('exit_status') not in {'Failed', 'Rejected', 'Cancelled'}
                 or row.get('exit_status') in {'unknown', 'submitting', 'cancelling_entry', 'waiting_entry_cancel'}):
             continue
         fingerprint = fingerprints.get(row['id'])
         if fingerprint is None or sum(fingerprint[1].values()) != int(row['filled_quantity']):
             continue
-        identity = identities.get(row['id'])
         if identity and (identity['account_key'] != account or identity['broker_trade_id'] != row['entry_trade_id']):
             continue
         if identity and not identity.get('ordno'):
@@ -128,8 +134,17 @@ def plan_external_closes(rows, history, fills, identities, details, actual, acco
             prices = Counter()
             for detail in records:
                 prices[Decimal(str(detail['entry_price']))] += detail['quantity']
-            if prices != fingerprint[1] or any(record['entry_quantity'] < record['quantity'] for record in records):
+            # A saved exchange order number identifies a partial close. Legacy
+            # rows still require the complete, unique per-price fingerprint.
+            if ((not identity and prices != fingerprint[1]) or prices - fingerprint[1]
+                    or any(record['entry_quantity'] < record['quantity'] for record in records)):
                 continue
+            if broker_lot is not None:
+                remaining_prices = Counter()
+                for record in broker_lot['details']:
+                    remaining_prices[Decimal(str(record['price']))] += record['quantity']
+                if prices + remaining_prices != fingerprint[1]:
+                    continue
             evidence_key = hashlib.sha256(json.dumps([account, *key]).encode()).hexdigest()
             if evidence_key not in claimed:
                 matches.append((evidence_key, records))
@@ -137,15 +152,23 @@ def plan_external_closes(rows, history, fills, identities, details, actual, acco
             continue
         evidence_key, records = matches[0]
         quantity = sum(record['quantity'] for record in records)
+        if not external_quantity < quantity <= int(row['filled_quantity']):
+            continue
         average = sum(record['quantity'] * record['cover_price'] for record in records) / quantity
-        changes = dict(active=0, auto_exit=0, breakeven_enabled=0, profit_lock_enabled=0, curve_armed=0,
-            exit_trade_id=None, exit_status='Filled', exit_status_code=None, triggered_at=None,
+        full = quantity == int(row['filled_quantity'])
+        changes = dict(active=int(not full), external_exit_quantity=quantity,
+            exit_trade_id=None, exit_status='Filled' if full else None, exit_status_code=None, triggered_at=None,
             exit_filled_quantity=quantity, avg_exit_price=average,
-            trigger_reason='external_close', error=None)
+            trigger_reason='external_close' if full else None, error=None)
+        if full:
+            changes.update(auto_exit=0, breakeven_enabled=0, profit_lock_enabled=0, curve_armed=0)
         repairs.append(dict(before=dict(row), changes=changes, evidence_key=evidence_key,
             account_key=account, match_method='entry_seqno' if identity else 'unique_entry_fills', details=records))
         planned[row['id']].update(changes)
         claimed.add(evidence_key)
-    if repairs and position_totals(planned.values()) != actual:
+    changed_pairs = {(repair['before']['contract_code'], repair['before']['action']) for repair in repairs}
+    totals = position_totals(planned.values())
+    if repairs and (any(quantity > actual.get(pair, 0) for pair, quantity in totals.items())
+                    or entry_lots is None and any(totals.get(pair, 0) != actual.get(pair, 0) for pair in changed_pairs)):
         raise ReconciliationPending('外部平倉明細尚無法完整核對全部部位，等待券商資料')
     return repairs

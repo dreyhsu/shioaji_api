@@ -229,6 +229,8 @@ def test_wrapper_handles_project_and_conda_paths_with_spaces(tmp_path):
     import os
     import shutil
     import subprocess
+    if os.name == 'nt':
+        pytest.skip('POSIX .command wrapper; Windows uses start_all.bat')
     root = Path(__file__).resolve().parents[1]
     project = tmp_path / 'project with spaces'
     tools = tmp_path / 'conda with spaces'

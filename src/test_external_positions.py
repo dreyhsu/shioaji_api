@@ -13,7 +13,10 @@ from test_external_reconciliation import install
 pytestmark = pytest.mark.integration
 
 
-def external(r, action='Buy'):
+def external(r, action='Buy', *, automatic=False):
+    if not automatic:
+        r.service._reconcile_external_positions = lambda *args: None
+        r.service._prepare_broker_lots = lambda *args: False
     r.broker.position = 2 if action == 'Buy' else -2
     r.broker.list_positions = lambda *a, **k: ([] if not r.broker.position else [NS(
         id=0, code=r.broker.contract.code, direction='Buy' if r.broker.position > 0 else 'Sell',
@@ -23,6 +26,86 @@ def external(r, action='Buy'):
     r.broker.list_position_detail = lambda *a, **k: details
     r.runtime.step()
     return details
+
+
+@pytest.mark.parametrize('action', ['Buy', 'Sell'])
+def test_automatic_broker_lot_import_preserves_existing_risk_and_never_sends(rig, action):
+    r = rig
+    external(r, action, automatic=True)
+    assert r.service._broker_ready, r.service._reconcile_error
+    first = list(rows(r).values())[0]
+    assert first['filled_quantity'] == 2 and first['active'] == 1
+    assert first['auto_exit'] == first['breakeven_enabled'] == first['profit_lock_enabled'] == 0
+    r.service.update_risk_settings(first['id'], curve_id=None, stop_price=19000 if action == 'Buy' else 21000,
+        target_price=21000 if action == 'Buy' else 19000, breakeven_enabled=True,
+        risk_revision=first['risk_revision'])
+    existing = rows(r)[first['id']]
+    details = [NS(code=r.broker.contract.code, direction=action, date='20261030', quantity=2,
+        entry_quantity=2, price=20000.5, currency='TWD', dseq='app-new-1'),
+        NS(code=r.broker.contract.code, direction=action, date='20261030', quantity=1,
+        entry_quantity=1, price=20020, currency='TWD', dseq='app-new-2')]
+    r.broker.list_position_detail = lambda *a, **k: details
+    r.broker.position = 3 if action == 'Buy' else -3
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and len(rows(r)) == 2, r.service._reconcile_error
+    assert all(rows(r)[first['id']][key] == existing[key] for key in ('stop_price', 'target_price', 'auto_exit', 'breakeven_enabled'))
+    for _ in range(3):
+        r.service._sync_managed_orders(force=True)
+    assert len(rows(r)) == 2 and not r.broker.trades
+
+
+def test_automatic_import_requires_stable_lot_identity_and_rolls_back(rig):
+    r = rig
+    details = external(r, automatic=False)
+    del r.service._reconcile_external_positions
+    del r.service._prepare_broker_lots
+    count = [0]
+    def changed(*args, **kwargs):
+        count[0] += 1
+        if count[0] == 2:
+            details[0].dseq = 'reopened'
+        return details
+    r.broker.list_position_detail = changed
+    r.service._sync_managed_orders(force=True)
+    assert not r.service._broker_ready and not rows(r)
+    assert '已變動' in r.service._reconcile_error
+
+
+def test_automatic_import_does_not_manage_an_unconfigured_month(rig):
+    r = rig
+    r.service.position_sync_codes = {'TMFR1'}
+    external(r, automatic=True)
+    assert not r.service._broker_ready and not rows(r) and not r.broker.trades
+
+
+def test_close_one_and_reopen_one_same_total_splits_original_and_new_lot(rig):
+    r = rig
+    r.service.position_sync_codes = {'TMFR1', r.broker.contract.code}
+    original_details = external(r, 'Sell', automatic=True)
+    original = list(rows(r).values())[0]
+    r.service.update_risk_settings(original['id'], curve_id=None, stop_price=21000,
+        target_price=19000, breakeven_enabled=True, risk_revision=original['risk_revision'])
+    previous = rows(r)[original['id']]
+    remaining = original_details[1]
+    new = NS(code=r.broker.contract.code, direction='Sell', date='20261030', quantity=1,
+        entry_quantity=1, price=20020, currency='TWD', dseq='app-new-2')
+    r.broker.list_position_detail = lambda *args, **kwargs: [remaining, new]
+    closed = original_details[0]
+    install(r, [NS(code=closed.code, direction=closed.direction, date=closed.date,
+        entry_date=closed.date, entry_seqno=closed.dseq, entry_quantity=1, quantity=1,
+        entry_price=closed.price, cover_price=19900, dseq='app-cover', currency='TWD', pnl=1000, fee=30, tax=10)])
+    r.mono[0] += 61
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and not r.service._reconcile_error, r.service._reconcile_error
+    managed = rows(r)
+    assert len(managed) == 2 and not r.broker.trades
+    old = managed.pop(original['id'])
+    assert old['filled_quantity'] == 2 and old['external_exit_quantity'] == old['exit_filled_quantity'] == 1
+    assert all(old[key] == previous[key] for key in ('auto_exit','breakeven_enabled','stop_price','target_price'))
+    added = list(managed.values())[0]
+    assert added['filled_quantity'] == 1 and added['avg_fill_price'] == 20020 and added['auto_exit'] == 0
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and len(rows(r)) == 2 and not r.broker.trades
 
 
 def adopt(r, identity='adopt-1', action='Buy', **changes):

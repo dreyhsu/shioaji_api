@@ -26,6 +26,7 @@ import session_bars as sb
 import snr_core as snr
 import gap_zones
 import supertrend_alerts
+from session_open_alerts import SessionOpenAlerts
 from monitor_notify import MonitorNotifier
 from latency_trace import LatencyRecorder
 import market_health as mh
@@ -61,6 +62,7 @@ class MonitorConfig:
     alerts_config: Path = ar.DEFAULT_CONFIG_PATH
     health_config: Path = mh.DEFAULT_CONFIG
     api_timeout_ms: int = 30000
+    signal_code: str = "TMFR1"
 
 
 def log(message: str) -> None:
@@ -190,15 +192,23 @@ def _enqueue_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate
     rather than the wall clock, so a restart or a replay throttles the same way.
     The config master switch pauses alerts without claiming their history.
     """
-    if not alerts.telegram_enabled:
+    alert_id = claim_rule(conn, config, alerts, candidate, minute_start)
+    if alert_id is None:
         return False
+    return enqueue_claimed_rule(conn, config, candidate, alert_id, notifier=notifier)
+
+
+def claim_rule(conn, config, alerts, candidate, minute_start, *, commit=True):
+    """Persist a claim, optionally in the caller's state-update transaction."""
+    if not alerts.telegram_enabled:
+        return None
     last = db.last_alert_at(conn, config.code, candidate.key, candidate.rule)
     if last is not None:
         if candidate.once:
-            return False
+            return None
         cooldown = pd.Timedelta(minutes=alerts.cooldown_minutes(candidate.rule))
         if pd.Timestamp(minute_start) - last < cooldown:
-            return False
+            return None
     alert_id = db.record_alert(
         conn,
         config.code,
@@ -208,9 +218,13 @@ def _enqueue_rule(conn, config: MonitorConfig, alerts: ar.AlertConfig, candidate
         visit_id=None,
         kind=candidate.rule,
         message=candidate.message,
+        commit=commit,
     )
-    if alert_id is None:
-        return False  # this minute is already claimed -- a re-polled cycle
+    return alert_id
+
+
+def enqueue_claimed_rule(conn, config, candidate, alert_id, *, notifier=None):
+    """Submit only after the claim (and any associated rule state) is committed."""
     if not config.enable_telegram:
         db.mark_alert_sent(conn, alert_id, False)
         log(f"  [telegram disabled] would send {candidate.rule} ({candidate.key})")
@@ -520,6 +534,7 @@ class MonitorRuntime:
         self._calendar_token = self._cached_calendar = None
         self.signals_ready = False
         self.ready_since = None
+        self.open_alerts = SessionOpenAlerts(config.code, config.mode, started_at=clock())
         self.audit_path = Path(config.db_path).resolve().parent / 'logs' / 'monitor.log'
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS monitor_fetch_events (
@@ -818,6 +833,17 @@ class MonitorRuntime:
                 self.last_state = run_cycle(None, None, self.conn, self.config, self.watchers, self.recorder,
                                            self.alerts, fresh=pd.DataFrame(), allow_signals=ready, notifier=self.notifier)
             self.last_frame = fresh
+            if self.config.code == self.config.signal_code and self.config.mode != 'mock':
+                jobs = self.open_alerts.step(
+                    self.conn, self.last_state.hourly if self.last_state is not None else pd.DataFrame(),
+                    calendar, now, ready=ready,
+                    opening_grace=validation['opening_grace'] and stream_ready,
+                    enabled=(self.config.enable_telegram and self.alerts.telegram_enabled
+                             and self.alerts.enabled('session_open_supertrend')),
+                    claim=lambda candidate, minute: claim_rule(
+                        self.conn, self.config, self.alerts, candidate, minute, commit=False))
+                for alert_id, candidate in jobs:
+                    enqueue_claimed_rule(self.conn, self.config, candidate, alert_id, notifier=self.notifier)
             self.signals_ready = ready
             state = self.last_state
             self.last_fetch = self.monotonic()
@@ -857,6 +883,7 @@ class MonitorRuntime:
             return state
         except Exception as error:
             self.conn.rollback()
+            self.open_alerts.suspend(now)
             self.publisher.publish(state='failed', operation=None, validation_pending=True,
                                    error={'kind': error_kind(error), 'type': type(error).__name__})
             log(f'fetch monitor failed: {error_kind(error)}: {type(error).__name__}')
@@ -925,6 +952,7 @@ def parse_args(argv: list[str] | None = None) -> MonitorConfig:
 
     return MonitorConfig(
         code=args.code or runtime_config.signal_code,
+        signal_code=runtime_config.signal_code,
         db_path=args.db or runtime_config.unified_db,
         fetcher_db=args.fetcher_db or runtime_config.acquisition_db,
         mode=runtime_config.mode,

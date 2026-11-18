@@ -394,6 +394,7 @@ def main(argv=None):
     if not re.fullmatch('[A-Za-z0-9]{1,24}', args.code):
         parser.error('invalid code')
     app = create_app(db_path=args.db or runtime_config.unified_db, code=args.code, simulation=runtime_config.mode == 'simulation',
+        position_sync_codes=runtime_config.contracts,
         fetcher_settings=FetcherSettings.load(args.config or runtime_config.market_config), health_config=args.health_config or runtime_config.health_config,
         settings_path=args.settings or runtime_config.trading_config, enable_telegram=not args.no_telegram)
     run_server(app, control=lambda: getattr(getattr(app.state, 'runtime', None), 'service', None), host=args.host or runtime_config.trade_host, port=args.port or runtime_config.trade_port, workers=1)

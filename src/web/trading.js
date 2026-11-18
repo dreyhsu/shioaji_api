@@ -183,6 +183,8 @@
     const selectedQuote = selected && info.market_quotes ? info.market_quotes[selected.code] : null;
     const contractReady = !info.contract_bars_ready || (selected && info.contract_bars_ready[selected.code]);
     state.entryReady = info.bars_ready !== false && info.broker_ready !== false && Boolean(contractReady);
+    state.manualReady = info.manual_order_ready
+      ? Boolean(selected && info.manual_order_ready[selected.code]) : state.entryReady;
     lastTradeStatusAt = Date.now();
     entryEnabled = Boolean(info.auto_entry_enabled);
     entrySnapshot = info.curve_entry || null;
@@ -206,10 +208,11 @@
         ? `固定出場：${protection.fixed_exit ? '監控中' : '受影響'} · 保本：${protection.breakeven ? '監控中' : '受影響'} · 曲線出場：${protection.curve_exit ? '監控中' : '暫停'} · 券商端保護：待核對`
         : (quoteReady ? '自動市價出場：啟用' : '自動出場已啟用；等待行情 tick');
     if (info.reconciliation_error) connection.textContent = info.reconciliation_error;
+    else if (selected && info.manual_order_errors?.[selected.code]) connection.textContent = info.manual_order_errors[selected.code];
     if (info.pending_external_risk) $('auto-exit-state').textContent += ` · ${info.pending_external_risk} 筆接管部位待設定出場（未啟用保護）`;
     state.price = displayPrice == null ? null : Number(displayPrice);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
-    $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
+    $('trade-submit').disabled = !state.connected || !state.manualReady || !selectedContract() || busy;
   }
 
   async function loadContracts() {
@@ -227,7 +230,7 @@
     select.disabled = state.contracts.length === 0;
     if (state.contracts.some((item) => item.code === previous)) select.value = previous;
     else if (state.contracts.length) select.selectedIndex = 0;
-    $('trade-submit').disabled = !state.connected || !state.entryReady || !selectedContract() || busy;
+    $('trade-submit').disabled = !state.connected || !state.manualReady || !selectedContract() || busy;
     if (selectedContract()) subscribeSelectedContract();
   }
 
@@ -315,7 +318,8 @@
     preview.innerHTML = `基準 ${priceType === 'LMT' ? '委託價' : '最新成交價'} ${number(entry)} · ATR(1h) ${number(atr, 1)}<br>`
       + `停損 <b>${number(stop)}</b> · `
       + (curve ? `移動停利：${escapeHtml($('trade-curve').selectedOptions[0]?.textContent || '已選曲線')}` : `停利 <b>${number(target)}</b>`);
-    $('trade-submit').disabled = !state.connected || !state.entryReady || !contract || busy;
+    if (state.manualReady && !state.entryReady) preview.innerHTML += '<br>歷史 K 棒待就緒，可依即時 tick 手動送單；自動出場保護受影響。';
+    $('trade-submit').disabled = !state.connected || !state.manualReady || !contract || busy;
   }
 
   function escapeHtml(text) {
@@ -346,7 +350,8 @@
     if (order.trigger_reason && !order.exit_trade_id) return '已觸發 · 自動出場停用';
     if (order.exit_trade_id && Number(order.exit_filled_quantity) > 0 && !order.active) return '已平倉';
     if (Number(order.filled_quantity) > Number(order.exit_filled_quantity)) {
-      if (order.entry_status === 'Filled') return '持倉監控中';
+      if (order.entry_status === 'Filled') return Number(order.external_exit_quantity) > 0
+        ? `外部已平 ${order.external_exit_quantity} 口 · 剩餘 ${Number(order.filled_quantity) - Number(order.exit_filled_quantity)} 口監控中` : '持倉監控中';
       if (order.entry_status === 'Cancelled') return `部分成交 ${order.filled_quantity} 口 · 餘量已取消`;
       return `部分成交 ${order.filled_quantity}/${order.quantity} 口`;
     }
@@ -448,13 +453,17 @@
       $('risk-target').placeholder = values.curve_id && target == null ? '線條暫不可用' : '';
       $('risk-breakeven').checked = values.breakeven_enabled;
       $('risk-profit-lock').checked = values.profit_lock_enabled;
-      const profitLockTrigger = order.profit_lock_trigger_points ?? 500;
-      $('risk-profit-lock-label').textContent = `獲利回撤保本：達 ${number(profitLockTrigger)} 點後，保留最高浮盈 50%`;
+      const profitLockTrigger = order.profit_lock_trigger_points ?? 300;
+      const giveback = order.profit_lock_giveback_ratio;
+      const tier = giveback == null ? '區間資料尚未取得'
+        : `目前區間 ${number(order.profit_lock_tier_from_points ?? 0)} 點${order.profit_lock_tier_to_points == null ? '以上' : `至未滿 ${number(order.profit_lock_tier_to_points)} 點`}，容許回吐 ${number(giveback * 100, 2)}%`;
+      $('risk-profit-lock-label').textContent = `獲利回撤保本：達 ${number(profitLockTrigger)} 點後，依最高浮盈區間保護`;
       $('risk-profit-lock-state').textContent = order.profit_lock_enabled
         ? (order.profit_lock_triggered_at
-          ? `已啟動：每口最高浮盈 ${number(order.profit_lock_peak_points, 2)} 點，保護價 ${number(order.profit_lock_price, 2)}；tick 碰價觸發平倉，成交可能有延遲與滑價。`
-          : `等待每口浮盈達 ${number(profitLockTrigger)} 點；目前最高 ${number(order.profit_lock_peak_points || 0, 2)} 點。追蹤 tick，多單最高價／空單最低價。`)
-        : `逐單啟用並儲存後追蹤 tick；多單最高價／空單最低價，達 ${number(profitLockTrigger)} 點保留 ${number(profitLockTrigger * 0.5)} 點，回撤碰價觸發平倉。`;
+          ? `已啟動：每口最高浮盈 ${number(order.profit_lock_peak_points, 2)} 點，保護價 ${number(order.profit_lock_price, 2)}；${tier}。保護價只收緊；tick 碰價觸發平倉，成交可能有延遲與滑價。`
+          : `等待每口浮盈達 ${number(profitLockTrigger)} 點；目前最高 ${number(order.profit_lock_peak_points || 0, 2)} 點。${tier}。追蹤 tick，多單最高價／空單最低價。`)
+        : `逐單啟用並儲存後追蹤 tick；多單最高價／空單最低價，達 ${number(profitLockTrigger)} 點保留 ${number(order.profit_lock_trigger_retained_points, 2)} 點，之後依最高浮盈區間調整。${tier}。回撤碰價觸發平倉。`;
+      if (order.profit_lock_config_error) $('risk-profit-lock-state').textContent += ' 設定讀取／驗證失敗，沿用上一份有效設定；尚無有效設定時使用內建預設。';
       for (const [id, value] of [['trigger', values.breakeven_trigger_points], ['offset', values.breakeven_offset_points]]) {
         const input = $('risk-breakeven-' + id);
         if (document.activeElement !== input) input.value = value ?? '';
@@ -604,6 +613,9 @@
         ? (order.action === 'Buy' ? '買進平倉' : '賣出平倉') : (order.action === 'Buy' ? '多單' : '空單');
       const filled = Number(order.filled_quantity || 0);
       const entry = filled > 0 ? order.avg_fill_price : order.price;
+      const quantityLabel = Number(order.exit_filled_quantity) > 0
+        ? `剩餘 ${Math.max(0, filled - Number(order.exit_filled_quantity))} 口 · 已平 ${order.exit_filled_quantity}／原成交 ${filled} 口`
+        : `${filled}/${order.quantity} 口`;
       const entryLabel = filled > 0 ? '成交均價' : '委託價';
       const actions = [];
       if (canManageCurve(order)) {
@@ -613,7 +625,7 @@
       if (cancelErrors.has(order.id)) actions.push(`<span class="cancel-error" role="alert">${escapeHtml(cancelErrors.get(order.id))}</span>`);
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
       return `<div class="managed-order ${selected ? 'selected' : ''}" data-order-id="${escapeHtml(order.id)}" tabindex="0">
-        <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${filled}/${order.quantity} 口</b><br>
+        <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${quantityLabel}</b><br>
           <span class="managed-order-sub">${entryLabel} ${number(entry)} · ${order.broker_octype === 'Cover' ? '券商確認為平倉委託' : `停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} ${order.curve_kind === 'line' ? '直線' : '曲線'}；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}`}</span>
         </div><span class="order-status ${order.active ? 'active' : ''}">${escapeHtml(orderStatus(order))}</span>${actionMarkup}</div>`;
     }).join('');
@@ -698,7 +710,7 @@
         lastStateAt = Date.now();
       }
     } catch (error) {
-      state.connected = state.entryReady = false;
+      state.connected = state.entryReady = state.manualReady = false;
       $('trade-connection').textContent = '連線狀態查詢失敗：' + error.message;
       $('trade-connection').className = 'trade-connection bad';
       $('auto-exit-state').textContent = '保護狀態無法確認，請檢查獨立告警與券商端';
@@ -842,7 +854,7 @@
   });
   $('trade-contract').addEventListener('change', () => {
     state.price = null;
-    state.entryReady = false;
+    state.entryReady = state.manualReady = false;
     $('trade-price').value = '';
     subscribeSelectedContract(); refreshTrading(); renderPreview(); renderEntry();
   });
@@ -922,7 +934,7 @@
   setInterval(() => {
     refreshPendingCommand();
     if (lastTradeStatusAt && Date.now() - lastTradeStatusAt > 15000) {
-      state.connected = state.entryReady = false;
+      state.connected = state.entryReady = state.manualReady = false;
       $('trade-connection').textContent = '交易狀態更新逾時';
       $('trade-connection').className = 'trade-connection bad';
       $('auto-exit-state').textContent = '保護狀態無法確認，請檢查獨立告警與券商端';

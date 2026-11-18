@@ -87,6 +87,22 @@ def test_duplicate_sync_identical_anonymous_fills_and_seq_enrichment(ledger):
         assert len(pnl.report(conn, 'simulation', '2026-11')[0]) == 2
 
 
+def test_external_partial_and_sdk_exit_keep_separate_costs_and_survive_resync(ledger):
+    with db.session(ledger) as conn:
+        row = order(conn, external_exit_quantity=1)
+        conn.execute('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+                     (row['id'], 'exit', 'realized:external:0', 'realized:external', '2026-11-08', '2026-11-08', 1, 110))
+        conn.execute('INSERT INTO external_exit_costs VALUES (?,?,?)', (row['id'], 'realized:external:0', 90))
+        for _ in range(3):
+            save(conn, row, exits=trade(fill(price=120)), entries=trade(
+                fill('2026-11-07T10:00:00+08:00', price=90), fill('2026-11-07T10:00:01+08:00', price=110)))
+        records, _, pending, _, _ = pnl.report(conn, 'simulation', '2026-11')
+        assert pending == 0 and len(records) == 2
+        assert sum(record['gross_pnl'] for record in records) == 300
+        assert sorted(record['entry_price'] for record in records) == [90, 110]
+        assert conn.execute("SELECT SUM(quantity) FROM pnl_fills WHERE phase='exit'").fetchone()[0] == 2
+
+
 def test_daily_and_monthly_counts_are_distinct_orders(ledger):
     with db.session(ledger) as conn:
         row = order(conn)

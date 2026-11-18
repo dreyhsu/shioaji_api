@@ -114,6 +114,9 @@ def save_fills(conn, order, *, entry=None, exit_trade=None, multiplier=None, cur
     ):
         if trade is None:
             continue
+        external = phase == 'exit' and int(order.get('external_exit_quantity', 0)) > 0
+        if external:
+            expected -= int(order['external_exit_quantity'])
         if expected > 0 and not value(value(trade, 'status'), 'deals', []):
             # A relogin's order summary can omit old deals. A previously verified
             # ledger with exactly the same quantity remains valid evidence.
@@ -134,12 +137,14 @@ def save_fills(conn, order, *, entry=None, exit_trade=None, multiplier=None, cur
                      (error, observed_at, order['id'], error))
         if rows is not None:
             existing = [tuple(row) for row in conn.execute('''SELECT fill_key, filled_at, fill_date, quantity, price
-                FROM pnl_fills WHERE order_id=? AND phase=? ORDER BY fill_key''', (order['id'], phase))]
+                FROM pnl_fills WHERE order_id=? AND phase=? AND (?=0 OR broker_trade_id NOT LIKE 'realized:%')
+                ORDER BY fill_key''', (order['id'], phase, int(external)))]
             if existing == sorted(rows):
                 continue
             # The SDK exposes cumulative lists. Replace this phase atomically so
             # later seq/time/price corrections cannot duplicate anonymous rows.
-            conn.execute('DELETE FROM pnl_fills WHERE order_id=? AND phase=?', (order['id'], phase))
+            conn.execute("DELETE FROM pnl_fills WHERE order_id=? AND phase=? AND (?=0 OR broker_trade_id NOT LIKE 'realized:%')",
+                         (order['id'], phase, int(external)))
             conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
                 [(order['id'], phase, key, str(trade_id or ''), at, day, qty, price)
                  for key, at, day, qty, price in rows])
@@ -185,14 +190,22 @@ def report(conn, mode, month, contract_code=None):
             continue
         latest = max(latest or '', order['ledger_updated_at'] or '') or None
         average = sum(_decimal(row['price']) * row['quantity'] for row in entries) / order['filled_quantity']
+        external_costs = {row['fill_key']: _decimal(row['entry_price']) for row in conn.execute(
+            'SELECT fill_key,entry_price FROM external_exit_costs WHERE order_id=?', (order['id'],))} if 'external_exit_costs' in tables else {}
+        external_quantity = sum(fill['quantity'] for fill in exits if fill['fill_key'] in external_costs)
+        external_value = sum((external_costs[fill['fill_key']] * fill['quantity'] for fill in exits
+                              if fill['fill_key'] in external_costs), Decimal(0))
+        local_average = ((average * order['filled_quantity'] - external_value) / (order['filled_quantity'] - external_quantity)
+                         if external_quantity < order['filled_quantity'] else average)
         direction = 1 if order['action'] == 'Buy' else -1
         for fill in exits:
             if fill['fill_date'][:7] != month:
                 continue
-            pnl = (_decimal(fill['price']) - average) * direction * fill['quantity'] * _decimal(order['multiplier'])
+            entry_average = external_costs.get(fill['fill_key'], local_average)
+            pnl = (_decimal(fill['price']) - entry_average) * direction * fill['quantity'] * _decimal(order['multiplier'])
             details.append(dict(order_id=order['id'], contract_code=order['contract_code'], action=order['action'],
                 filled_at=fill['filled_at'], date=fill['fill_date'], quantity=fill['quantity'],
-                entry_price=float(average), exit_price=fill['price'], multiplier=order['multiplier'], gross_pnl=float(pnl)))
+                entry_price=float(entry_average), exit_price=fill['price'], multiplier=order['multiplier'], gross_pnl=float(pnl)))
     return sorted(details, key=lambda row: (row['filled_at'], row['order_id'])), contracts, pending, latest, True
 
 

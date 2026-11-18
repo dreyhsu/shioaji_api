@@ -10,6 +10,10 @@
     "_comment": "At each completed 15m close, notify once when confirmed 1h and 15m Supertrends enter opposite directions (both ATR 10 / multiplier 3). No repeating or historical replay.",
     "enabled": true
   },
+  "session_open_supertrend": {
+    "_comment": "Signal-code monitor only: confirmed 1h ST (ATR 10 / multiplier 3), opening gap versus the previous session's final complete 1m close, then a 1m close crossing the open in the ST direction. Once per session; cancel on ST flip; no historical replay. Requires monitor restart after first installation.",
+    "enabled": true
+  },
 
   "_utc_offset_comment": "the market clock (TAIFEX = Taiwan, UTC+8). Every 'now' in the monitor and dashboard is UTC + this, whatever the computer's own timezone, so travelling (e.g. Japan, UTC+9) needs no change. Read at startup: restart monitor.py and dashboard.py after changing it.",
   "utc_offset_hours": 8,

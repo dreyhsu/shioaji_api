@@ -176,7 +176,7 @@
       <label class="risk-check"><input id="risk-breakeven" type="checkbox"><span id="risk-breakeven-label">自動保本</span></label>
       <label>浮盈觸發點數 <input id="risk-breakeven-trigger" required type="number" min="0" step="any" aria-label="浮盈觸發點數"></label>
       <label>保留獲利點數 <input id="risk-breakeven-offset" required type="number" min="0" step="any" aria-label="保留獲利點數"></label>
-      <label class="risk-check"><input id="risk-profit-lock" type="checkbox"><span id="risk-profit-lock-label">獲利回撤保本：保留最高浮盈 50%</span></label>
+      <label class="risk-check"><input id="risk-profit-lock" type="checkbox"><span id="risk-profit-lock-label">獲利回撤保本：依最高浮盈區間保護</span></label>
       <span id="risk-profit-lock-state" aria-live="polite"></span>
       <button id="risk-save" type="submit">儲存</button>
       <button id="risk-reset" type="button">還原</button>
@@ -214,7 +214,7 @@
   <script src="/static/supertrend_primitive.js?v=ai-toggle-1"></script>
   <script src="/static/lwc_app.js?v=supertrend-ai-1"></script>
   <script src="/static/latency.js?v=1"></script>
-  <script src="/static/trading.js?v=latency-1"></script>
+  <script src="/static/trading.js?v=manual-tick-1"></script>
   <script src="/static/mock_replay.js?v=curve-tabs-2"></script>
 </body>
 </html>

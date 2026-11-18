@@ -22,7 +22,7 @@ def position_totals(positions, aliases):
     return {pair: qty for pair, qty in result.items() if qty}
 
 
-def plan_lots(details, code, action, quantity, account_key, aliases):
+def plan_lots(details, code, action, quantity, account_key, aliases, *, allow_partial=False):
     groups = defaultdict(list)
     for item in details:
         raw_code = str(value(item, 'code'))
@@ -33,7 +33,7 @@ def plan_lots(details, code, action, quantity, account_key, aliases):
                 or text(value(item, 'currency')) != 'TWD' or not ordno or set(ordno) == {'0'}
                 or isinstance(qty, bool) or isinstance(entered, bool)
                 or int(qty) != float(qty) or int(entered) != float(entered)
-                or int(qty) <= 0 or int(entered) != int(qty)
+                or int(qty) <= 0 or int(entered) < int(qty) or not allow_partial and int(entered) != int(qty)
                 or not price.is_finite() or price <= 0):
             raise ValueError('外部部位明細不完整或含部分平倉，無法接管')
         groups[day, ordno].append(dict(date=day, dseq=ordno, code=code, direction=action,

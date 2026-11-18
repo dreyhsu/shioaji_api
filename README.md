@@ -351,6 +351,8 @@ JSON 格式錯誤時沿用上一次的設定並在 log 警告。
 `monitor.py` 啟動時若使用 `--no-telegram`，即使設定為 `true`，該程序仍不會發送；需移除此旗標並重啟才能恢復發送。
 Dashboard 的進場成交通知也遵守 `telegram_enabled`，詳見上方交易操作說明。
 
+新增的開盤提醒 `session_open_supertrend` 會持久化觀察每個時段的首次穿越；暫停期間仍消耗已發生的訊號，恢復後不補發或將第二次穿越當首次。首次安裝需重啟訊號商品的 monitor；規則與操作見 [開盤 Supertrend 提醒](doc/session_open_alerts.md)。
+
 | 規則 | 條件 | 參數 |
 |---|---|---|
 | `support_bottom_third` | 收盤在支撐箱內、位於下緣 1/3（0 = 箱底，1 = 箱頂） | `zone_max`（預設 0.3333） |
@@ -360,6 +362,7 @@ Dashboard 的進場成交通知也遵守 `telegram_enabled`，詳見上方交易
 | `trendline_near` | 收盤距離畫線 ≤ 門檻 | `distance_points`（預設 30）；設了 `distance_atr` 則改用 `distance_atr × 小時 ATR` |
 | `trendline_break_below_up` | 收盤跌破**上升**的線（**每條線只通知一次**） | `buffer_points` |
 | `trendline_break_above_down` | 收盤突破**下降**的線（**每條線只通知一次**） | `buffer_points` |
+| `session_open_supertrend` | 1h ST 空頭下向上跳空後，1m 收盤跌破開盤價；多頭下向下跳空後漲破開盤價。日／夜盤各自最多一筆提醒，ST 翻向取消 | `enabled`；沿用總開關，不使用全域冷卻時間 |
 
 * 每條規則都有 `enabled`；趨勢線規則另有 `kinds`（`["curve", "line"]`，只要曲線就填 `["curve"]`）。
 * 冷卻時間 `cooldown_minutes`（預設 10）以「規則 × 箱體／線」計算，以觸發的那根 1 分 K 時間為準，

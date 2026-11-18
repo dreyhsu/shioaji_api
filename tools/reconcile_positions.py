@@ -84,7 +84,7 @@ def copy_updates(path, work, before):
             columns = [key for key in row if key != 'id']
             live.execute('UPDATE managed_orders SET ' + ','.join(key + '=?' for key in columns) + ' WHERE id=?',
                 (*[row[key] for key in columns], row['id']))
-            for table in ('pnl_fills', 'pnl_order_metadata'):
+            for table in ('pnl_fills', 'pnl_order_metadata', 'external_exit_costs', 'position_sync_events'):
                 live.execute(f'DELETE FROM {table} WHERE order_id=?', (row['id'],))
                 for record in planned.execute(f'SELECT * FROM {table} WHERE order_id=?', (row['id'],)):
                     live.execute(f'INSERT INTO {table} VALUES (' + ','.join('?' for _ in record) + ')', tuple(record))

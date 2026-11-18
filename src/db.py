@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS telegram_alerts (
   UNIQUE (code, hour_start, box_type, kind)
 );
 
+CREATE TABLE IF NOT EXISTS session_open_alert_states (
+  mode TEXT NOT NULL, code TEXT NOT NULL, session_start TEXT NOT NULL,
+  rule_version INTEGER NOT NULL, status TEXT NOT NULL,
+  document TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (mode, code, session_start, rule_version)
+);
+
 CREATE TABLE IF NOT EXISTS trendlines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT NOT NULL,
@@ -236,6 +243,18 @@ CREATE TABLE IF NOT EXISTS external_close_reconciliations (
   document TEXT NOT NULL,
   reconciled_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS position_sync_events (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  document TEXT NOT NULL,
+  reconciled_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS external_exit_costs (
+  order_id TEXT NOT NULL,
+  fill_key TEXT NOT NULL,
+  entry_price REAL NOT NULL,
+  PRIMARY KEY(order_id,fill_key)
+);
 
 CREATE TABLE IF NOT EXISTS curve_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -328,6 +347,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("managed_orders", "reconciled_order_id", "ALTER TABLE managed_orders ADD COLUMN reconciled_order_id TEXT"),
     ("managed_orders", "exit_status_code", "ALTER TABLE managed_orders ADD COLUMN exit_status_code TEXT"),
     ("managed_orders", "avg_exit_price", "ALTER TABLE managed_orders ADD COLUMN avg_exit_price REAL"),
+    ("managed_orders", "external_exit_quantity", "ALTER TABLE managed_orders ADD COLUMN external_exit_quantity INTEGER NOT NULL DEFAULT 0"),
     ("trendlines", "timeframe", "ALTER TABLE trendlines ADD COLUMN timeframe TEXT NOT NULL DEFAULT '1h' CHECK (timeframe IN ('1m', '5m', '15m', '1h'))"),
     ("curve_entries", "action", "ALTER TABLE curve_entries ADD COLUMN action TEXT NOT NULL DEFAULT 'Buy' CHECK (action IN ('Buy', 'Sell'))"),
     ("box_visits", "source", "ALTER TABLE box_visits ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"),
@@ -1038,6 +1058,7 @@ def record_alert(
     visit_id: int | None,
     kind: str,
     message: str,
+    commit: bool = True,
 ) -> int | None:
     """Claim the right to send one alert; returns its row id, or None if taken.
 
@@ -1062,7 +1083,8 @@ def record_alert(
             message,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     if cursor.rowcount == 0:
         return None
     return int(cursor.lastrowid)

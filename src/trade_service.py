@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 import db
 import external_positions as ep
 import external_reconciliation as er
-from position_reconciliation import position_totals
+from position_reconciliation import position_totals, ReconciliationPending, TERMINAL
 import market_health as mh
 import shioaji_client as sc
 import trendline as tl
@@ -191,7 +191,7 @@ class ClosedMinuteEntry(CurveEntryController):
 
 
 class IndependentTradingService(TradingService):
-    def __init__(self, *args, fetcher_settings=None, **kwargs):
+    def __init__(self, *args, fetcher_settings=None, position_sync_codes=None, **kwargs):
         kwargs['start_worker'] = False
         kwargs['health_enabled'] = True
         super().__init__(*args, **kwargs)
@@ -202,6 +202,7 @@ class IndependentTradingService(TradingService):
         self.logout_unconfirmed = False
         self.session_window = None
         self.contract_cache = []
+        self.position_sync_codes = set(position_sync_codes) if position_sync_codes is not None else None
         self.margin_cache = {'status': 'unavailable'}
         self.last_rpc_sync = float('-inf')
         self.latency = LatencyRecorder(self.db_path, 'trade', self.code,
@@ -285,6 +286,9 @@ class IndependentTradingService(TradingService):
             self.last_rpc_sync = float('-inf')
             self._recover_subscriptions()  # registers DB quote aliases only
             self.contract_cache = super().contracts()
+            for code in self.position_sync_codes or ():
+                if not code.endswith(('R1', 'R2')):
+                    self._subscribe(self._find_contract(code))
             return self._api
         except Exception as error:
             self.event('session_setup_failed' if logged_in else 'login_failed', reason=type(error).__name__)
@@ -345,7 +349,8 @@ class IndependentTradingService(TradingService):
             try:
                 stamp, received = pd.Timestamp(row['quote_at']), pd.Timestamp(row['received_at'])
                 price = float(row['price'])
-                if not math.isfinite(price) or price <= 0 or pd.isna(stamp) or pd.isna(received):
+                if (not math.isfinite(price) or price <= 0 or pd.isna(stamp) or pd.isna(received)
+                        or received > pd.Timestamp(self._now()) + pd.Timedelta(seconds=5)):
                     continue
                 if self.session_started_at is not None and received < self.session_started_at:
                     continue
@@ -550,7 +555,7 @@ class IndependentTradingService(TradingService):
             since = max(since, pd.Timestamp(row['created_at']))
         code = self.bar_codes.get(row['contract_code'], row['contract_code'])
         mode = 'simulation' if self.simulation else 'production'
-        threshold = self.profit_lock_settings()['profit_lock_trigger_points']
+        policy = self._profit_lock_policy()
         with db.read_session(self.db_path) as conn:
             conn.execute('BEGIN')
             state = conn.execute('SELECT * FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
@@ -605,7 +610,7 @@ class IndependentTradingService(TradingService):
                 break
             if not math.isfinite(price) or price <= 0:
                 continue
-            updated.update(super()._profit_lock_updates(updated, price, trigger_points=threshold))
+            updated.update(super()._profit_lock_updates(updated, price, policy=policy))
             protection = updated.get('profit_lock_price')
             if protection is not None and crossed_exit(row['action'], price, protection, None):
                 hit = stamp
@@ -711,6 +716,45 @@ class IndependentTradingService(TradingService):
         return 'curve' if crossed_curve_close(row['action'], float(pair.iloc[0]['close']), values[0],
                                                float(pair.iloc[1]['close']), values[1]) else None
 
+    def _manual_order_market_error(self, contract_code):
+        """Validate the live quote path independently of historical bar readiness."""
+        if super()._fresh_risk_quote({'contract_code': contract_code}) is None:
+            return (f'月份合約 {contract_code} 的即時報價缺少或已過期（行情／接收時間須在 '
+                    f'{self.health_settings.tick_stale_seconds:g} 秒內）')
+        code = self.bar_codes.get(contract_code, contract_code)
+        mode = 'simulation' if self.simulation else 'production'
+        monitor = mh.read_health(mh.health_path(self.db_path, 'monitor', code))
+        try:
+            now = pd.Timestamp(self._now())
+            budget = self.health_settings.tick_stale_seconds
+            def recent(stamp):
+                return -5 <= (now - pd.Timestamp(stamp)).total_seconds() <= budget
+            if (monitor['db_path'] != str(Path(self.db_path).resolve()) or monitor['code'] != code
+                    or monitor['mode'] != mode or monitor['state'] not in {'healthy', 'degraded'}
+                    or monitor.get('error') or monitor.get('audit_error')
+                    or not recent(monitor['heartbeat_at'])
+                    or not recent(monitor['cycle_completed_at'])
+                    or (monitor.get('operation') and not -5 <= (
+                        now - pd.Timestamp(monitor['operation_started'])).total_seconds()
+                        <= self.health_settings.operation_timeout_seconds)):
+                return f'月份合約 {code} 的 monitor 即時資料同步尚未就緒'
+            fetcher_db = Path(monitor['fetcher_db']).resolve()
+            tick = mh.read_health(fetcher_db.parent / '.health' / fetcher_db.name / 'tick-fetcher.json')
+            if (tick['db_path'] != str(fetcher_db) or tick['mode'] != mode or code not in tick['codes']
+                    or tick['state'] != 'running' or tick.get('error') or tick.get('audit_error')
+                    or tick.get('recovery', {}).get('pending') or not recent(tick['heartbeat_at'])
+                    or self._quote_sources.get(contract_code) != (tick['instance'], tick['generation'])):
+                return f'月份合約 {code} 的 tick 來源狀態或世代不符'
+        except (KeyError, TypeError, ValueError):
+            return f'月份合約 {code} 的即時行情健康資料缺少或無效'
+        return None
+
+    def _validate_order_market(self, contract_code):
+        self.load_quotes()
+        error = self._manual_order_market_error(contract_code)
+        if error:
+            raise ValueError(error)
+
     def place_order(self, request):
         with db.session(self.db_path) as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='trade_commands'").fetchone():
@@ -722,17 +766,180 @@ class IndependentTradingService(TradingService):
         self.load_quotes()
         contract = self._find_contract(request['contract_code'])
         self._subscribe(contract)
-        reference = {'contract_code': str(contract.code)}
-        if super()._fresh_risk_quote(reference) is None:
-            raise ValueError(f'月份合約 {contract.code} 的即時報價缺少或已過期（行情／接收時間須在 '
-                             f'{self.health_settings.tick_stale_seconds:g} 秒內）')
-        if self.closed_price(reference) is None:
-            raise ValueError(f'月份合約 {contract.code} 的 monitor 或已收定 1 分 K 尚未就緒（K 棒時效上限 '
-                             f'{self.health_settings.bar_lag_seconds:g} 秒）')
+        self._validate_order_market(str(contract.code))
         return super().place_order(request)
 
     def contracts(self):
         return list(self.contract_cache)
+
+    def _read_broker_lots(self, positions, actual, kwargs):
+        result = {}
+        account = self._api.futopt_account
+        key = er.account_key(account)
+        for (code, action), quantity in sorted(actual.items()):
+            details = []
+            for item in positions:
+                raw = str(_value(item, 'code'))
+                if (self._quote_aliases.get(raw, raw), _enum_text(_value(item, 'direction'))) != (code, action):
+                    continue
+                detail_id = _value(item, 'id')
+                if detail_id is None:
+                    raise ReconciliationPending('券商未提供部位明細 ID，等待重新核對')
+                details.extend(self._api.list_position_detail(account, detail_id=detail_id, **kwargs))
+            result[code, action] = ep.plan_lots(details, code, action, quantity, key,
+                                               self._quote_aliases, allow_partial=True)
+        return result
+
+    def _prepare_broker_lots(self, rows, positions, actual, kwargs):
+        self._broker_lots_snapshot = self._broker_entry_lots = None
+        if not callable(getattr(self._api, 'list_position_detail', None)):
+            return False
+        supported = {str(self._find_contract(item['code']).code) for item in self.contracts()}
+        if any(code not in supported for code, _ in actual):
+            return False
+        self._broker_lots_snapshot = self._read_broker_lots(positions, actual, kwargs)
+        self._broker_entry_lots = {(code, action, lot['entry_date'], lot['ordno']): lot
+            for (code, action), lots in self._broker_lots_snapshot.items() for lot in lots}
+        return self._broker_lots_mismatch(rows)
+
+    def _broker_lots_mismatch(self, rows):
+        lots = getattr(self, '_broker_entry_lots', None)
+        if lots is None:
+            return False
+        with db.read_session(self.db_path) as conn:
+            identities = {row['order_id']: dict(row) for row in conn.execute('SELECT * FROM broker_order_identities')}
+        remaining = dict(lots)
+        account = er.account_key(self._api.futopt_account)
+        for row in rows:
+            quantity = int(row['filled_quantity']) - int(row['exit_filled_quantity'])
+            if quantity <= 0:
+                continue
+            identity = identities.get(row['id'])
+            if not identity or not identity.get('ordno'):
+                return True
+            if identity['account_key'] != account or identity['broker_trade_id'] != row['entry_trade_id']:
+                return True
+            key = row['contract_code'], row['action'], identity['entry_date'], identity['ordno']
+            lot = remaining.pop(key, None)
+            if lot is None or lot['quantity'] != quantity:
+                return True
+        return bool(remaining)
+
+    def _confirm_broker_lots(self, positions, actual, kwargs):
+        previous = getattr(self, '_broker_lots_snapshot', None)
+        if previous is not None and self._read_broker_lots(positions, actual, kwargs) != previous:
+            raise ReconciliationPending('核對期間券商進場批次已變動，等待重新核對')
+
+    def _reconcile_external_positions(self, rows, positions, actual, kwargs):
+        """Import additional broker lots only after verifying both snapshots.
+
+        Existing orders retain their risk settings. New lots wait for a risk save.
+        A missing lot identity never permits allocation by aggregate quantity.
+        """
+        if not callable(getattr(self._api, 'list_position_detail', None)):
+            return
+        expected = position_totals(rows)
+        if any(quantity > actual.get(pair, 0) for pair, quantity in expected.items()):
+            return
+        if any(row['entry_status'] not in TERMINAL or row.get('exit_trade_id')
+               or row.get('exit_status') for row in rows):
+            return
+        account = self._api.futopt_account
+        key = er.account_key(account)
+        with db.read_session(self.db_path) as conn:
+            if conn.execute("SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
+                            (self.code, 'simulation' if self.simulation else 'production')).fetchone():
+                return
+            identities = {row['order_id']: dict(row) for row in conn.execute('SELECT * FROM broker_order_identities')}
+        contracts = {str(self._find_contract(item['code']).code): self._find_contract(item['code'])
+                     for item in self.contracts()}
+        if self.position_sync_codes is not None:
+            allowed = {str(self._find_contract(code).code) for code in self.position_sync_codes
+                       if not code.endswith(('R1', 'R2'))}
+            contracts = {code: contract for code, contract in contracts.items() if code in allowed}
+        if any(code not in contracts for code, _ in actual):
+            return
+
+        lots = getattr(self, '_broker_lots_snapshot', None)
+        if lots is None:
+            lots = self._read_broker_lots(positions, actual, kwargs)
+        remaining = {(code, action, lot['entry_date'], lot['ordno']): lot
+                     for (code, action), values in lots.items() for lot in values}
+        for row in rows:
+            if int(row['filled_quantity']) == int(row['exit_filled_quantity']):
+                continue
+            identity = identities.get(row['id'])
+            if not identity or identity['account_key'] != key or identity['broker_trade_id'] != row['entry_trade_id']:
+                return
+            lot_key = row['contract_code'], row['action'], identity['entry_date'], identity['ordno']
+            lot = remaining.pop(lot_key, None)
+            if lot is None or lot['quantity'] != int(row['filled_quantity']) - int(row['exit_filled_quantity']):
+                return
+        if not remaining:
+            return
+        if any(record['entry_quantity'] != record['quantity'] for lot in remaining.values() for record in lot['details']):
+            return  # pre-adoption closed fills need a complete historical ledger
+        fresh = self._api.list_positions(account, **kwargs)
+        if ep.position_totals(fresh, self._quote_aliases) != actual or self._read_broker_lots(fresh, actual, kwargs) != lots:
+            raise ReconciliationPending('自動同步期間券商部位或進場明細已變動，等待重新核對')
+        try:
+            atr, _ = self._risk_context(self.code)
+        except RuntimeError:
+            atr = 0.0
+        stamp = mh.iso(self._now())
+        adopted = []
+        with db.session(self.db_path) as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            current = [dict(row) for row in conn.execute(
+                'SELECT * FROM managed_orders WHERE code=? AND simulation=? AND active=1 ORDER BY id',
+                (self.code, int(self.simulation)))]
+            if sorted(rows, key=lambda row: row['id']) != current:
+                raise ReconciliationPending('自動同步期間本機部位已變動，等待重新核對')
+            for (code, action, _, _), lot in remaining.items():
+                adopted.append(self._save_external_lot(conn, contracts[code], action, lot, key, stamp, atr, automatic=True))
+            conn.commit()
+        for code, _, _, _ in remaining:
+            self._subscribe(contracts[code])
+        self.event('external_positions_synchronized', order_ids=adopted, risk_enabled=False)
+
+    def _save_external_lot(self, conn, contract, action, lot, key, stamp, atr, *, automatic=False):
+        code = str(contract.code)
+        tick = float(_value(contract, 'tick', 1) or 1)
+        if not math.isfinite(tick) or tick <= 0:
+            raise ValueError('合約最小跳動單位無效')
+        if conn.execute('SELECT 1 FROM external_position_adoptions WHERE evidence_key=?', (lot['evidence_key'],)).fetchone():
+            raise ValueError('此券商進場批次已接管，不能重複接管')
+        # Also exclude a previously managed and closed order of this identity.
+        if conn.execute('SELECT 1 FROM broker_order_identities WHERE account_key=? AND entry_date=? AND ordno=?',
+                        (key, lot['entry_date'], lot['ordno'])).fetchone():
+            raise ValueError('此券商委託已存在本機歷史，請核對')
+        row_id = str(uuid.uuid4())
+        external_id = 'external-position:' + lot['evidence_key']
+        stop, target = (stop_target_prices(action, lot['price'], atr) if atr > 0 else (None, None))
+        stop = align_tick(stop, tick) if stop is not None else None
+        target = align_tick(target, tick) if target is not None else None
+        conn.execute('''INSERT INTO managed_orders
+            (id,code,contract_code,action,quantity,filled_quantity,avg_fill_price,price,price_type,order_type,
+             atr,auto_exit,breakeven_enabled,simulation,entry_trade_id,entry_status,broker_octype,
+             order_origin,levels_customized,contract_tick,created_at,updated_at,stop_price,target_price)
+            VALUES (?,?,?,?,?,?,?,0,'EXTERNAL','EXTERNAL',?,0,0,?,?,'Filled','New','external_position',1,?,?,?,?,?)''',
+            (row_id,self.code,code,action,lot['quantity'],lot['quantity'],lot['price'],atr,int(self.simulation),external_id,tick,stamp,stamp,stop,target))
+        conn.execute('INSERT INTO broker_order_identities (order_id,broker_trade_id,account_key,seqno,entry_date,ordno,updated_at) VALUES (?,?,?,?,?,?,?)',
+            (row_id,external_id,key,'',lot['entry_date'],lot['ordno'],stamp))
+        # Accounting provides a trading date only; do not invent entry time or SDK IDs.
+        conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
+            [(row_id,'entry',f'position:{index}',external_id,record['date'],record['date'],record['quantity'],record['price'])
+             for index, record in enumerate(lot['details'])])
+        conn.execute('INSERT INTO pnl_order_metadata (order_id,multiplier,currency,updated_at) VALUES (?,?,?,?)',
+            (row_id,_value(contract,'multiplier'),'TWD',stamp))
+        conn.execute('INSERT INTO external_position_adoptions VALUES (?,?,?,?)',
+            (lot['evidence_key'],row_id,json.dumps(dict(account_key=key,contract_code=code,action=action,lot=lot,
+                risk_defaults=dict(atr=atr,timeframe='1h',basis='adoption',observed_at=stamp)),ensure_ascii=False),stamp))
+        if automatic:
+            conn.execute('INSERT INTO position_sync_events VALUES (?,?,?,?)',
+                (str(uuid.uuid4()), row_id, json.dumps(dict(kind='automatic_adoption', lot=lot,
+                    account_key=key, risk_enabled=False), ensure_ascii=False), stamp))
+        return row_id
 
     def adopt_external_position(self, *, contract_code, action, quantity, simulation, confirmed=False):
         """The command worker adopts verified full lots, without sending orders."""
@@ -812,35 +1019,7 @@ class IndependentTradingService(TradingService):
             if sorted(rows, key=lambda row: row['id']) != current:
                 raise ValueError('接管期間本機部位已變動')
             for lot in lots:
-                if conn.execute('SELECT 1 FROM external_position_adoptions WHERE evidence_key=?', (lot['evidence_key'],)).fetchone():
-                    raise ValueError('此券商進場批次已接管，不能重複接管')
-                # Also exclude a previously managed and closed order of this identity.
-                if conn.execute('SELECT 1 FROM broker_order_identities WHERE account_key=? AND entry_date=? AND ordno=?',
-                                (key, lot['entry_date'], lot['ordno'])).fetchone():
-                    raise ValueError('此券商委託已存在本機歷史，請核對')
-                row_id = str(uuid.uuid4())
-                external_id = 'external-position:' + lot['evidence_key']
-                stop, target = (stop_target_prices(action, lot['price'], atr) if atr > 0 else (None, None))
-                stop = align_tick(stop, tick) if stop is not None else None
-                target = align_tick(target, tick) if target is not None else None
-                conn.execute('''INSERT INTO managed_orders
-                    (id,code,contract_code,action,quantity,filled_quantity,avg_fill_price,price,price_type,order_type,
-                     atr,auto_exit,breakeven_enabled,simulation,entry_trade_id,entry_status,broker_octype,
-                     order_origin,levels_customized,contract_tick,created_at,updated_at,stop_price,target_price)
-                    VALUES (?,?,?,?,?,?,?,0,'EXTERNAL','EXTERNAL',?,0,0,?,?,'Filled','New','external_position',1,?,?,?,?,?)''',
-                    (row_id,self.code,code,action,lot['quantity'],lot['quantity'],lot['price'],atr,int(self.simulation),external_id,tick,stamp,stamp,stop,target))
-                conn.execute('INSERT INTO broker_order_identities (order_id,broker_trade_id,account_key,seqno,entry_date,ordno,updated_at) VALUES (?,?,?,?,?,?,?)',
-                    (row_id,external_id,key,'',lot['entry_date'],lot['ordno'],stamp))
-                # Accounting provides a trading date only; do not invent entry time or SDK IDs.
-                conn.executemany('INSERT INTO pnl_fills VALUES (?,?,?,?,?,?,?,?)',
-                    [(row_id,'entry',f'position:{index}',external_id,record['date'],record['date'],record['quantity'],record['price'])
-                     for index, record in enumerate(lot['details'])])
-                conn.execute('INSERT INTO pnl_order_metadata (order_id,multiplier,currency,updated_at) VALUES (?,?,?,?)',
-                    (row_id,_value(contract,'multiplier'),'TWD',stamp))
-                conn.execute('INSERT INTO external_position_adoptions VALUES (?,?,?,?)',
-                    (lot['evidence_key'],row_id,json.dumps(dict(account_key=key,contract_code=code,action=action,lot=lot,
-                        risk_defaults=dict(atr=atr,timeframe='1h',basis='adoption',observed_at=stamp)),ensure_ascii=False),stamp))
-                adopted.append(row_id)
+                adopted.append(self._save_external_lot(conn, contract, action, lot, key, stamp, atr))
             conn.commit()
         self._broker_ready = False
         self._reconcile_required = True
@@ -903,6 +1082,7 @@ class IndependentTradingService(TradingService):
         status.update(self.breakeven_settings())
         status.update(self.profit_lock_settings())
         contract_bars = {code: self.closed_price({'contract_code': code}) is not None for code in self._wanted}
+        manual_errors = {code: self._manual_order_market_error(code) for code in self._wanted}
         market_quotes = {code: dict(price=quote['price'], at=mh.iso(quote['at']),
             fresh=-5 <= (pd.Timestamp(self._now()) - quote['at']).total_seconds() <= self.health_settings.tick_stale_seconds)
             for code, quote in self._quotes.items()}
@@ -911,8 +1091,14 @@ class IndependentTradingService(TradingService):
                 market_quotes[alias] = market_quotes[canonical]
             if canonical in contract_bars:
                 contract_bars[alias] = contract_bars[canonical]
+            if canonical in manual_errors:
+                manual_errors[alias] = manual_errors[canonical]
         status['market_quotes'] = market_quotes
         status['contract_bars_ready'] = contract_bars
+        status['manual_order_ready'] = {code: error is None and bool(status.get('connected'))
+            and status.get('broker_ready', False) and self.window() is not None and not self._recovery.pending
+            for code, error in manual_errors.items()}
+        status['manual_order_errors'] = manual_errors
         if 'protection' in status:
             for key in ('fixed_exit', 'breakeven', 'curve_exit'):
                 status['protection'][key] = status['protection'][key] and bool(contract_bars) and all(contract_bars.values())

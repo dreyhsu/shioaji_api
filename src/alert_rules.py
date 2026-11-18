@@ -62,6 +62,7 @@ DEFAULTS: dict[str, Any] = {
     "gap_entered": {"enabled": True},
     "gap_filled": {"enabled": True},
     "supertrend_opposite": {"enabled": True},
+    "session_open_supertrend": {"enabled": True},
     "cooldown_minutes": 10,
     "support_bottom_third": {"enabled": True, "zone_max": 1 / 3},
     "resistance_top_third": {"enabled": True, "zone_min": 2 / 3},

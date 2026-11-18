@@ -70,9 +70,13 @@ def rig(tmp_path):
             with db.session(path) as conn:
                 db.upsert_minute_bars(conn, code, sb.add_sessions(bars))
             health[code].publish(state='healthy', ready_since='2026-10-30 08:45',
+                                 fetcher_db=str(path.resolve()), cycle_completed_at=mh.iso(now[0]),
                                  bars=dict(ready=True, last_minute_start=mh.iso(latest)))
             store.quotes([dict(code=code, mode='simulation', price=price if tick is None else tick,
                 volume=1, quote_at=mh.iso(now[0]), received_at=mh.iso(now[0]), instance='offline-monitor', generation=1)])
+        mh.atomic_json(path.parent / '.health' / path.name / 'tick-fetcher.json', dict(
+            db_path=str(path.resolve()), mode='simulation', codes=['TMFR1', 'TMF209912'],
+            state='running', heartbeat_at=mh.iso(now[0]), instance='offline-monitor', generation=1))
         broker.price = close if tick is None else tick
     # Stable geometry and enough adjacent minutes for arming.
     for code in ('TMFR1', 'TMF209912'):
@@ -154,13 +158,14 @@ def test_read_endpoints_never_initialize_schema_or_write(rig, monkeypatch):
     assert not (r.path.parent / 'must-not-create.db').exists()
 
 
-def test_stale_monitor_data_blocks_entry_without_quote_subscription(rig):
+def test_signal_history_pending_does_not_block_manual_entry_with_valid_tick(rig):
     r = rig
     r.health['TMFR1'].publish(state='degraded', bars={'ready': False})
     request(r)
     r.runtime.step()
-    assert not r.broker.trades
-    assert r.client.get('/api/commands/order-1').json()['state'] == 'failed'
+    assert len(r.broker.trades) == 1
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'succeeded'
+    assert not r.service._entry_data_ready({})  # automatic curve entries still require healthy bars
 
 
 def test_pending_incomplete_minute_does_not_disable_manual_order(rig):
@@ -689,7 +694,7 @@ def test_order_at_minute_boundary_uses_monitor_valid_previous_close(rig):
     assert r.service.snapshot()['status']['contract_bars_ready']['TMF209912']
 
 
-@pytest.mark.parametrize('failure', ['quote', 'bars'])
+@pytest.mark.parametrize('failure', ['quote', 'monitor'])
 def test_manual_order_reports_specific_market_failure_without_broker_submit(rig, failure):
     r = rig
     r.runtime.step()
@@ -698,16 +703,16 @@ def test_manual_order_reports_specific_market_failure_without_broker_submit(rig,
         r.now[0] += pd.Timedelta(seconds=11)
         r.mono[0] += 11
     else:
-        r.health['TMF209912'].publish(state='degraded', bars={'ready': False})
+        r.health['TMF209912'].publish(state='failed', bars={'ready': False})
     request(r, identity='specific-failure')
     r.runtime.step()
     result = r.client.get('/api/commands/specific-failure').json()
     assert result['state'] == 'failed'
-    assert ('即時報價' if failure == 'quote' else 'monitor 或已收定') in result['result']['detail']
+    assert ('即時報價' if failure == 'quote' else 'monitor') in result['result']['detail']
     assert not r.broker.trades
 
 
-def test_old_closed_bars_still_block_even_with_fresh_tick_and_heartbeat(rig):
+def test_old_closed_bars_do_not_block_manual_order_with_fresh_tick(rig):
     r = rig
     r.runtime.step()
     r.update('2026-10-30 09:06:04')
@@ -719,7 +724,79 @@ def test_old_closed_bars_still_block_even_with_fresh_tick_and_heartbeat(rig):
     assert r.service.closed_price({'contract_code': 'TMF209912'}) is None
     request(r, identity='old-bars')
     r.runtime.step()
-    assert r.client.get('/api/commands/old-bars').json()['state'] == 'failed'
+    assert r.client.get('/api/commands/old-bars').json()['state'] == 'succeeded'
+    assert len(r.broker.trades) == 1
+    assert not r.service._entry_data_ready({})
+    status = r.service.snapshot()['status']
+    assert status['manual_order_ready']['TMF209912']
+    assert not status['contract_bars_ready']['TMF209912']
+
+
+@pytest.mark.parametrize('price_type', ['MKT', 'LMT'])
+def test_manual_order_uses_tick_while_contract_history_is_missing(rig, price_type):
+    r = rig
+    r.runtime.step()
+    with db.session(r.path) as conn:
+        conn.execute("DELETE FROM minute_bars WHERE code='TMF209912'")
+        conn.commit()
+    r.health['TMF209912'].publish(state='degraded', bars=dict(ready=False,
+        blocking_missing_count=1, missing_sample=['2026-10-30 08:59:00']),
+        validation_pending=True, stream_error='history_not_bridged')
+    payload = dict(contract_code='TMF209912', action='Buy', quantity=1,
+        price=20000 if price_type == 'LMT' else 0, price_type=price_type,
+        order_type='ROD' if price_type == 'LMT' else 'IOC', simulation=True, confirmed=True)
+    request(r, payload=payload)
+    r.runtime.step()
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'succeeded'
+    assert len(r.broker.trades) == 1
+    # Same ID cannot duplicate an order even though historical repair is pending.
+    request(r, payload=payload)
+    r.runtime.step()
+    assert len(r.broker.trades) == 1
+    assert r.service.closed_price({'contract_code': 'TMF_MOCK'}) is None
+
+
+@pytest.mark.parametrize('failure', ['generation', 'instance', 'tick_down', 'tick_stale',
+    'monitor_stale', 'monitor_mode', 'monitor_db', 'receipt', 'future_receipt'])
+def test_manual_order_requires_current_healthy_tick_path(rig, failure):
+    r = rig
+    r.runtime.step()
+    tick_path = r.path.parent / '.health' / r.path.name / 'tick-fetcher.json'
+    tick = mh.read_health(tick_path)
+    if failure in {'generation', 'instance'}:
+        tick[failure] = 2 if failure == 'generation' else 'new-instance'
+    elif failure == 'tick_down':
+        tick['state'] = 'disconnected'
+    elif failure == 'tick_stale':
+        tick['heartbeat_at'] = mh.iso(r.now[0] - pd.Timedelta(seconds=11))
+    elif failure.startswith('monitor_'):
+        changes = {'monitor_stale': dict(cycle_completed_at=mh.iso(r.now[0] - pd.Timedelta(seconds=11))),
+            'monitor_mode': dict(mode='production'), 'monitor_db': dict(db_path='other.db')}
+        r.health['TMF209912'].publish(**changes[failure])
+    elif failure in {'receipt', 'future_receipt'}:
+        with db.session(r.path) as conn:
+            conn.execute('UPDATE market_latest_quotes SET received_at=? WHERE code=?',
+                (mh.iso(r.now[0] + pd.Timedelta(seconds=11 if failure == 'future_receipt' else -11)), 'TMF209912'))
+            conn.commit()
+    mh.atomic_json(tick_path, tick)
+    request(r)
+    r.runtime.step()
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'failed'
+    assert not r.broker.trades
+    assert not r.service.snapshot()['status']['manual_order_ready']['TMF209912']
+
+
+def test_manual_tick_is_rechecked_after_risk_calculation(rig):
+    r = rig
+    r.runtime.step()
+    def slow_risk(code):
+        r.now[0] += pd.Timedelta(seconds=11)
+        r.mono[0] += 11
+        return 120., pd.DataFrame()
+    r.service._risk_context = slow_risk
+    request(r)
+    r.runtime.step()
+    assert r.client.get('/api/commands/order-1').json()['state'] == 'failed'
     assert not r.broker.trades
 
 
