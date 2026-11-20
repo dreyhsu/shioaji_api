@@ -91,7 +91,7 @@ function element() {
   await trade.controlEntry();
   assert.match(summary, /\[5m\] 短線/);
   assert.match(summary, /已收盤 1 分 K/);
-  assert.match(summary, /各 2 倍進場 1h ATR/);
+  assert.match(summary, /停損 0\.5 倍、停利 2 倍進場 1h ATR/);
   get('entry-curve').value = '8';
   await trade.controlEntry();
   assert.match(summary, /線條：\[5m\] 直線 #8/);

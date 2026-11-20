@@ -11,6 +11,7 @@ import uuid
 import pandas as pd
 
 import db
+from order_reconciliation import pending_command
 import external_reconciliation as er
 from pnl_calendar import value, normalized_fills
 from position_reconciliation import ReconciliationPending, TERMINAL, text
@@ -162,8 +163,7 @@ def synchronize(service, trades, positions, actual, kwargs):
         service._reconcile_external_closes(service._active_orders(), actual, kwargs)
     verified, working = set(), []
     with db.session(service.db_path) as conn:
-        if conn.execute("SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
-                        (service.code, 'simulation' if service.simulation else 'production')).fetchone():
+        if pending_command(conn, service.code, 'simulation' if service.simulation else 'production'):
             raise ReconciliationPending('先前指令結果未確認，保留原指令且不自動重送')
         for identity, record in candidates.items():
             previous = imports.get(identity) or imports_by_key.get(record['key'])

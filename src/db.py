@@ -414,6 +414,16 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.executescript(PNL_SCHEMA)
     conn.executescript(LATENCY_SCHEMA)
+    from order_reconciliation import SCHEMA as RECONCILIATION_SCHEMA
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_reconciliation_schema'").fetchone():
+        conn.executescript(RECONCILIATION_SCHEMA)
+        for table, index, columns in (
+            ('managed_orders','idx_order_history',('code','simulation','created_at','id')),
+            ('curve_entries','idx_curve_history',('code','simulation','armed_at','id')),
+        ):
+            existing={row['name'] for row in conn.execute(f'PRAGMA table_info({table})')}
+            if set(columns)<=existing:
+                conn.execute(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({','.join(columns)})")
     for table, column, statement in MIGRATIONS:
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in existing:

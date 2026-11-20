@@ -17,6 +17,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import db
+from order_reconciliation import pending_command
 import external_positions as ep
 import external_reconciliation as er
 from position_reconciliation import position_totals, ReconciliationPending, TERMINAL
@@ -82,6 +83,25 @@ class OrderSession:
         except Exception as error:
             self.service.latency.record('sdk_cancel_failed', started=began,
                 generation=self.service._generation, error_type=type(error).__name__)
+            raise
+
+    def cancel_reconciled_order(self, trade):
+        """Only a version-checked recovery proposal may cancel under a blocker."""
+        service = self.service
+        if ((service.control and service.control.stop_requested) or service.window() is None
+                or service._recovery.pending):
+            raise ValueError('交易 session 已改變，暫停撤單')
+        service._validate_connected_mode()
+        if er.account_key(_value(trade.order,'account')) != er.account_key(self.api.futopt_account):
+            raise ValueError('撤單帳戶不符')
+        broker_id = _value(trade.order,'id')
+        began = service.latency.record('sdk_cancel_started',broker_trade_id=broker_id,generation=service._generation)
+        try:
+            result = self.api.cancel_order(trade)
+            service.latency.record('sdk_cancel_completed',started=began,broker_trade_id=broker_id,generation=service._generation)
+            return result
+        except Exception as error:
+            service.latency.record('sdk_cancel_failed',started=began,error_type=type(error).__name__,generation=service._generation)
             raise
 
 
@@ -396,6 +416,9 @@ class IndependentTradingService(TradingService):
             self._open()
 
     def _entry_data_ready(self, entry):
+        with db.read_session(self.db_path) as conn:
+            if pending_command(conn,self.code,'simulation' if self.simulation else 'production'):
+                return False
         return (self._curve_data_ready() and self._broker_ready and not self._recovery.pending
                 and self._api is not None and self.window() is not None)
 
@@ -676,8 +699,7 @@ class IndependentTradingService(TradingService):
     def place_order(self, request):
         with db.session(self.db_path) as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE name='trade_commands'").fetchone():
-                unknown = conn.execute("SELECT id FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
-                                      (self.code, 'simulation' if self.simulation else 'production')).fetchone()
+                unknown = pending_command(conn, self.code, 'simulation' if self.simulation else 'production')
                 if unknown:
                     raise ValueError('先前交易指令結果待核對，暫停新增委託')
         self.ensure_connected()
@@ -795,8 +817,7 @@ class IndependentTradingService(TradingService):
         account = self._api.futopt_account
         key = er.account_key(account)
         with db.read_session(self.db_path) as conn:
-            if conn.execute("SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
-                            (self.code, 'simulation' if self.simulation else 'production')).fetchone():
+            if pending_command(conn, self.code, 'simulation' if self.simulation else 'production'):
                 return
             identities = {row['order_id']: dict(row) for row in conn.execute('SELECT * FROM broker_order_identities')}
         contracts = {str(self._find_contract(item['code']).code): self._find_contract(item['code'])
@@ -903,8 +924,7 @@ class IndependentTradingService(TradingService):
         if self.window() is None or self._api is None or self._recovery.pending:
             raise ValueError('交易 session 尚未就緒，無法接管')
         with db.read_session(self.db_path) as conn:
-            if conn.execute("SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
-                            (self.code, 'simulation' if self.simulation else 'production')).fetchone():
+            if pending_command(conn, self.code, 'simulation' if self.simulation else 'production'):
                 raise ValueError('先前交易指令結果待核對，暫停接管')
         self._validate_connected_mode()
         contract = self._find_contract(contract_code)
@@ -1059,6 +1079,8 @@ class IndependentTradingService(TradingService):
         status.update(signal_mode='closed_1m', scheduled_open=self.window() is not None,
                       logout_unconfirmed=self.logout_unconfirmed, market_source='monitor_db',
                       profit_lock_signal_mode='tick', exit_signal_mode='tick')
+        status['last_inspection_at'] = getattr(self,'_inspection_verified_at',None)
+        status['inspection_error'] = getattr(self,'_inspection_error',None)
         status['latency_health'] = {**self.latency.health(), 'callback_queue': self._order_events.qsize(),
                                    'stale_callbacks': self._stale_order_events}
         status.setdefault('mode', '模擬環境' if self.simulation else '正式環境')
@@ -1081,6 +1103,11 @@ class IndependentTradingService(TradingService):
         status['manual_order_ready'] = {code: error is None and bool(status.get('connected'))
             and status.get('broker_ready', False) and self.window() is not None and not self._recovery.pending
             for code, error in manual_errors.items()}
+        with db.read_session(self.db_path) as conn:
+            unknown_command = pending_command(conn,self.code,'simulation' if self.simulation else 'production')
+        if unknown_command:
+            status['manual_order_ready'] = {code:False for code in manual_errors}
+            manual_errors = {code:'先前交易指令結果待核對，請至委託與結案管理處理' for code in manual_errors}
         status['manual_order_errors'] = manual_errors
         status['entry_contracts'] = self.entry_contracts()
         active = [order for order in orders if order.get('active')]

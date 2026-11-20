@@ -155,7 +155,9 @@ def test_directional_entry_quantity_and_default_atr_exit(market, action, exit_re
     closed = driver.client.get("/api/trading/orders").json()[0]
     assert closed["trigger_reason"] == exit_reason and closed["exit_status"] == "Filled"
     assert driver.broker.position == 0 and len(driver.broker.trades) == 2
-    assert len(messages) == (0 if driver.mode == "mock" else 1)
+    # Normal SDK entry and exit fills each notify; historical reconciliation
+    # suppresses replay separately and must not disable normal exit notices.
+    assert len(messages) == (0 if driver.mode == "mock" else 2)
 
 
 @pytest.mark.parametrize("changes", [{"action": "Short"}, {"action": None}, {"quantity": 0}, {"quantity": 101}, {"quantity": True}, {"quantity": 1.5}])

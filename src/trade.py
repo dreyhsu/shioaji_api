@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import Literal
 
 import db
+import order_reconciliation as reconciliation
 from connection_recovery import error_kind
 import market_health as mh
 from service_control import ServiceControl, run_server
@@ -29,18 +30,21 @@ from trade_service import IndependentTradingService
 from latency_trace import trace_scope, order_link, link_order
 from trading import RiskConfirmation, RiskConflict
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
-                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
+                            TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn,
+                            ReconciliationPreviewIn, ReconciliationApplyIn)
 
 COMMAND_MODELS = dict(place_order=OrderIn, arm_curve=CurveEntryIn, subscribe=ContractSubscriptionIn,
     update_levels=TradeLevelsIn, update_risk=TradeRiskSettingsIn, update_curve=TradeCurveIn,
-    select_curve=TradeCurveSelectionIn, adopt_external=ExternalPositionIn)
+    select_curve=TradeCurveSelectionIn, adopt_external=ExternalPositionIn,
+    preview_reconciliation=ReconciliationPreviewIn, apply_reconciliation=ReconciliationApplyIn)
 TARGETS = {'cancel_entry', 'update_levels', 'update_risk', 'update_curve', 'select_curve'}
 
 
 class Command(BaseModel):
     id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
     name: Literal['place_order', 'arm_curve', 'cancel_curve', 'subscribe', 'cancel_entry',
-                  'update_levels', 'update_risk', 'update_curve', 'select_curve', 'adopt_external']
+                  'update_levels', 'update_risk', 'update_curve', 'select_curve', 'adopt_external',
+                  'refresh_reconciliation', 'preview_reconciliation', 'apply_reconciliation']
     target: str | None = Field(default=None, max_length=128)
     payload: dict = Field(default_factory=dict)
 
@@ -162,10 +166,18 @@ class TradeRuntime:
             raise HTTPException(404, '找不到指令')
         result = dict(row)
         result['result'] = json.loads(result['result']) if result['result'] else None
+        with db.read_session(self.service.db_path) as conn:
+            resolved = conn.execute("SELECT * FROM trade_reconciliation_resolutions WHERE code=? AND mode=? AND kind='command' AND target_id=?",
+                                   (self.service.code,self.mode,command_id)).fetchone()
+        if resolved:
+            result['resolution'] = dict(resolved)
         return result
 
     def execute(self, command):
         s, payload, target = self.service, command['payload'], command['target']
+        if command['name'].endswith('_reconciliation'):
+            from latency_trace import trace_values
+            return reconciliation.execute(s, command['name'], payload, trace_values()['command_id'])
         if command['name'] == 'place_order':
             return s.place_order(payload)
         if command['name'] == 'adopt_external':
@@ -221,6 +233,8 @@ class TradeRuntime:
                                 conn.commit()
                         except Exception as error:
                             self.service.latency.error = type(error).__name__
+        except reconciliation.Conflict as error:
+            state, status, result = 'failed', 409, {'detail': str(error)}
         except (RiskConfirmation, RiskConflict) as error:
             state, status = 'failed', 409
             result = {'detail': {'code': 'confirmation_required' if isinstance(error, RiskConfirmation) else 'risk_conflict',
@@ -231,8 +245,9 @@ class TradeRuntime:
             else:
                 state, status, result = 'failed', 422, {'detail': str(error)}
         except Exception as error:
-            state, status = 'unknown', 409
-            result = {'detail': '指令結果待核對，不自動重送', 'error_type': type(error).__name__}
+            read_only = json.loads(row['request'])['name'] in {'refresh_reconciliation','preview_reconciliation'}
+            state, status = ('failed',503) if read_only else ('unknown',409)
+            result = {'detail': '查詢／預覽未完成，既有紀錄保留' if read_only else '指令結果待核對，不自動重送', 'error_type': type(error).__name__}
         with db.session(self.service.db_path) as conn:
             conn.execute('UPDATE trade_commands SET state=?, result=?, http_status=?, updated_at=? WHERE id=?',
                          (state, json.dumps(result, ensure_ascii=False, allow_nan=False), status,
@@ -277,6 +292,7 @@ class TradeRuntime:
                             s.margin_cache = s.margin()
                 if not commands_processed:
                     self.process_commands()
+                reconciliation.publish_pending(s)
                 s._publish_health(state=('scheduled_closed' if window is None else 'healthy' if s._broker_ready and not s._recovery.pending else 'degraded'),
                     operation=None, cycle_completed_at=mh.iso(s._now()))
                 self.save_snapshot()

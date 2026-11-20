@@ -66,3 +66,21 @@ class CurveEntryIn(BaseModel):
     confirmed: StrictBool = False
 
 
+class ReconciliationPreviewIn(BaseModel):
+    kind: Literal['order', 'curve', 'command', 'broker']
+    target_id: str = Field(min_length=1, max_length=128)
+    action: Literal['cancel_condition', 'confirm_no_order', 'cancel_working', 'link_curve', 'resolve_command', 'sync', 'link_entry', 'link_exit']
+    note: str = Field(default='', max_length=1000)
+    checked_date: str | None = Field(default=None, pattern=r'^\d{4}-\d{2}-\d{2}$')
+    attested: StrictBool = False
+    linked_order_id: str | None = Field(default=None, max_length=128)
+    broker_trade_id: str | None = Field(default=None, max_length=128)
+    seqno: str | None = Field(default=None, max_length=64)
+    ordno: str | None = Field(default=None, max_length=64)
+
+
+class ReconciliationApplyIn(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=128)
+    confirmed: StrictBool = False
+
+

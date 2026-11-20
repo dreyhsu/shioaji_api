@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>委託與結案管理</title>
+  <link rel="stylesheet" href="/static/orders.css?v=1">
+  <script src="/static/orders.js?v=1" defer></script>
+</head>
+<body>
+  <header class="topbar"><a href="/">← 返回交易圖表</a><span>TRADE / ORDER DESK</span><b id="environment">確認環境中</b></header>
+  <main>
+    <div class="page-heading"><div><p class="eyebrow">交易工作台</p><h1>委託與結案管理</h1><p class="muted">查看券商與系統的差異，逐筆核對並處理待確認事項。</p></div><button id="refresh-broker" class="primary" disabled>重新核對券商</button></div>
+    <section class="summary" aria-label="交易狀態">
+      <article><span>待處理紀錄</span><strong id="pending-count">—</strong><small>包含等待中的曲線進場</small></article>
+      <article><span>券商核對</span><strong id="broker-state">—</strong><small id="account">—</small></article>
+      <article><span>手動進場</span><strong id="manual-state">—</strong><small id="curve-state">—</small></article>
+      <article><span>最新券商證據</span><strong id="observation-at" class="timestamp">—</strong><small id="snapshot-state">—</small></article>
+    </section>
+    <div id="notice" role="status" aria-live="polite"></div>
+    <section id="pending-commands" class="notice" hidden aria-label="待確認操作"></section>
+    <section id="blockers" class="blockers" aria-label="影響交易的項目"></section>
+    <section class="workspace">
+      <nav class="tabs" role="tablist" aria-label="委託清單">
+        <button role="tab" data-tab="pending" aria-selected="true">待處理</button>
+        <button role="tab" data-tab="all" aria-selected="false">全部委託</button>
+        <button role="tab" data-tab="positions" aria-selected="false">部位與結案</button>
+        <button role="tab" data-tab="conditions" aria-selected="false">曲線進場／交易指令</button>
+        <button role="tab" data-tab="events" aria-selected="false">處理紀錄</button>
+      </nav>
+      <form id="filters" class="filters">
+        <label>起始交易日<input name="since" type="date"></label>
+        <label>結束交易日<input name="until" type="date"></label>
+        <label>商品／月份<input name="contract" placeholder="例如 TMFL6" maxlength="24"></label>
+        <label>來源<select name="source"><option value="">全部來源</option><option value="system">系統</option><option value="external">券商外部</option></select></label>
+        <label>方向<select name="side"><option value="">全部</option><option value="Buy">買進</option><option value="Sell">賣出</option></select></label>
+        <label>類型<select name="phase"><option value="">全部</option><option value="entry">進場</option><option value="exit">平倉</option><option value="condition">曲線條件</option><option value="command">交易指令</option></select></label>
+        <label>系統結案<select name="closed"><option value="">全部</option><option value="0">尚未結束</option><option value="1">已結束</option></select></label>
+        <label>執行狀態<select name="state"><option value="">全部</option><option value="Submitted">未成交</option><option value="PartFilled">部分成交</option><option value="Filled">全成</option><option value="Cancelled">已撤銷</option><option value="Rejected">拒絕</option><option value="unknown">結果未知</option><option value="submitting">送單待核對</option><option value="armed">等待突破</option><option value="failed">已停止／失敗</option></select></label>
+        <label class="search">編號搜尋<input name="search" placeholder="本機 ID、指令 ID、券商書號" maxlength="128"></label><button type="submit">查詢</button><button id="reset-filters" type="reset">重設</button>
+      </form>
+      <div class="list-meta"><span id="list-status" role="status">載入紀錄中…</span><button id="reload-list">更新清單</button></div>
+      <div class="table-scroll"><table><thead id="records-head"></thead><tbody id="records-body"></tbody></table></div>
+      <div class="pagination"><button id="previous-page" disabled>上一頁</button><span id="page-number">第 1 頁</span><button id="next-page" disabled>下一頁</button></div>
+    </section>
+    <p id="coverage" class="footnote">資料涵蓋範圍確認中。</p>
+  </main>
+  <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title">
+    <header><div><p class="eyebrow">紀錄詳情</p><h2 id="detail-title">核對紀錄</h2></div><button id="close-detail" aria-label="關閉詳情">✕</button></header>
+    <div id="detail-content"></div>
+    <section id="repair-form"><h3>核對與處理</h3><p class="muted">選擇處理方式後先查看預覽。資料不足時會列出原因。</p>
+      <label>處理方式<select id="repair-action"></select></label>
+      <label id="linked-order-field" hidden>關聯的原管理單<select id="linked-order"></select></label>
+      <div id="broker-link-fields" hidden><p class="warning">逐一核對券商書號。此操作會將券商已存在的委託歸入原管理單，不會重新送單。</p><label>券商委託 ID<input id="link-broker-id" maxlength="128"></label><label>seqno<input id="link-seqno" maxlength="64"></label><label>ordno<input id="link-ordno" maxlength="64"></label></div>
+      <div id="attestation-fields" hidden><label>已核對交易日<input id="checked-date" type="date"></label><label>人工核對說明<textarea id="repair-note" rows="3" maxlength="1000" placeholder="請說明在哪裡查核、核對範圍與結果（至少 10 字）；不要填入帳號或憑證。"></textarea></label><label class="check"><input id="attested" type="checkbox"><span id="attestation-label">我已核對券商委託、成交與部位，確認本事項沒有對應委託</span></label></div>
+      <button id="preview-repair" class="primary">查看處理預覽</button><p id="detail-message" role="status"></p>
+    </section>
+  </dialog>
+  <dialog id="preview-dialog" aria-labelledby="preview-title"><header><h2 id="preview-title">確認處理內容</h2><button id="close-preview" aria-label="關閉預覽">✕</button></header><div id="preview-content"></div><footer><button id="back-preview">返回</button><button id="apply-repair" class="primary">確認執行此處理</button></footer><p id="preview-message" role="status"></p></dialog>
+</body>
+</html>

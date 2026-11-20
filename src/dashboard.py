@@ -59,6 +59,7 @@ from starlette.concurrency import run_in_threadpool
 from trading_models import (OrderIn, TradeLevelsIn, TradeCurveIn, TradeCurveSelectionIn,
                             TradeRiskSettingsIn, ContractSubscriptionIn, CurveEntryIn, ExternalPositionIn)
 from mock_routes import router as mock_router
+from order_routes import create_router as create_order_router, mock_command
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LWC_BUNDLE = WEB_DIR / "lightweight-charts.standalone.production.js"
@@ -118,11 +119,14 @@ def _pnl_context():
 
 from pnl_calendar import create_router as create_pnl_router
 app.include_router(create_pnl_router(_pnl_context))
+app.include_router(create_order_router(lambda:dict(db_path=CONFIG['db_path'],code=CONFIG['code'],
+    mode='mock' if _mock_runtime() is not None else CONFIG.get('mode','simulation')),lambda:_trading_service()))
 
 @app.middleware('http')
 async def trading_identity(request: Request, call_next):
     token = command_id.set(request.headers.get('Idempotency-Key'))
-    recorder = _latency_recorder() if request.url.path.startswith('/api/trading/') else None
+    inspection_read = request.method == 'GET' and request.url.path.startswith('/api/trading/reconciliation/')
+    recorder = _latency_recorder() if request.url.path.startswith('/api/trading/') and not inspection_read else None
     trace_id = identity(request.headers.get('Idempotency-Key') or request.headers.get('X-Trace-Id'))
     began = recorder.record('dashboard_request_received', trace_id=trace_id, command_id=command_id.get()) if recorder else None
     try:
@@ -198,6 +202,8 @@ def api_latency(trace_id: str | None = None, order_id: str | None = None):
 def api_trade_command(identity: str):
     service = _trading_service()
     if not isinstance(service, TradeClient):
+        if _mock_runtime() is not None:
+            return mock_command(service,identity)
         raise HTTPException(404, '此模式未使用獨立 trade 指令')
     return service.command(identity)
 

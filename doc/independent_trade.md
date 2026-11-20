@@ -240,3 +240,10 @@ conda run -n tss pytest -q src/test_independent_trade.py src/test_market_fetcher
 - 新 trade 整合測試涵蓋只讀查詢不登入／不查券商、同 ID 去重及內容衝突、送單已接受但回應遺失不重送、processing 重啟轉 unknown、排程外不登入、登出不平倉、登入跨登出時間先釋放 session、登出失敗仍可在下次排程登入、tick 越線不提前出場、曲線版本變更、monitor checking 不重設起點，以及實際報價與收定判斷價格分離。
 - JavaScript 語法、Python 語法與 diff 空白檢查通過；另以離線瀏覽器環境替身驗證「回應遺失 → 頁面重載 → 同指令 ID 重試」，不產生新指令 ID。
 - 未登入券商、未送單、未部署；實際券商多 session、CA、回報／部位跨 session 核對、資料時效與 Windows 原生行為仍待驗收。
+# 2026-11-20：委託與結案管理頁
+
+新增 Dashboard `/orders`，整合完整本機歷史、已保存與當前可取得的券商委託、曲線條件及交易指令。核對、預覽及套用使用持久化唯一指令 ID，由原 trade 背景執行緒執行；Dashboard 不增加券商登入。原始未知結果與 claim 保留，後續核對另存 resolution，不能重送原單。
+
+可撤銷已確認的掛單餘量、同步券商證據、配對原進出場委託，以及在沒有送單 claim／SDK 證據或矛盾紀錄時，經人工確認結束舊曲線／指令。預覽綁定帳戶、session 與資料版本，套用前再核對。取消尚未送單的條件可在排程外執行。詳見 [委託與結案管理](order_reconciliation.md)。
+
+目前為離線驗證的實作；尚未更新正式服務，原生瀏覽器版面、macOS 與券商現場驗收待完成。

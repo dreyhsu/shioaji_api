@@ -42,6 +42,7 @@ class MockRuntime:
             enable_telegram=False,
             **({"settings_path": self.settings_path} if self.settings_path is not None else {}),
         )
+        self.service._ledger_mode = 'mock'
         with db.session(self.db_path) as conn:
             db.upsert_minute_bars(conn, self.code, self.bars.iloc[:self.cursor])
         self.service.ensure_connected()

@@ -18,6 +18,7 @@ import shioaji as sj
 from dotenv import load_dotenv
 
 import db
+from order_reconciliation import pending_command
 from latency_trace import link_order, order_link, trace_scope
 import market_clock
 import market_health as mh
@@ -565,9 +566,7 @@ class TradingService:
             return
         self._last_external_sync = self._monotonic()
         with db.read_session(self.db_path) as conn:
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='trade_commands'").fetchone() and conn.execute(
-                    "SELECT 1 FROM trade_commands WHERE code=? AND mode=? AND state='unknown' LIMIT 1",
-                    (self.code, 'simulation' if self.simulation else 'production')).fetchone():
+            if pending_command(conn, self.code, 'simulation' if self.simulation else 'production'):
                 return
             pending = {row['id']:dict(row) for row in conn.execute('''SELECT o.* FROM managed_orders o
                 JOIN pnl_order_metadata m ON m.order_id=o.id WHERE o.code=? AND o.simulation=?
@@ -713,6 +712,9 @@ class TradingService:
         try:
             kwargs = {"timeout": self.health_settings.api_timeout_ms} if self.api_factory is None else {}
             positions = self._api.list_positions(self._api.futopt_account, **kwargs)
+            # Inspection persistence runs after accepted commands/protection;
+            # never normalize historical observations in the entry fast path.
+            self._inspection_pending = (self._generation, trades, positions)
             stage = 'position_totals'
             actual = {}
             for position in positions:
@@ -1108,9 +1110,9 @@ class TradingService:
                             broker_trade_id=original['entry_trade_id'] if phase == 'entry' else original.get('exit_trade_id'),
                             cumulative_quantity=updates[key], broker_filled_at=broker_stamp,
                             generation=self._generation, **fields)
-        if new_fill and original.get('order_origin') != 'external_order':
+        if new_fill and original.get('order_origin') != 'external_order' and not getattr(self,'_reconciliation_suppress_notifications',False):
             self.entry_notifier.notify(self._active_order(row_id))
-        if new_exit_fill:
+        if new_exit_fill and not getattr(self,'_reconciliation_suppress_notifications',False):
             notification = self._active_order(row_id)
             if int(notification.get('external_exit_quantity', 0)):
                 # Notification describes this SDK exit, excluding earlier App fills.
