@@ -64,6 +64,26 @@ def test_gap_is_not_hidden_by_a_fresh_tail_or_no_volume():
     assert result["ready"]  # evidence excuses the absence without inventing a bar
 
 
+def test_confirmed_empty_minute_is_scoped_to_its_contract(tmp_path):
+    document = calendar_document()
+    document['confirmed_empty_minutes'] = [dict(code='TMFL6', minute_start='2026-10-27 19:03',
+                                               evidence='fixture broker ticks and neighboring kbars verified')]
+    path = tmp_path / 'calendar.json'
+    path.write_text(json.dumps(document), encoding='utf-8')
+    calendar = mh.SessionCalendar.load(path)
+    frame = bars('2026-10-27 19:00', '2026-10-27 19:09')
+    frame = frame[frame.minute_start != pd.Timestamp('2026-10-27 19:03')]
+    for code, ready in [('TMFL6', True), ('TMFR1', False), (None, False)]:
+        scoped = calendar.for_code(code)
+        result = mh.validate_bars(frame, '2026-10-27 19:10', scoped, since='2026-10-27 19:00')
+        assert result['ready'] is ready
+        assert result['blocking_missing_count'] == (0 if ready else 1)
+        assert not scoped.consecutive_trading_minutes('2026-10-27 19:02', '2026-10-27 19:04')
+    assert calendar.empty_minutes == set()
+    assert calendar.for_code('TMFR1').empty_minutes == set()
+    assert calendar.for_code('TMFL6').for_code('TMFR1').empty_minutes == set()
+
+
 def test_live_delay_is_allowed_but_final_minute_must_be_caught_up():
     calendar = mh.SessionCalendar(calendar_document())
     frame = bars("2026-10-28 04:57", "2026-10-28 04:58")

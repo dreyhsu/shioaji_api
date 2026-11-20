@@ -12,14 +12,14 @@ import math
 
 import pandas as pd
 
-from alert_rules import Candidate
+from alert_rules import Candidate, DEFAULTS
 import db
 from supertrend import confirmed_supertrend
 
 RULE = 'session_open_supertrend'
-VERSION = 1
+VERSION = 2
 MINUTE = pd.Timedelta(minutes=1)
-ACTIVE = {'waiting', 'armed'}
+ACTIVE = {'waiting', 'armed', 'triggered'}
 
 
 def _text(stamp):
@@ -113,14 +113,16 @@ class SessionOpenAlerts:
                      (self.mode, self.code, _text(start), VERSION, state['status'],
                       json.dumps(state, sort_keys=True, ensure_ascii=False), _text(now)))
 
-    def _expire(self, conn, now):
+    def _expire(self, conn, now, monitor_window):
         rows = conn.execute('SELECT session_start, document FROM session_open_alert_states '
-                            "WHERE mode=? AND code=? AND rule_version=? AND status IN ('armed','waiting')",
+                            "WHERE mode=? AND code=? AND rule_version=? AND status IN ('armed','waiting','triggered')",
                             (self.mode, self.code, VERSION)).fetchall()
         for row in rows:
             state = json.loads(row['document'])
-            if pd.Timestamp(state['session_end']) + MINUTE <= now:
-                state.update(status='expired', reason='session_ended')
+            deadline = min(pd.Timestamp(state['session_end']),
+                           pd.Timestamp(row['session_start']) + monitor_window)
+            if deadline + MINUTE <= now:
+                state.update(status='expired', reason='monitoring_window_ended')
                 self._save(conn, pd.Timestamp(row['session_start']), state, now)
 
     def _context(self, conn, bars, hours, previous, start):
@@ -146,7 +148,8 @@ class SessionOpenAlerts:
                     direction=int(reading.supertrend_direction),
                     opening_st=float(reading.supertrend), opening_st_at=_text(reading.available_at)), None
 
-    def step(self, conn, hourly, calendar, now, *, ready, enabled, claim, opening_grace=False):
+    def step(self, conn, hourly, calendar, now, *, ready, enabled, claim, opening_grace=False,
+             rule_config=None):
         """Return committed (alert_id, Candidate) pairs; claim must not commit.
 
         Only new minutes run through the transition loop. A bounded session
@@ -154,22 +157,25 @@ class SessionOpenAlerts:
         A recovered/reenabled cycle never delivers a past crossing.
         """
         now = pd.Timestamp(now)
+        settings = {**DEFAULTS[RULE], **(rule_config or {})}
+        monitor_window = pd.Timedelta(minutes=settings['monitor_minutes'])
+        notify_interval = pd.Timedelta(minutes=settings['cooldown_minutes'])
         live = ready and enabled
         observing = (ready or opening_grace) and enabled
         if self._was_live is False and observing:
             self.not_before = max(self.not_before, now)
         self._was_live = observing
         revision = db.chart_versions(conn, self.code)[0]
-        key = (revision, now.floor('min'), id(calendar), ready, enabled)
+        key = (revision, now.floor('min'), id(calendar), ready, enabled, monitor_window, notify_interval)
         if key == self._last_key:
             return []
-        jobs = self._step(conn, hourly, calendar, now, revision, live, claim)
+        jobs = self._step(conn, hourly, calendar, now, revision, live, claim, monitor_window, notify_interval)
         self._last_key = key
         return jobs
 
-    def _step(self, conn, hourly, calendar, now, revision, live, claim):
+    def _step(self, conn, hourly, calendar, now, revision, live, claim, monitor_window, notify_interval):
         with conn:
-            self._expire(conn, now)
+            self._expire(conn, now, monitor_window)
         if not calendar.covered(now):
             self.suspend(now)
             return []
@@ -186,17 +192,34 @@ class SessionOpenAlerts:
         if (start.hour, start.minute) not in {(8, 45), (15, 0)}:
             return []
         saved = self._load(conn, start)
-        if saved and saved['status'] not in ACTIVE:
+        deadline = min(end, start + monitor_window)
+        reopened = bool(saved and saved['status'] == 'expired'
+                        and saved.get('reason') == 'monitoring_window_ended'
+                        and now < deadline + MINUTE)
+        if saved and saved['status'] not in ACTIVE and not reopened:
             return []
-        bars = _bars(conn, self.code, start, min(end, now.floor('min')))
+        # The last monitored candle keeps the usual <60s synchronization window.
+        if now >= deadline + MINUTE:
+            return []
+        bars = _bars(conn, self.code, start, min(deadline, now.floor('min')))
         hours = self._confirmed_hours(hourly, now)
         context, error = self._context(conn, bars, hours,
                                        calendar.sessions[index - 1] if index else None, start)
         state = dict(saved) if saved else dict(status='waiting', session_end=_text(end))
         before = json.dumps(state, sort_keys=True)
+        if reopened:
+            state['status'] = ('triggered' if state.get('trigger_minute') else
+                               'armed' if state.get('context') else 'waiting')
+        if saved is None:
+            # A live upgrade must also respect an alert claimed by version 1.
+            legacy = conn.execute(
+                'SELECT MAX(sent_at) FROM telegram_alerts WHERE code=? AND kind=? AND box_type=?',
+                (self.code, RULE, f'open:v1:{self.mode}:{start.isoformat()}')).fetchone()[0]
+            if legacy is not None:
+                state['last_notified_at'] = legacy
         pending = []
         if context is None:
-            state.update(status='invalid' if state['status'] == 'armed' else 'waiting', reason=error)
+            state.update(status='invalid' if state['status'] in {'armed', 'triggered'} else 'waiting', reason=error)
         elif saved and saved.get('context') and context != saved['context']:
             state.update(status='invalid', reason='opening_context_revised')
         elif not ((context['direction'] == -1 and context['open'] > context['previous_close'])
@@ -206,17 +229,17 @@ class SessionOpenAlerts:
             # Missing data repaired after observation, or an already-processed
             # minute/hour revised: reconstruct silently rather than create a
             # new "first" signal from a historical correction.
-            replay = bool(saved and saved['status'] == 'waiting' and not (
+            replay = reopened or bool(saved and saved['status'] == 'waiting' and not (
                 saved.get('reason') == 'missing_open' and now < start + 2 * MINUTE))
             cursor = pd.Timestamp(state['cursor']) if state.get('cursor') else None
             if cursor is not None and list(_prefix(bars, hours, start, cursor)) != state['prefix']:
                 replay = True
             if replay:
                 cursor = None
-            state.update(context=context, status='armed', reason=None, source_revision=revision)
+            state.update(context=context, status='triggered' if state.get('trigger_minute') else 'armed',
+                         reason=None, source_revision=revision)
             if cursor is None:
                 state.pop('cursor', None)
-                state.pop('last_close', None)
             new = bars if cursor is None else bars[bars.minute_start > cursor]
             timeline = hours[['available_at', 'supertrend_direction']].copy()
             timeline['st_available_at'] = timeline.available_at
@@ -235,35 +258,38 @@ class SessionOpenAlerts:
                         state.update(status='cancelled', reason='supertrend_changed', cursor=_text(minute))
                         break
                     valid = _finite((bar.open, bar.high, bar.low, bar.close))
-                    previous_close = context['open'] if minute == start else state.get('last_close')
-                    adjacent = minute == start or (cursor is not None and minute - cursor == MINUTE)
                     opening = context['open']
-                    crossed = valid and adjacent and previous_close is not None and (
-                        previous_close >= opening > bar.close if context['direction'] == -1 else
-                        previous_close <= opening < bar.close)
-                    state.update(cursor=_text(minute), last_close=float(bar.close) if valid else None)
+                    # Every complete close on the breakout side qualifies;
+                    # wicks, touches and forming candles never qualify.
+                    qualifies = valid and (bar.close < opening if context['direction'] == -1 else
+                                           bar.close > opening)
+                    state.update(cursor=_text(minute))
                     cursor = minute
-                    if crossed:
+                    if qualifies:
+                        last_notified = state.get('last_notified_at')
                         notify = (live and not replay and self.not_before < bar.available_at
-                                  and bar.available_at <= now < bar.available_at + MINUTE)
-                        state.update(status='triggered', trigger_minute=_text(minute),
-                                     trigger_close=float(bar.close),
-                                     reason='live_crossing' if notify else 'historical_or_paused_crossing')
+                                  and bar.available_at <= now < bar.available_at + MINUTE
+                                  and (last_notified is None or
+                                       now >= pd.Timestamp(last_notified) + notify_interval))
+                        state.setdefault('trigger_minute', _text(minute))
+                        state.setdefault('trigger_close', float(bar.close))
+                        state.update(status='triggered',
+                                     reason='live_close' if notify else 'historical_paused_or_throttled_close')
                         if notify:
                             candidate = Candidate(
-                                RULE, f'open:v{VERSION}:{self.mode}:{start.isoformat()}', True,
+                                RULE, f'open:v{VERSION}:{self.mode}:{start.isoformat()}', False,
                                 _message(self.code, start, context, minute, float(bar.close)))
                             pending = [(candidate, minute)]
-                        break
             if state.get('cursor'):
                 state['prefix'] = list(_prefix(bars, hours, start, pd.Timestamp(state['cursor'])))
         # All calculation is complete before taking SQLite's writer lock.
         committed = []
         if json.dumps(state, sort_keys=True) != before or saved is None:
             with conn:
-                self._save(conn, start, state, now)
                 for candidate, minute in pending:
                     alert_id = claim(candidate, minute)
                     if alert_id is not None:
+                        state['last_notified_at'] = _text(now)
                         committed.append((alert_id, candidate))
+                self._save(conn, start, state, now)
         return committed

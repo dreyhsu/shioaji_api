@@ -103,7 +103,7 @@
         <div id="trade-message" class="trade-message" role="status"></div>
       </div>
       <div id="curve-panel" role="tabpanel" aria-labelledby="curve-tab" hidden>
-        <p class="trade-muted entry-help">保存 1m／5m／15m／1h 直線或曲線後，統一等待相鄰已收盤 1 分 K 穿越，僅進場一次。成交後預設停損、停利各 2 倍 1h ATR；進場線條不會自動套用為停利線條。啟用後若要變更設定，請先取消再重新啟用。</p>
+        <p class="trade-muted entry-help">保存 1m／5m／15m／1h 直線或曲線後，統一等待相鄰已收盤 1 分 K 穿越，僅進場一次。成交後預設停損 0.5 倍、停利 2 倍 1h ATR；進場線條不會自動套用為停利線條。啟用後若要變更設定，請先取消再重新啟用。</p>
         <label class="trade-field">進場直線／曲線
           <select id="entry-curve"><option value="">先在 1m／5m／15m／1h 圖手動畫直線或曲線</option></select>
         </label>
@@ -117,7 +117,7 @@
         <label class="trade-field">口數
           <input id="entry-quantity" type="number" min="1" max="100" step="1" value="{{default_entry_quantity}}" inputmode="numeric">
         </label>
-        <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損、停利預設各 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。成交後可編輯出場，自動保本依交易設定。</div>
+        <div class="trade-preview">觸發後以市價 MKT / IOC 進場。停損預設 0.5 倍、停利 2 倍進場 1h ATR，依實際成交均價計算；空單方向反向。成交後可編輯出場，自動保本依交易設定。</div>
         <button id="entry-arm" class="trade-submit" type="button" disabled>啟用一次突破做多</button>
         <button id="entry-cancel" class="entry-cancel" type="button" disabled>取消等待進場</button>
         <div id="entry-message" class="trade-message" role="status"></div>

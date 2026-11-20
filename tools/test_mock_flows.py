@@ -31,8 +31,8 @@ class Scenario:
 SCENARIOS = (
     Scenario("fixed-atr", "進場後固定 +2 ATR 停利", "test_fixed_exits_fill_and_flatten_position[Buy-target]"),
     Scenario("curve-exit", "反彈後回檔，跌破 Curve 曲線停利", "test_rebound_then_pullback_closes_long_at_a_profit_using_curve"),
-    Scenario("curve-entry", "向上突破 Curve 曲線後進場一次", "test_3_curve_breakout_buys_once_and_creates_two_atr_levels"),
-    Scenario("curve-entry-stop", "突破 Curve 曲線進場後固定 −2 ATR 停損", "test_curve_breakout_entry_then_fixed_two_atr_stop"),
+    Scenario("curve-entry", "向上突破 Curve 曲線後進場一次", "test_3_curve_breakout_buys_once_and_creates_default_atr_levels"),
+    Scenario("curve-entry-stop", "突破 Curve 曲線進場後固定 −0.5 ATR 停損", "test_curve_breakout_entry_then_fixed_half_atr_stop"),
 )
 
 
@@ -76,7 +76,7 @@ def print_result(result: dict):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="離線自動測試：固定 2 ATR 停利、Curve 停利、突破進場及 −2 ATR 停損")
+    parser = argparse.ArgumentParser(description="離線自動測試：固定 2 ATR 停利、Curve 停利、突破進場及 −0.5 ATR 停損")
     parser.add_argument("--case", choices=["all", *(scenario.key for scenario in SCENARIOS)], default="all",
                         help="只測指定流程，預設 all 全部執行")
     parser.add_argument("--report", type=Path, help="另存 JSON 報告的路徑")

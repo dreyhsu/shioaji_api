@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import math
 import os
-from contextlib import closing
 from pathlib import Path
 import uuid
 import threading
@@ -28,7 +27,7 @@ from curve_entry import crossed_curve
 from curve_entry_controller import CurveEntryController
 from latency_trace import LatencyRecorder, trace_scope, trace_values, order_link, identity
 from market_fetcher import FetcherSettings, SessionSchedule
-from trading import TradingService, _value, _enum_text, _fill_summary, _trade_status, align_tick, stop_target_prices, crossed_exit, crossed_curve_close
+from trading import TradingService, _value, _enum_text, _fill_summary, _trade_status, align_tick, stop_target_prices
 
 PROFIT_LOCK_TICK_BATCH = 256
 
@@ -62,6 +61,13 @@ class OrderSession:
 
     def place_order(self, *args, **kwargs):
         self._check()
+        contract = args[0] if args else kwargs.get('contract')
+        order = args[1] if len(args) > 1 else kwargs.get('order')
+        if _enum_text(_value(order, 'octype')) == 'Cover':
+            self.service.load_quotes()
+            for code in (str(contract.code), getattr(self.service, '_exit_signal_quote_code', None)):
+                if code and self.service._manual_order_market_error(code):
+                    raise ValueError('即時行情來源已失效，暫停自動平倉')
         return self.api.place_order(*args, **kwargs)
 
     def cancel_order(self, *args, **kwargs):
@@ -122,7 +128,8 @@ class ClosedMinuteEntry(CurveEntryController):
         now = pd.Timestamp(service._now())
         closed, _ = service._curve_source(service.code, curve['timeframe'], closed=True)
         contract = service._find_contract(entry['contract_code'])
-        if service._fresh_risk_quote({'contract_code': str(contract.code)}) is None:
+        if (service._fresh_risk_quote({'contract_code': str(contract.code)}) is None
+                or service.closed_price({'contract_code': str(contract.code)}) is None):
             return
         watermark = entry.get('last_checked_minute')
         for index in _pending_minute_indices(closed, entry['check_from'], watermark):
@@ -220,6 +227,9 @@ class IndependentTradingService(TradingService):
         self.curve_entry = ClosedMinuteEntry(self)
         with db.session(self.db_path) as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS trade_curve_versions (entry_id INTEGER PRIMARY KEY, signature TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS managed_tick_exit_hits (order_id TEXT PRIMARY KEY, reason TEXT NOT NULL, hit_at TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS managed_curve_exit_ticks (order_id TEXT PRIMARY KEY, tick_seq INTEGER NOT NULL, quote_at TEXT NOT NULL)')
+            conn.execute('CREATE TABLE IF NOT EXISTS managed_tick_risk_rules (order_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL)')
             conn.commit()
 
     def _session_event(self, event):
@@ -285,7 +295,7 @@ class IndependentTradingService(TradingService):
             self._recovery.pending = False
             self.last_rpc_sync = float('-inf')
             self._recover_subscriptions()  # registers DB quote aliases only
-            self.contract_cache = super().contracts()
+            self.contract_cache = super().contracts(subscribe_first=self.position_sync_codes is None)
             for code in self.position_sync_codes or ():
                 if not code.endswith(('R1', 'R2')):
                     self._subscribe(self._find_contract(code))
@@ -392,7 +402,7 @@ class IndependentTradingService(TradingService):
     def _trades_by_id(self, *, force=False):
         terminal = {'Filled', 'Cancelled', 'Failed', 'Rejected'}
         rows = self._active_orders()
-        pending = self._report_repair_needed or any(row['entry_status'] not in terminal or
+        pending = self._report_repair_needed or bool(getattr(self, '_external_working_orders', [])) or any(row['entry_status'] not in terminal or
                       row['entry_status'] == 'Filled' and not row['filled_quantity'] or
                       row.get('exit_trade_id') and row.get('exit_status') not in terminal
                       for row in rows)
@@ -430,6 +440,35 @@ class IndependentTradingService(TradingService):
                         generation=self._generation, **order_link(self.db_path, row['id']))
         self._observed_trade_states = observed
         return trades
+
+    def _synchronize_broker_authority(self, trades, positions, actual, kwargs):
+        from broker_sync import synchronize
+        return synchronize(self, trades, positions, actual, kwargs)
+
+    def _external_close_reserved(self, row):
+        from broker_sync import pending_close
+        return pending_close(self, row)
+
+    def _persist_trade_state(self, row_id, *, entry=None, exit_trade=None):
+        row = self._active_order(row_id)
+        if row and row.get('order_origin') == 'external_order':
+            # App Auto executions can contain both covers and new entries.
+            # Their entry quantities come from verified open-position lots,
+            # while all reported order fills remain in broker_external_orders.
+            if entry is not None:
+                with db.read_session(self.db_path) as conn:
+                    saved=conn.execute('SELECT document FROM broker_external_orders WHERE broker_trade_id=?',
+                        (row['entry_trade_id'],)).fetchone()
+                document=json.loads(saved['document']) if saved else {}
+                order,status=entry.order,entry.status
+                if any(document.get(key)!=current for key,current in (
+                    ('status',_trade_status(entry)),('filled_quantity',int(_value(status,'deal_quantity',0))),
+                    ('quantity',int(_value(status,'order_quantity') or _value(order,'quantity',0))),
+                    ('price',float(_value(status,'modified_price') or _value(order,'price',0))))):
+                    self._reconcile_required = self._report_repair_needed = True
+            entry = None
+        if entry is not None or exit_trade is not None:
+            return super()._persist_trade_state(row_id, entry=entry, exit_trade=exit_trade)
 
     def _capture_order_event(self, generation, *args):
         """SDK thread: no broker I/O, database access, locks on trading, or raw payload logs."""
@@ -513,123 +552,30 @@ class IndependentTradingService(TradingService):
         return float(last['close'])
 
     def _fresh_risk_quote(self, row):
-        tick = super()._fresh_risk_quote(row)
-        if tick is None:
-            return None
-        return self.closed_price(row)
-
-    def _monitor_risk_quote(self, row):
-        if row.get('profit_lock_enabled') and self.closed_price({'contract_code': row['contract_code']}) is not None:
-            return super()._fresh_risk_quote(row)
-        return self._fresh_risk_quote(row)
-
-    def _apply_breakeven(self, row, price):
-        row = self._apply_tick_profit_lock(row)
-        closed = self.closed_price(row)
-        if closed is None:
-            return row
-        # The ordinary fixed breakeven still uses the closed minute. Its call
-        # into the shared helper must not feed a candle into the tick peak.
-        fixed_row = {**row, 'profit_lock_enabled': 0}
-        fixed = super()._apply_breakeven(fixed_row, closed)
-        return row if fixed is fixed_row else fixed
-
-    def _profit_lock_quote(self, row, price):
-        if row.get('profit_lock_enabled') and self._profit_lock_backlog.get(row['id']):
-            return None  # a later quote cannot be inserted ahead of pending ticks
-        if not self._curve_data_ready() or self.closed_price({'contract_code': row['contract_code']}) is None:
+        if self._manual_order_market_error(row['contract_code']):
             return None
         return super()._fresh_risk_quote(row)
 
+    def _monitor_risk_quote(self, row):
+        return self._fresh_risk_quote(row)
+
+    def _apply_breakeven(self, row, price):
+        return self._apply_tick_profit_lock(row)
+
+    def _profit_lock_quote(self, row, price):
+        if self._profit_lock_backlog.get(row['id']):
+            return None
+        return self._fresh_risk_quote(row)
+
     def _apply_tick_profit_lock(self, row):
-        if (not row.get('profit_lock_enabled') or not row.get('active') or row.get('triggered_at')
-                or row.get('exit_trade_id') or row.get('exit_status')
-                or int(row['filled_quantity']) <= int(row['exit_filled_quantity'])):
-            return row
-        latest = super()._fresh_risk_quote(row)
-        if latest is None or self.closed_price({'contract_code': row['contract_code']}) is None or not self._curve_data_ready():
-            return row
-        now = pd.Timestamp(self._now())
-        since = pd.Timestamp(row.get('profit_lock_started_at') or now)
-        if row.get('created_at'):
-            since = max(since, pd.Timestamp(row['created_at']))
-        code = self.bar_codes.get(row['contract_code'], row['contract_code'])
-        mode = 'simulation' if self.simulation else 'production'
-        policy = self._profit_lock_policy()
-        with db.read_session(self.db_path) as conn:
-            conn.execute('BEGIN')
-            state = conn.execute('SELECT * FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
-            cursor, hit = (state['tick_seq'], state['hit_at']) if state else (0, None)
-            last_stamp = pd.Timestamp(state['quote_at']) if state and state['quote_at'] else since
-            exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='market_risk_ticks'").fetchone()
-            cutoff = mh.iso(max(since, now - pd.Timedelta(seconds=self.health_settings.tick_stale_seconds)))
-            head = 2**63 - 1
-            if exists and conn.execute("SELECT 1 FROM sqlite_master WHERE name='market_risk_tick_heads'").fetchone():
-                published = conn.execute('''SELECT q.quote_at,q.price,q.instance,q.generation,h.seq
-                    FROM market_latest_quotes q LEFT JOIN market_risk_tick_heads h USING(code,mode)
-                    WHERE q.code=? AND q.mode=?''', (code, mode)).fetchone()
-                quote = self._quotes[row['contract_code']]
-                if (published is None or pd.Timestamp(published['quote_at']) != quote['at']
-                        or published['price'] != quote['price']
-                        or (published['instance'], published['generation']) != self._quote_sources.get(row['contract_code'])):
-                    self._wake.set()  # reload a coherent quote/head next cycle
-                    return row
-                if published['seq'] is not None:
-                    head = published['seq']
-            if exists:
-                # Seek past obsolete history using the receive-time index, then
-                # consume a bounded suffix through the sequence index.
-                old = conn.execute('''SELECT seq FROM market_risk_ticks
-                    WHERE code=? AND mode=? AND received_at<? AND seq<=?
-                    ORDER BY received_at DESC,seq DESC LIMIT 1''', (code, mode, cutoff, head)).fetchone()
-                cursor = max(cursor, old['seq'] if old else 0)
-            ticks = conn.execute('''SELECT * FROM market_risk_ticks WHERE code=? AND mode=? AND seq>? AND seq<=?
-                ORDER BY seq LIMIT ?''', (code, mode, cursor, head, PROFIT_LOCK_TICK_BATCH + 1)).fetchall() if exists else []
-        more = len(ticks) > PROFIT_LOCK_TICK_BATCH
-        self._profit_lock_backlog[row['id']] = more
-        if more:
-            self._wake.set()  # resume without the normal .5s sleep; commands get priority each cycle
-        updated = dict(row)
-        prices = []
-        for tick in ticks[:PROFIT_LOCK_TICK_BATCH]:
-            cursor = tick['seq']
-            stamp, received = pd.Timestamp(tick['quote_at']), pd.Timestamp(tick['received_at'])
-            if ((tick['instance'], tick['generation']) != self._quote_sources.get(row['contract_code'])
-                    or stamp < since or received < since or stamp < last_stamp
-                    or not all(-5 <= (now - at).total_seconds() <= self.health_settings.tick_stale_seconds for at in (stamp, received))
-                    or not -5 <= (received - stamp).total_seconds() <= self.health_settings.tick_stale_seconds):
-                continue
-            last_stamp = stamp
-            prices.append((float(tick['price']), str(stamp)))
-        latest_at = self._quotes[row['contract_code']]['at']
-        if not more and latest_at >= max(since, last_stamp):
-            prices.append((latest, str(latest_at)))
-            last_stamp = latest_at
-        for price, stamp in prices:
-            if hit:
-                break
-            if not math.isfinite(price) or price <= 0:
-                continue
-            updated.update(super()._profit_lock_updates(updated, price, policy=policy))
-            protection = updated.get('profit_lock_price')
-            if protection is not None and crossed_exit(row['action'], price, protection, None):
-                hit = stamp
-        changes = {key: value for key, value in updated.items() if row.get(key) != value}
-        if not row.get('profit_lock_started_at'):
-            changes['profit_lock_started_at'] = str(since)
-        next_state = (cursor, hit, str(last_stamp))
-        previous_state = tuple(state[key] for key in ('tick_seq', 'hit_at', 'quote_at')) if state else None
-        if not changes and next_state == previous_state:
-            return row
-        # Parsing/calculation above holds no writer lock. Schema setup already
-        # happened at service startup; persist just the changed order and cursor.
-        with closing(db.connect(self.db_path)) as conn, conn:
-            if changes:
-                conn.execute('UPDATE managed_orders SET ' + ','.join(f'{key}=?' for key in changes)
-                    + ',risk_revision=risk_revision+1,updated_at=? WHERE id=?',
-                    (*changes.values(), str(now), row['id']))
-            conn.execute('INSERT OR REPLACE INTO managed_profit_lock_ticks VALUES (?,?,?,?)', (row['id'], *next_state))
-        return {**row, **changes, 'risk_revision': row['risk_revision'] + 1, 'updated_at': str(now)} if changes else row
+        from tick_protection import apply_contract
+        limit = PROFIT_LOCK_TICK_BATCH // 2 if row.get('curve_id') else PROFIT_LOCK_TICK_BATCH
+        return apply_contract(self, row, limit)
+
+    def _risk_settings_saved(self, conn, row_id, now):
+        conn.execute('INSERT OR REPLACE INTO managed_tick_risk_rules VALUES (?,?)', (row_id, now))
+        conn.execute('DELETE FROM managed_tick_exit_hits WHERE order_id=?', (row_id,))
+        conn.execute('DELETE FROM managed_curve_exit_ticks WHERE order_id=?', (row_id,))
 
     def _curve_source(self, code, timeframe, *, closed=False):
         """Share complete source geometry until the monitor's minute revision changes.
@@ -666,55 +612,27 @@ class IndependentTradingService(TradingService):
                                  "AND kind IN ('line','curve') AND enabled=1", (row['curve_id'], row['code'])).fetchone()
         if curve is None:
             return None
-        minutes, source = self._curve_source(row['code'], curve['timeframe'])
-        if minutes.empty:
-            return None
-        value = tl.values_at_times(source, json.loads(curve['anchors']), [minutes.iloc[-1]['minute_start']],
-                                   kind=curve['kind'], timeframe=curve['timeframe']).iloc[0]
-        return float(value) if math.isfinite(value) else None
+        from tick_protection import curve_values
+        quote = self._quotes.get(self.code)
+        return curve_values(self, curve, [quote['at'] if quote else self._now()])[0]
 
     def _exit_signal(self, row, price):
-        if not self._curve_data_ready():
+        if self._fresh_risk_quote(row) is None:
             return None
-        if row.get('profit_lock_enabled') and row.get('profit_lock_price') is not None:
-            tick = super()._fresh_risk_quote(row)
-            if tick is not None and self.closed_price({'contract_code': row['contract_code']}) is not None:
-                with db.read_session(self.db_path) as conn:
-                    state = conn.execute('SELECT hit_at FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
-                if (state and state['hit_at']) or crossed_exit(row['action'], tick, row['profit_lock_price'], None):
-                    return 'stop'
-        closed = self.closed_price(row)
-        if closed is None:
-            return None
-        fixed_stop = float(row['stop_price'])
-        if row.get('profit_lock_enabled') and row.get('profit_lock_price') == fixed_stop:
-            # A freshly raised tick floor cannot be compared to an older close.
-            # Tighter manual/fixed breakeven stops still use their original rule.
-            fixed_stop = float('-inf') if row['action'] == 'Buy' else float('inf')
-        stop = crossed_exit(row['action'], closed, fixed_stop, None)
-        if stop:
-            return stop
-        if not row.get('curve_id'):
-            return crossed_exit(row['action'], closed, fixed_stop, row['target_price'])
         with db.read_session(self.db_path) as conn:
-            curve = conn.execute("SELECT anchors,timeframe,kind FROM trendlines WHERE id=? AND code=? "
-                                 "AND kind IN ('line','curve') AND enabled=1", (row['curve_id'], self.code)).fetchone()
-        if curve is None:
-            return 'curve_unavailable'
-        bars, source = self._curve_source(self.code, curve['timeframe'], closed=True)
-        if len(bars) < 2:
-            return 'curve_unavailable'
-        pair = bars.iloc[-2:]
-        if not self._calendar.consecutive_trading_minutes(pair.iloc[0]['minute_start'], pair.iloc[-1]['minute_start']):
-            return 'curve_unavailable'
-        if row.get('curve_check_from') and pair.iloc[-1]['minute_start'] < pd.Timestamp(row['curve_check_from']):
-            return None
-        values = tl.values_at_times(source, json.loads(curve['anchors']),
-                                    pair['minute_start'].tolist(), kind=curve['kind'], timeframe=curve['timeframe']).tolist()
-        if any(not math.isfinite(value) for value in values):
-            return 'curve_unavailable'
-        return 'curve' if crossed_curve_close(row['action'], float(pair.iloc[0]['close']), values[0],
-                                               float(pair.iloc[1]['close']), values[1]) else None
+            hit = conn.execute('SELECT reason FROM managed_tick_exit_hits WHERE order_id=?', (row['id'],)).fetchone()
+            lock = conn.execute('SELECT hit_at FROM managed_profit_lock_ticks WHERE order_id=?', (row['id'],)).fetchone()
+        if hit:
+            if hit['reason'] != 'curve' or self._manual_order_market_error(self.code) is None:
+                return hit['reason']
+        if row.get('profit_lock_enabled') and lock and lock['hit_at']:
+            return 'stop'
+        # Each source keeps its own bounded tape cursor; neither inserts the
+        # latest quote ahead of its unconsumed ticks.
+        if row.get('curve_id'):
+            from tick_protection import curve_signal
+            return curve_signal(self, row, PROFIT_LOCK_TICK_BATCH // 2)
+        return None
 
     def _manual_order_market_error(self, contract_code):
         """Validate the live quote path independently of historical bar readiness."""
@@ -772,6 +690,33 @@ class IndependentTradingService(TradingService):
     def contracts(self):
         return list(self.contract_cache)
 
+    def entry_contracts(self):
+        """Selectable entries only; keep the broker catalog for reconciliation."""
+        now = pd.Timestamp(self._now())
+        if now.tzinfo is not None:
+            now = now.tz_convert('Asia/Taipei').tz_localize(None)
+        allowed = None if self.position_sync_codes is None else {
+            self._quote_aliases.get(code, code) for code in self.position_sync_codes
+            if not code.endswith(('R1', 'R2'))}
+        result = []
+        for item in self.contract_cache:
+            canonical = self._quote_aliases.get(item['code'], item['code'])
+            if allowed is not None and canonical not in allowed:
+                continue
+            if item.get('delivery_date'):
+                try:
+                    day = pd.Timestamp(item['delivery_date']).normalize()
+                    # TMF's final session ends at 13:30 on its broker-supplied
+                    # delivery date. Do not infer other products' expiry hours.
+                    cutoff = day + (pd.Timedelta(hours=13, minutes=30) if self.code[:3] == 'TMF'
+                                    else pd.Timedelta(days=1))
+                    if pd.isna(cutoff) or now >= cutoff:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            result.append(dict(item))
+        return result
+
     def _read_broker_lots(self, positions, actual, kwargs):
         result = {}
         account = self._api.futopt_account
@@ -791,6 +736,9 @@ class IndependentTradingService(TradingService):
         return result
 
     def _prepare_broker_lots(self, rows, positions, actual, kwargs):
+        if (getattr(self, '_broker_authority_snapshot_token', None) == self._last_position_sync_at
+                and getattr(self, '_broker_lots_snapshot', None) is not None):
+            return self._broker_lots_mismatch(rows)
         self._broker_lots_snapshot = self._broker_entry_lots = None
         if not callable(getattr(self._api, 'list_position_detail', None)):
             return False
@@ -841,7 +789,7 @@ class IndependentTradingService(TradingService):
         expected = position_totals(rows)
         if any(quantity > actual.get(pair, 0) for pair, quantity in expected.items()):
             return
-        if any(row['entry_status'] not in TERMINAL or row.get('exit_trade_id')
+        if any(row['entry_status'] in {'unknown','submitting'} or row.get('exit_trade_id')
                or row.get('exit_status') for row in rows):
             return
         account = self._api.futopt_account
@@ -879,9 +827,10 @@ class IndependentTradingService(TradingService):
             return
         if any(record['entry_quantity'] != record['quantity'] for lot in remaining.values() for record in lot['details']):
             return  # pre-adoption closed fills need a complete historical ledger
-        fresh = self._api.list_positions(account, **kwargs)
-        if ep.position_totals(fresh, self._quote_aliases) != actual or self._read_broker_lots(fresh, actual, kwargs) != lots:
-            raise ReconciliationPending('自動同步期間券商部位或進場明細已變動，等待重新核對')
+        if getattr(self, '_broker_authority_snapshot_token', None) != self._last_position_sync_at:
+            fresh = self._api.list_positions(account, **kwargs)
+            if ep.position_totals(fresh, self._quote_aliases) != actual or self._read_broker_lots(fresh, actual, kwargs) != lots:
+                raise ReconciliationPending('自動同步期間券商部位或進場明細已變動，等待重新核對')
         try:
             atr, _ = self._risk_context(self.code)
         except RuntimeError:
@@ -900,7 +849,7 @@ class IndependentTradingService(TradingService):
             conn.commit()
         for code, _, _, _ in remaining:
             self._subscribe(contracts[code])
-        self.event('external_positions_synchronized', order_ids=adopted, risk_enabled=False)
+        self.event('external_positions_synchronized', order_ids=adopted, risk_enabled=True)
 
     def _save_external_lot(self, conn, contract, action, lot, key, stamp, atr, *, automatic=False):
         code = str(contract.code)
@@ -908,22 +857,28 @@ class IndependentTradingService(TradingService):
         if not math.isfinite(tick) or tick <= 0:
             raise ValueError('合約最小跳動單位無效')
         if conn.execute('SELECT 1 FROM external_position_adoptions WHERE evidence_key=?', (lot['evidence_key'],)).fetchone():
+            if automatic:
+                raise ReconciliationPending('券商仍回報已接管的歷史進場批次，與本機結案紀錄衝突；等待部位及明細重新核對，不重複接管或重啟舊單')
             raise ValueError('此券商進場批次已接管，不能重複接管')
         # Also exclude a previously managed and closed order of this identity.
         if conn.execute('SELECT 1 FROM broker_order_identities WHERE account_key=? AND entry_date=? AND ordno=?',
                         (key, lot['entry_date'], lot['ordno'])).fetchone():
+            if automatic:
+                raise ReconciliationPending('券商仍回報本機歷史委託的進場批次，與本機剩餘部位不符；等待部位及明細重新核對，不重複接管或重啟舊單')
             raise ValueError('此券商委託已存在本機歷史，請核對')
         row_id = str(uuid.uuid4())
         external_id = 'external-position:' + lot['evidence_key']
         stop, target = (stop_target_prices(action, lot['price'], atr) if atr > 0 else (None, None))
         stop = align_tick(stop, tick) if stop is not None else None
         target = align_tick(target, tick) if target is not None else None
+        enabled = int(automatic)
         conn.execute('''INSERT INTO managed_orders
             (id,code,contract_code,action,quantity,filled_quantity,avg_fill_price,price,price_type,order_type,
-             atr,auto_exit,breakeven_enabled,simulation,entry_trade_id,entry_status,broker_octype,
+             atr,auto_exit,breakeven_enabled,profit_lock_enabled,profit_lock_started_at,simulation,entry_trade_id,entry_status,broker_octype,
              order_origin,levels_customized,contract_tick,created_at,updated_at,stop_price,target_price)
-            VALUES (?,?,?,?,?,?,?,0,'EXTERNAL','EXTERNAL',?,0,0,?,?,'Filled','New','external_position',1,?,?,?,?,?)''',
-            (row_id,self.code,code,action,lot['quantity'],lot['quantity'],lot['price'],atr,int(self.simulation),external_id,tick,stamp,stamp,stop,target))
+            VALUES (?,?,?,?,?,?,?,0,'EXTERNAL','EXTERNAL',?,?,?,?,?,?,?,'Filled','New','external_position',?,?,?,?,?,?)''',
+            (row_id,self.code,code,action,lot['quantity'],lot['quantity'],lot['price'],atr,enabled,enabled,enabled,
+             stamp if enabled else None,int(self.simulation),external_id,int(not automatic),tick,stamp,stamp,stop,target))
         conn.execute('INSERT INTO broker_order_identities (order_id,broker_trade_id,account_key,seqno,entry_date,ordno,updated_at) VALUES (?,?,?,?,?,?,?)',
             (row_id,external_id,key,'',lot['entry_date'],lot['ordno'],stamp))
         # Accounting provides a trading date only; do not invent entry time or SDK IDs.
@@ -938,7 +893,7 @@ class IndependentTradingService(TradingService):
         if automatic:
             conn.execute('INSERT INTO position_sync_events VALUES (?,?,?,?)',
                 (str(uuid.uuid4()), row_id, json.dumps(dict(kind='automatic_adoption', lot=lot,
-                    account_key=key, risk_enabled=False), ensure_ascii=False), stamp))
+                    account_key=key, risk_enabled=bool(enabled)), ensure_ascii=False), stamp))
         return row_id
 
     def adopt_external_position(self, *, contract_code, action, quantity, simulation, confirmed=False):
@@ -1034,9 +989,18 @@ class IndependentTradingService(TradingService):
         return super().cancel_entry(row_id)
 
     def _try_auto_exit(self, row, reason):
-        if self.window() is None or self._recovery.pending or not self._curve_data_ready():
+        from broker_sync import pending_close
+        if pending_close(self, row):
+            return  # a verified App cover already reserves these contracts
+        if self.window() is None or self._recovery.pending or self._fresh_risk_quote(row) is None:
             return
-        return super()._try_auto_exit(row, reason)
+        if reason == 'curve' and self._manual_order_market_error(self.code):
+            return
+        self._exit_signal_quote_code = self.code if reason == 'curve' else None
+        try:
+            return super()._try_auto_exit(row, reason)
+        finally:
+            self._exit_signal_quote_code = None
 
     def process_market_update(self, *, before_protection=None):
         with self._lock:
@@ -1053,16 +1017,35 @@ class IndependentTradingService(TradingService):
 
     def _public_order(self, row):
         result = super()._public_order(row)
-        current = super()._fresh_risk_quote(row)
-        result['protection']['closed_1m_ready'] = self.closed_price(row) is not None
-        result['protection']['tick_fresh'] = current is not None
-        result['protection']['profit_lock'] = bool(current is not None and self._broker_ready
-            and not self._recovery.pending and row.get('active') and row.get('profit_lock_enabled')
-            and row.get('auto_exit') and self.auto_exit_enabled() and self._curve_data_ready()
-            and self.closed_price({'contract_code': row['contract_code']}) is not None)
-        if current is not None:
-            result['last_quote'] = current
+        if row.get('order_origin')=='external_order':
+            with db.read_session(self.db_path) as conn:
+                imported=conn.execute('SELECT document FROM broker_external_orders WHERE broker_trade_id=?',
+                    (row['entry_trade_id'],)).fetchone()
+            if imported:
+                result['broker_order_filled_quantity']=json.loads(imported['document'])['filled_quantity']
+        ready = self._fresh_risk_quote(row) is not None
+        enabled = bool(ready and self._broker_ready and not self._recovery.pending and row.get('active')
+                       and row.get('auto_exit') and self.auto_exit_enabled() and self.window() is not None)
+        protection = result['protection']
+        protection.update(tick_fresh=ready, closed_1m_ready=self.closed_price(row) is not None,
+                          fixed_stop=enabled and row.get('stop_price') is not None,
+                          fixed_target=enabled and not row.get('curve_id') and row.get('target_price') is not None,
+                          breakeven=enabled and bool(row.get('breakeven_enabled')),
+                          profit_lock=enabled and bool(row.get('profit_lock_enabled')),
+                          curve_exit=enabled and bool(row.get('curve_id')) and self._curve_tick_available(row),
+                          exit_signal_mode='tick')
         return result
+
+    def _curve_tick_available(self, row):
+        if self._manual_order_market_error(self.code):
+            return False
+        with db.read_session(self.db_path) as conn:
+            curve = conn.execute("SELECT anchors,timeframe,kind FROM trendlines WHERE id=? AND code=? "
+                                 "AND enabled=1", (row['curve_id'], self.code)).fetchone()
+        if curve is None:
+            return False
+        from tick_protection import curve_values
+        return curve_values(self, curve, [self._quotes[self.code]['at']])[0] is not None
 
     def snapshot(self):
         orders = self.orders()
@@ -1075,7 +1058,7 @@ class IndependentTradingService(TradingService):
             curve_entry=self.curve_entry.snapshot(), bars_ready=False, broker_ready=False)
         status.update(signal_mode='closed_1m', scheduled_open=self.window() is not None,
                       logout_unconfirmed=self.logout_unconfirmed, market_source='monitor_db',
-                      profit_lock_signal_mode='tick')
+                      profit_lock_signal_mode='tick', exit_signal_mode='tick')
         status['latency_health'] = {**self.latency.health(), 'callback_queue': self._order_events.qsize(),
                                    'stale_callbacks': self._stale_order_events}
         status.setdefault('mode', '模擬環境' if self.simulation else '正式環境')
@@ -1099,18 +1082,18 @@ class IndependentTradingService(TradingService):
             and status.get('broker_ready', False) and self.window() is not None and not self._recovery.pending
             for code, error in manual_errors.items()}
         status['manual_order_errors'] = manual_errors
+        status['entry_contracts'] = self.entry_contracts()
+        active = [order for order in orders if order.get('active')]
         if 'protection' in status:
-            for key in ('fixed_exit', 'breakeven', 'curve_exit'):
-                status['protection'][key] = status['protection'][key] and bool(contract_bars) and all(contract_bars.values())
-        for order in orders:
-            quote = super()._fresh_risk_quote(order)
-            if quote is not None:
-                order['last_quote'] = quote
-            order['protection']['tick_fresh'] = quote is not None
-            if quote is None:
-                for key in ('fixed_stop', 'fixed_target', 'curve_exit', 'breakeven', 'profit_lock'):
-                    order['protection'][key] = False
+            for key, field in (('fixed_exit', 'fixed_stop'), ('breakeven', 'fixed_stop'), ('curve_exit', 'fixed_stop')):
+                status['protection'][key] = bool(active) and all(order['protection'][field] for order in active)
+            curves = [order for order in active if order.get('curve_id')]
+            if curves:
+                status['protection']['curve_exit'] = all(order['protection']['curve_exit'] for order in curves)
         status['orders'] = orders
         status['pending_external_risk'] = sum(bool(row['active'] and row.get('order_origin') == 'external_position'
                                                    and not row['auto_exit']) for row in orders)
-        return dict(status=status, orders=orders, contracts=self.contracts(), margin=self.margin_cache)
+        status['broker_external_orders'] = list(getattr(self, '_external_working_orders', []))
+        status['pending_default_atr'] = sum(bool(row['active'] and row.get('order_origin') in {'external_order','external_position'}
+            and row['auto_exit'] and not row['atr']) for row in orders)
+        return dict(status=status, orders=orders, contracts=status['entry_contracts'], margin=self.margin_cache)

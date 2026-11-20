@@ -175,10 +175,31 @@
     return state.contracts.find((item) => item.code === $('trade-contract').value) || null;
   }
 
+  function setContracts(contracts) {
+    const select = $('trade-contract');
+    const previous = select.value;
+    if (JSON.stringify(state.contracts) === JSON.stringify(contracts)) return false;
+    state.contracts = contracts;
+    select.replaceChildren(...contracts.map((item) => {
+      const option = document.createElement('option');
+      option.value = item.code;
+      option.textContent = `${item.delivery_month} · ${item.name} (${item.code})`;
+      return option;
+    }));
+    select.disabled = contracts.length === 0;
+    select.value = contracts.some((item) => item.code === previous) ? previous : (contracts[0]?.code || '');
+    if (select.value !== previous) {
+      state.price = null;
+      $('trade-price').value = '';
+    }
+    return select.value !== previous;
+  }
+
   function setMode(info) {
     state.mock = Boolean(info.mock);
     state.simulation = Boolean(info.simulation);
     state.connected = Boolean(info.connected);
+    if (Array.isArray(info.entry_contracts)) setContracts(info.entry_contracts);
     const selected = selectedContract();
     const selectedQuote = selected && info.market_quotes ? info.market_quotes[selected.code] : null;
     const contractReady = !info.contract_bars_ready || (selected && info.contract_bars_ready[selected.code]);
@@ -210,6 +231,9 @@
     if (info.reconciliation_error) connection.textContent = info.reconciliation_error;
     else if (selected && info.manual_order_errors?.[selected.code]) connection.textContent = info.manual_order_errors[selected.code];
     if (info.pending_external_risk) $('auto-exit-state').textContent += ` · ${info.pending_external_risk} 筆接管部位待設定出場（未啟用保護）`;
+    if (info.pending_default_atr) $('auto-exit-state').textContent += ` · ${info.pending_default_atr} 筆等待 1h ATR 計算固定停利；保本及回撤仍依有效 tick 監控`;
+    const appOrders = info.broker_external_orders || [];
+    if (appOrders.length) $('auto-exit-state').textContent += ` · App 委託已自動納管：${appOrders.map((item) => `${item.code} ${item.action === 'Buy' ? '買' : '賣'} ${Math.max(0, item.quantity - item.filled_quantity - item.cancel_quantity)} 口（${item.status}）`).join('、')}`;
     state.price = displayPrice == null ? null : Number(displayPrice);
     if (state.price && !$('trade-price').value) $('trade-price').value = Math.round(state.price);
     $('trade-submit').disabled = !state.connected || !state.manualReady || !selectedContract() || busy;
@@ -218,20 +242,9 @@
   async function loadContracts() {
     const response = await fetchRead('/api/trading/contracts');
     if (!response.ok) throw new Error((await response.json()).detail || '合約載入失敗');
-    state.contracts = await response.json();
-    const select = $('trade-contract');
-    const previous = select.value;
-    select.replaceChildren(...state.contracts.map((item) => {
-      const option = document.createElement('option');
-      option.value = item.code;
-      option.textContent = `${item.delivery_month} · ${item.name} (${item.code})`;
-      return option;
-    }));
-    select.disabled = state.contracts.length === 0;
-    if (state.contracts.some((item) => item.code === previous)) select.value = previous;
-    else if (state.contracts.length) select.selectedIndex = 0;
+    const changed = setContracts(await response.json());
     $('trade-submit').disabled = !state.connected || !state.manualReady || !selectedContract() || busy;
-    if (selectedContract()) subscribeSelectedContract();
+    if (changed && selectedContract()) subscribeSelectedContract();
   }
 
   function curveLabel(curve) {
@@ -312,13 +325,13 @@
       return;
     }
     const direction = action === 'Buy' ? 1 : -1;
-    const stop = entry - direction * 2 * atr;
+    const stop = entry - direction * 0.5 * atr;
     const target = entry + direction * 2 * atr;
     const curve = $('trade-curve').value;
     preview.innerHTML = `基準 ${priceType === 'LMT' ? '委託價' : '最新成交價'} ${number(entry)} · ATR(1h) ${number(atr, 1)}<br>`
       + `停損 <b>${number(stop)}</b> · `
       + (curve ? `移動停利：${escapeHtml($('trade-curve').selectedOptions[0]?.textContent || '已選曲線')}` : `停利 <b>${number(target)}</b>`);
-    if (state.manualReady && !state.entryReady) preview.innerHTML += '<br>歷史 K 棒待就緒，可依即時 tick 手動送單；自動出場保護受影響。';
+    if (state.manualReady && !state.entryReady) preview.innerHTML += '<br>歷史 K 棒待就緒，手動送單與出場保護使用有效 tick；曲線自動進場等待歷史就緒。';
     $('trade-submit').disabled = !state.connected || !state.manualReady || !contract || busy;
   }
 
@@ -329,6 +342,12 @@
   }
 
   function orderStatus(order) {
+    if (order.order_origin === 'external_order' && order.broker_octype === 'Cover') {
+      const filled = Number(order.broker_order_filled_quantity || 0);
+      return order.entry_status === 'Filled' ? `App 平倉已成交 ${filled} 口 · 部位自動同步`
+        : order.entry_status === 'Cancelled' ? `App 平倉已取消 · 已成交 ${filled} 口`
+        : `App 平倉委託已納管 · 已成交 ${filled} 口 · ${order.entry_status}`;
+    }
     if (order.active && order.order_origin === 'external_position' && !order.auto_exit) return '券商 App 部位已接管 · 待設定出場';
     if (!order.active && order.trigger_reason === 'external_close') return '券商 App／外部平倉 · 已自動結案';
     if (order.broker_octype === 'Cover' && !Number(order.filled_quantity)
@@ -341,7 +360,7 @@
     if (order.active && Number(order.filled_quantity) > Number(order.exit_filled_quantity) && order.protection) {
       if (!order.protection.broker_ready) return '券商委託／部位待核對 · 自動送單暫停';
       if (!order.protection.tick_fresh) return '此合約 tick 過期 · 本機自動保護受影響';
-      if (order.protection.closed_1m_ready === false) return '已收定 1 分 K 未就緒 · 自動出場／保本受限';
+      if (order.protection.closed_1m_ready === false && order.protection.exit_signal_mode !== 'tick') return '已收定 1 分 K 未就緒 · 自動出場／保本受限';
       if (order.curve_id && !order.protection.curve_exit) return '曲線停利暫停 · 固定停損依設定監控';
     }
     if (order.entry_status === 'CancelRequested') return '取消送出中';
@@ -381,15 +400,16 @@
     const entry = Number(order.avg_fill_price);
     const tick = Number(order.contract_tick) || 1;
     const direction = order.action === 'Buy' ? 1 : -1;
+    const pendingAdoption = order.order_origin === 'external_position' && !order.auto_exit;
     const defaults = atr > 0 && entry > 0 ? {
-      stop: Math.round((entry - direction * 2 * atr) / tick) * tick,
+      stop: Math.round((entry - direction * 0.5 * atr) / tick) * tick,
       target: Math.round((entry + direction * 2 * atr) / tick) * tick,
     } : {};
     return { curve_id: order.curve_id || null, stop_price: order.stop_price ?? order.default_stop_price ?? defaults.stop ?? null,
-      target_price: order.target_price ?? order.default_target_price ?? defaults.target ?? null, breakeven_enabled: Boolean(order.breakeven_enabled),
+      target_price: order.target_price ?? order.default_target_price ?? defaults.target ?? null, breakeven_enabled: pendingAdoption || Boolean(order.breakeven_enabled),
       breakeven_trigger_points: order.breakeven_trigger_points,
       breakeven_offset_points: order.breakeven_offset_points,
-      profit_lock_enabled: Boolean(order.profit_lock_enabled),
+      profit_lock_enabled: pendingAdoption || Boolean(order.profit_lock_enabled),
       risk_revision: Number(order.risk_revision) };
   }
 
@@ -501,7 +521,7 @@
     }
     updateRiskDraft(id, patch);
     if (cancelling && ((order.breakeven_enabled && order.breakeven_triggered_at) || (order.profit_lock_enabled && order.profit_lock_triggered_at))) {
-      riskNotice = '已帶入 ±2 ATR 預設值，stop 保留已觸發的保本保護；儲存後才生效。';
+      riskNotice = '已帶入停損 0.5 ATR／停利 2 ATR 預設值，stop 保留已觸發的保本保護；儲存後才生效。';
       renderRiskEditor();
     }
   }
@@ -612,7 +632,7 @@
       const selected = order.id === state.selectedId;
       const side = order.broker_octype === 'Cover'
         ? (order.action === 'Buy' ? '買進平倉' : '賣出平倉') : (order.action === 'Buy' ? '多單' : '空單');
-      const filled = Number(order.filled_quantity || 0);
+      const filled = Number((order.broker_octype === 'Cover' ? order.broker_order_filled_quantity : order.filled_quantity) || 0);
       const entry = filled > 0 ? order.avg_fill_price : order.price;
       const quantityLabel = Number(order.exit_filled_quantity) > 0
         ? `剩餘 ${Math.max(0, filled - Number(order.exit_filled_quantity))} 口 · 已平 ${order.exit_filled_quantity}／原成交 ${filled} 口`
@@ -627,7 +647,7 @@
       const actionMarkup = actions.length ? `<div class="managed-order-actions">${actions.join('')}</div>` : '';
       return `<div class="managed-order ${selected ? 'selected' : ''}" data-order-id="${escapeHtml(order.id)}" tabindex="0">
         <div class="managed-order-main"><b>${escapeHtml(order.contract_code)} · ${side} ${quantityLabel}</b><br>
-          <span class="managed-order-sub">${entryLabel} ${number(entry)} · ${order.broker_octype === 'Cover' ? '券商確認為平倉委託' : `停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} ${order.curve_kind === 'line' ? '直線' : '曲線'}；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}`}</span>
+          <span class="managed-order-sub">${order.order_origin === 'external_order' ? 'App 委託已納管 · ' : order.order_origin === 'external_position' ? 'App 部位已納管 · ' : ''}${entryLabel} ${number(entry)} · ${order.broker_octype === 'Cover' ? '券商確認為平倉委託' : `停損 ${number(order.stop_price)} · ${order.curve_id ? `${order.curve_timeframe || ''} ${order.curve_kind === 'line' ? '直線' : '曲線'}；1m 收盤穿越停利` : `固定停利 ${number(order.target_price)}`}`}</span>
         </div><span class="order-status ${order.active ? 'active' : ''}">${escapeHtml(orderStatus(order))}</span>${actionMarkup}</div>`;
     }).join('');
     list.querySelectorAll('[data-order-id]').forEach((item) => {
@@ -701,7 +721,7 @@
       await loadCurves();
       renderOrders();
       if (typeof window === 'object') window.TradeLatency?.rendered(info.latency, state.orders);
-      if (state.contracts.length === 0 && info.connected) await loadContracts();
+      if (!Array.isArray(info.entry_contracts) && state.contracts.length === 0 && info.connected) await loadContracts();
       if ((state.mock || Date.now() - lastMarginAt > 30000) && info.connected) await loadAccountMargin();
       if (stateResponse) {
         if (stateResponse.ok) {
@@ -754,7 +774,7 @@
       const mode = state.mock ? '離線 Mock' : simulation ? '券商 Simulation' : '正式交易';
       const side = action === 'Sell' ? '向下突破做空（賣出）' : '向上突破做多（買進）';
       const curve = state.curves.find((item) => Number(item.id) === curveId);
-      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n線條：${curve ? curveLabel(curve) : '#' + curveId}\n訊號：相鄰已收盤 1 分 K 穿越\n方向：${side}\n口數：${quantity}\n委託：市價 MKT / IOC\n僅觸發一次，依成交均價設定停損、停利各 2 倍進場 1h ATR。\n確認啟用？`)) return;
+      if (!await confirmOperation(`環境：${mode}\n合約：${contract.code}\n線條：${curve ? curveLabel(curve) : '#' + curveId}\n訊號：相鄰已收盤 1 分 K 穿越\n方向：${side}\n口數：${quantity}\n委託：市價 MKT / IOC\n僅觸發一次，依成交均價設定停損 0.5 倍、停利 2 倍進場 1h ATR。\n確認啟用？`)) return;
     }
     entryBusy = true;
     renderEntry();
@@ -821,7 +841,7 @@
     const entry = priceType === 'LMT' ? price : state.price;
     const atr = state.atr;
     const side = action === 'Buy' ? '多單' : '空單';
-    const stop = entry && atr ? entry - (action === 'Buy' ? 1 : -1) * 2 * atr : null;
+    const stop = entry && atr ? entry - (action === 'Buy' ? 1 : -1) * 0.5 * atr : null;
     const target = entry && atr ? entry + (action === 'Buy' ? 1 : -1) * 2 * atr : null;
     const summary = `環境：${simulation ? '模擬' : '正式'}\n商品：${contract.delivery_month} ${contract.name}\n方向：${side} · ${quantity} 口\n委託：${priceType} / ${orderType}${priceType === 'LMT' ? ' / ' + number(price) : ''}\n停損：${number(stop)}\n停利：${curveId ? `${curveLabel(state.curves.find((curve) => Number(curve.id) === curveId) || { id: curveId })}，1m K 收盤穿越觸發` : number(target)}\n\n確認送單？`;
     if (!await confirmOperation(summary)) return;

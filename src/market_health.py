@@ -94,6 +94,8 @@ class SessionCalendar:
         self.start = self.end = None
         self.sessions = []
         self.empty_minutes = set()
+        self._global_empty_minutes = self.empty_minutes
+        self.empty_minutes_by_code = {}
         self.error = "exchange calendar not configured"
         if document is None:
             return
@@ -119,8 +121,21 @@ class SessionCalendar:
             stamp = pd.Timestamp(row["minute_start"])
             if not row.get("evidence") or not any(a <= stamp < b for a, b in self.sessions):
                 raise ValueError("empty minute needs in-session evidence")
-            self.empty_minutes.add(stamp)
+            code = row.get('code')
+            if code is not None:
+                if not isinstance(code, str) or not code.isalnum():
+                    raise ValueError('empty minute needs a valid contract code')
+                self.empty_minutes_by_code.setdefault(code, set()).add(stamp)
+            else:
+                self.empty_minutes.add(stamp)
         self.error = None
+
+    def for_code(self, code):
+        """Apply no-trade evidence only to the instrument it certifies."""
+        from copy import copy
+        result = copy(self)
+        result.empty_minutes = self._global_empty_minutes | self.empty_minutes_by_code.get(code, set())
+        return result
 
     @classmethod
     def load(cls, path):
@@ -291,7 +306,7 @@ def fingerprint():
     for name in ("monitor.py", "dashboard.py", "trading.py", "shioaji_client.py", "market_health.py", "connection_recovery.py",
                  "db.py", "orderbook.py", "session_bars.py", "market_clock.py", "curve_entry.py", "curve_entry_controller.py",
                  "shioaji_order_adapter.py", "place_order.py", "file_lease.py", "external_reconciliation.py",
-                 "monitor_notify.py", "alert_rules.py", "latency_trace.py", "trade.py", "trade_service.py"):
+                 "monitor_notify.py", "alert_rules.py", "latency_trace.py", "trade.py", "trade_service.py", "tick_protection.py", "broker_sync.py"):
         sources[name] = hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
     try:
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, timeout=2).stdout.strip()

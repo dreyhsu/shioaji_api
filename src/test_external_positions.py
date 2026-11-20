@@ -1,4 +1,4 @@
-"""Durable external-position adoption and the existing closed-minute risk flow."""
+"""Durable external-position adoption and valid-tick protective exits."""
 import json
 from types import SimpleNamespace as NS
 
@@ -35,7 +35,7 @@ def test_automatic_broker_lot_import_preserves_existing_risk_and_never_sends(rig
     assert r.service._broker_ready, r.service._reconcile_error
     first = list(rows(r).values())[0]
     assert first['filled_quantity'] == 2 and first['active'] == 1
-    assert first['auto_exit'] == first['breakeven_enabled'] == first['profit_lock_enabled'] == 0
+    assert first['auto_exit'] == first['breakeven_enabled'] == first['profit_lock_enabled'] == 1
     r.service.update_risk_settings(first['id'], curve_id=None, stop_price=19000 if action == 'Buy' else 21000,
         target_price=21000 if action == 'Buy' else 19000, breakeven_enabled=True,
         risk_revision=first['risk_revision'])
@@ -68,7 +68,7 @@ def test_automatic_import_requires_stable_lot_identity_and_rolls_back(rig):
     r.broker.list_position_detail = changed
     r.service._sync_managed_orders(force=True)
     assert not r.service._broker_ready and not rows(r)
-    assert '已變動' in r.service._reconcile_error
+    assert '變動' in r.service._reconcile_error
 
 
 def test_automatic_import_does_not_manage_an_unconfigured_month(rig):
@@ -76,6 +76,53 @@ def test_automatic_import_does_not_manage_an_unconfigured_month(rig):
     r.service.position_sync_codes = {'TMFR1'}
     external(r, automatic=True)
     assert not r.service._broker_ready and not rows(r) and not r.broker.trades
+
+
+def test_pending_app_order_allows_read_only_lot_diagnostics_but_no_adoption(rig):
+    r = rig
+    pending = NS(contract=r.broker.contract, order=NS(id='app-pending'), status=NS(status='Submitted'))
+    r.broker.trades.append(pending)
+    external(r, automatic=True)
+    assert not r.service._broker_ready and not rows(r)
+    assert r.broker.trades == [pending]
+    assert r.service._broker_positions[0]['quantity'] == 2
+    assert '帳戶' in r.service._reconcile_error
+    r.broker.list_position_detail = lambda *a, **k: [NS(code=r.broker.contract.code,
+        direction='Buy', date='invalid-private-date', quantity=2, entry_quantity=2,
+        price=20000, currency='TWD', dseq='app-new')]
+    r.mono[0] += 61
+    r.service._sync_managed_orders(force=True)
+    diagnostic = r.service._reconcile_diagnostic
+    assert not r.service._broker_ready and not rows(r) and r.broker.trades == [pending]
+    assert diagnostic is None  # malformed App identity remains gated before lot adoption
+    assert 'invalid-private-date' not in json.dumps(r.service.snapshot())
+
+
+def test_closed_adoption_reappearing_is_corrected_to_the_verified_broker_position(rig):
+    r = rig
+    details = external(r, automatic=True)
+    original = next(iter(rows(r).values()))
+    with db.session(r.path) as conn:
+        conn.execute("UPDATE managed_orders SET active=0,auto_exit=0,exit_filled_quantity=filled_quantity,"
+                     "exit_status='Filled' WHERE id=?", (original['id'],))
+        conn.commit()
+    for _ in range(2):
+        r.service._sync_managed_orders(force=True)
+        assert r.service._broker_ready and r.service._reconcile_error is None
+        assert len(rows(r)) == 1 and rows(r)[original['id']]['active'] == 1
+        assert not r.broker.trades
+    # Once accounting catches up, the gate recovers through a fresh broker check.
+    r.broker.position = 0
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and r.service._reconcile_error is None
+    # A genuine new batch still receives its own management record.
+    for detail in details:
+        detail.dseq = 'app-new-after-close'
+    r.broker.position = 2
+    r.service._sync_managed_orders(force=True)
+    assert r.service._broker_ready and len(rows(r)) == 2
+    assert rows(r)[original['id']]['active'] == 0
+    assert len(r.service._active_orders()) == 1 and not r.broker.trades
 
 
 def test_close_one_and_reopen_one_same_total_splits_original_and_new_lot(rig):
@@ -103,7 +150,7 @@ def test_close_one_and_reopen_one_same_total_splits_original_and_new_lot(rig):
     assert old['filled_quantity'] == 2 and old['external_exit_quantity'] == old['exit_filled_quantity'] == 1
     assert all(old[key] == previous[key] for key in ('auto_exit','breakeven_enabled','stop_price','target_price'))
     added = list(managed.values())[0]
-    assert added['filled_quantity'] == 1 and added['avg_fill_price'] == 20020 and added['auto_exit'] == 0
+    assert added['filled_quantity'] == 1 and added['avg_fill_price'] == 20020 and added['auto_exit'] == 1
     r.service._sync_managed_orders(force=True)
     assert r.service._broker_ready and len(rows(r)) == 2 and not r.broker.trades
 
@@ -129,7 +176,7 @@ def test_adoption_persists_full_lots_waits_for_risk_save_and_exits_once(rig, act
     assert row['filled_quantity'] == 2 and row['avg_fill_price'] == 20000.5
     assert row['auto_exit'] == row['breakeven_enabled'] == row['profit_lock_enabled'] == 0
     assert row['atr'] == 120 and row['triggered_at'] is None
-    assert row['stop_price'] == (19760 if action == 'Buy' else 20240)
+    assert row['stop_price'] == (19940 if action == 'Buy' else 20060)
     assert row['target_price'] == (20240 if action == 'Buy' else 19760)
     assert r.service._broker_ready and not r.broker.trades
     snapshot = r.client.get('/api/snapshot').json()
@@ -153,10 +200,10 @@ def test_adoption_persists_full_lots_waits_for_risk_save_and_exits_once(rig, act
     r.service.update_risk_settings(row_id, curve_id=None, stop_price=stop, target_price=target,
         breakeven_enabled=False, risk_revision=row['risk_revision'])
     assert rows(r)[row_id]['auto_exit'] == 1
-    # Tick-only movement cannot exit before a new complete minute is imported.
+    # Saving risk enables valid-tick exits without waiting for a new closed bar.
     r.update('2026-10-30 09:02:20', close=20000, tick=stop-10 if action == 'Buy' else stop+10)
     r.runtime.step()
-    assert not r.broker.trades
+    assert len(r.broker.trades) == 1
     r.update('2026-10-30 09:04:03', close=stop-10 if action == 'Buy' else stop+10)
     r.runtime.step()
     r.runtime.step()
@@ -183,8 +230,8 @@ def test_adoption_rejects_incomplete_or_changed_evidence_without_writes(rig, fau
         count = [0]
         def changed(*a, **k):
             count[0] += 1
-            if fault == 'changed_lots' and count[0] == 2:
-                details[0].dseq = 'another-entry'
+            if fault == 'changed_lots':
+                details[0].dseq = 'another-entry' if count[0] % 2 == 0 else 'app-new-1'
             if fault == 'changed_position': r.broker.position = 1
             return details
         r.broker.list_position_detail = changed

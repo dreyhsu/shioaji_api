@@ -95,10 +95,15 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   ctx.state.orders.push(adopted);
   ctx.state.selectedId = adopted.id;
   ctx.renderRiskEditor();
-  assert.equal(get('risk-stop').value, 19760);
+  assert.equal(get('risk-stop').value, 19940);
   assert.equal(get('risk-target').value, 20240);
+  assert.equal(get('risk-breakeven').checked, true);
+  assert.equal(get('risk-profit-lock').checked, true);
+  assert.equal(adopted.auto_exit, 0); // preselected defaults do not activate inventory
   ctx.changeRiskMode(adopted.id, 4);
-  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19760);
+  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19940);
+  assert.equal(ctx.riskDrafts.get(adopted.id).breakeven_enabled, true);
+  assert.equal(ctx.riskDrafts.get(adopted.id).profit_lock_enabled, true);
   assert.equal(calls.length, 2);
   assert.equal(adopted.stop_price, null);
   ctx.riskDrafts.delete(adopted.id);
@@ -107,13 +112,13 @@ vm.runInContext(source.slice(source.indexOf('  function curveLabel('), source.in
   ctx.renderRiskEditor();
   assert.equal(get('risk-stop').value, 19900); // saved custom protection survives refresh
   ctx.changeRiskMode(adopted.id, null);
-  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19760);
+  assert.equal(ctx.riskDrafts.get(adopted.id).stop_price, 19940);
   assert.equal(ctx.riskDrafts.get(adopted.id).target_price, 20240);
   const short = { ...adopted, action: 'Sell', stop_price: null, target_price: null };
-  assert.equal(ctx.riskValues(short).stop_price, 20240);
+  assert.equal(ctx.riskValues(short).stop_price, 20060);
   // Changing away from a curve must retain a triggered profit-lock stop.
   ctx.riskDrafts.delete(adopted.id);
-  Object.assign(adopted, { profit_lock_enabled: true, profit_lock_peak_points: 800,
+  Object.assign(adopted, { auto_exit: 1, profit_lock_enabled: true, profit_lock_peak_points: 800,
     profit_lock_triggered_at: '2026-11-17 09:05:00', profit_lock_price: 20400,
     stop_price: 20400, breakeven_enabled: false, curve_id: 4 });
   ctx.renderRiskEditor();

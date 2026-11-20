@@ -386,5 +386,11 @@
       "end": "2027-01-01 05:00:00"
     }
   ],
-  "confirmed_empty_minutes": []
+  "confirmed_empty_minutes": [
+    {
+      "code": "TMFL6",
+      "minute_start": "2026-11-17 03:24:00",
+      "evidence": "2026-11-18 broker historical RangeTime ticks: 03:24 has no trades; neighboring 03:23/03:25 OHLCV match raw K-bars. Evidence: data/recovery/20261118-TMFL6-empty-minute/manifest.json"
+    }
+  ]
 }

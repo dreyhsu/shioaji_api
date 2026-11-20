@@ -2,8 +2,8 @@
   "auto_entry_enabled": true,
   "auto_exit_enabled": true,
   "breakeven_trigger_points": 200,
-  "breakeven_offset_points": 10,
-  "profit_lock_trigger_points": 300,
+  "breakeven_offset_points": 15,
+  "profit_lock_trigger_points": 400,
   "profit_lock_tiers": [
     {"from_points": 0, "giveback_ratio": 0.5},
     {"from_points": 500, "giveback_ratio": 0.4},

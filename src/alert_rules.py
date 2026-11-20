@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,8 @@ DEFAULTS: dict[str, Any] = {
     "gap_entered": {"enabled": True},
     "gap_filled": {"enabled": True},
     "supertrend_opposite": {"enabled": True},
-    "session_open_supertrend": {"enabled": True},
+    "supertrend_near": {"enabled": True, "distance_percent": 0.5, "cooldown_minutes": 10},
+    "session_open_supertrend": {"enabled": True, "monitor_minutes": 30, "cooldown_minutes": 5},
     "cooldown_minutes": 10,
     "support_bottom_third": {"enabled": True, "zone_max": 1 / 3},
     "resistance_top_third": {"enabled": True, "zone_min": 2 / 3},
@@ -94,6 +96,26 @@ def merge_config(user: dict | None) -> dict:
             merged[key] = value
     if not isinstance(merged["telegram_enabled"], bool):
         raise ValueError("telegram_enabled must be a JSON boolean (true or false)")
+    opening = merged["session_open_supertrend"]
+    if not isinstance(opening, dict):
+        raise ValueError("session_open_supertrend must be a JSON object")
+    window = opening["monitor_minutes"]
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        raise ValueError("session_open_supertrend.monitor_minutes must be a positive integer")
+    cooldown = opening["cooldown_minutes"]
+    if (isinstance(cooldown, bool) or not isinstance(cooldown, (int, float))
+            or not math.isfinite(cooldown) or cooldown < 0):
+        raise ValueError("session_open_supertrend.cooldown_minutes must be finite and nonnegative")
+    near = merged["supertrend_near"]
+    if not isinstance(near, dict):
+        raise ValueError("supertrend_near must be a JSON object")
+    if not isinstance(near["enabled"], bool):
+        raise ValueError("supertrend_near.enabled must be a JSON boolean")
+    for name in ("distance_percent", "cooldown_minutes"):
+        value = near[name]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"supertrend_near.{name} must be finite and nonnegative")
     return merged
 
 

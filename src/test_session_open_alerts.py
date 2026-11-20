@@ -19,7 +19,8 @@ pytestmark = pytest.mark.integration
 def make_rig(tmp_path):
     connections = []
 
-    def make(*, direction=-1, start='2026-11-18 08:45', code='TMFR1', mode='simulation'):
+    def make(*, direction=-1, start='2026-11-18 08:45', code='TMFR1', mode='simulation',
+             monitor_minutes=30, cooldown_minutes=5):
         start = pd.Timestamp(start)
         sessions = []
         for day in pd.date_range('2026-11-13', '2026-11-23', freq='D'):
@@ -42,6 +43,8 @@ def make_rig(tmp_path):
             sessions=[dict(start=str(left), end=str(right)) for left, right in sessions]))
         config = monitor.MonitorConfig(code=code, db_path=path, mode=mode)
         alerts = ar.AlertConfig(tmp_path / 'absent-alerts.json')
+        alerts.data = ar.merge_config({oa.RULE: dict(monitor_minutes=monitor_minutes,
+                                                   cooldown_minutes=cooldown_minutes)})
         engine = oa.SessionOpenAlerts(code, mode, started_at=start - pd.Timedelta(seconds=10))
         r = NS(conn=conn, path=path, start=start, previous=sessions[index - 1],
                end=sessions[index][1], calendar=calendar, code=code, config=config, alerts=alerts,
@@ -57,10 +60,12 @@ def make_rig(tmp_path):
             r.latest = max(r.latest, offset)
 
         def step(*, now=None, ready=True, enabled=True, opening_grace=False, claim=None):
+            alerts.reload()
             now = pd.Timestamp(now) if now is not None else start + (r.latest + 1) * oa.MINUTE + pd.Timedelta(seconds=3)
             hourly = sb.minute_bars_to_hourly(db.load_minute_bars(conn, code))
             return r.engine.step(conn, hourly, r.calendar, now, ready=ready, enabled=enabled,
                 opening_grace=opening_grace,
+                rule_config=alerts.rule(oa.RULE),
                 claim=claim or (lambda candidate, minute: monitor.claim_rule(
                     conn, config, alerts, candidate, minute, commit=False)))
 
@@ -80,13 +85,13 @@ def make_rig(tmp_path):
 
 @pytest.mark.parametrize('direction', [-1, 1])
 @pytest.mark.parametrize('start', ['2026-11-18 08:45', '2026-11-18 15:00'])
-def test_first_minute_crosses_once_with_real_supertrend(make_rig, direction, start):
+def test_first_minute_close_and_five_minute_throttle(make_rig, direction, start):
     r = make_rig(direction=direction, start=start)
     r.put(0, r.open + direction)
     jobs = r.step()
     assert len(jobs) == 1
     alert_id, candidate = jobs[0]
-    assert candidate.rule == oa.RULE and candidate.once
+    assert candidate.rule == oa.RULE and not candidate.once
     assert ('放空' if direction == -1 else '做多') in candidate.message
     assert 'ATR 10／倍數 3' in candidate.message
     assert ('日盤' if r.start.hour == 8 else '夜盤') in candidate.message
@@ -205,16 +210,16 @@ def test_missing_boundaries_and_previous_session_do_not_guess(make_rig, missing)
     assert r.state()['status'] == 'waiting'
 
 
-def test_missing_current_minute_is_not_a_crossing_and_repair_is_silent(make_rig):
+def test_complete_close_after_gap_qualifies_and_repair_is_silent(make_rig):
     r = make_rig()
     r.put(0, r.open + 1)
     r.step()
     r.put(2, r.open - 1)
-    assert r.step() == []
-    assert r.state()['status'] == 'armed'
+    assert len(r.step()) == 1  # each complete close stands on its own
+    assert r.state()['status'] == 'triggered'
     r.put(1, r.open - 1)  # late broker repair reveals the earlier crossing
     assert r.step() == []
-    assert r.state()['trigger_minute'] == str(r.start + oa.MINUTE)
+    assert r.state()['trigger_minute'] == str(r.start + 2 * oa.MINUTE)
 
 
 def test_repaired_opening_is_rebuilt_silently(make_rig):
@@ -328,15 +333,15 @@ def test_forming_hour_cannot_change_opening_regime(make_rig):
     assert r.state()['context']['opening_st_at'] == str(r.previous[1])
 
 
-def test_hourly_flip_at_the_crossing_close_cancels_signal(make_rig):
+def test_hourly_close_is_outside_opening_monitor_window(make_rig):
     r = make_rig()
     r.put(0, r.open + 1)
     r.step()
     for offset in range(1, 60):
         r.put(offset, r.open + 1 if offset < 59 else r.open - 1)
     assert r.step() == []
-    assert r.state()['status'] == 'cancelled'
-    assert r.state()['cursor'] == str(r.start + 59 * oa.MINUTE)
+    assert r.state()['status'] == 'expired'
+    assert r.state()['reason'] == 'monitoring_window_ended'
 
 
 def test_weekend_uses_calendar_previous_session(make_rig):
@@ -358,13 +363,13 @@ def test_calendar_confirmed_holiday_is_a_normal_break(make_rig):
     assert r.state()['context']['previous_end'] == '2026-11-14 05:00:00'
 
 
-def test_night_signal_can_cross_after_midnight(make_rig):
+def test_night_signal_after_midnight_is_outside_window(make_rig):
     r = make_rig(start='2026-11-18 15:00')
     r.open = 100.1  # small gap stays below the bearish ST throughout the night
     for offset in range(541):
         r.put(offset, r.open + .1 if offset < 540 else r.open - .1)
-    assert len(r.step()) == 1
-    assert r.state()['trigger_minute'] == '2026-11-19 00:00:00'
+    assert r.step() == []
+    assert r.state() is None
 
 
 @pytest.mark.parametrize('changes,expected', [({}, 1), ({'code': 'TMFK6'}, 0),
@@ -470,7 +475,7 @@ def test_opening_delivery_is_background_and_failure_never_replays(make_rig, tran
         worker.close(timeout=3)
 
 
-def test_missing_whole_current_hour_does_not_carry_st_through_gap(make_rig):
+def test_missing_whole_current_hour_cannot_extend_monitoring_window(make_rig):
     r = make_rig()
     r.open = 100.1
     r.put(0, 100.2)
@@ -480,7 +485,7 @@ def test_missing_whole_current_hour_does_not_carry_st_through_gap(make_rig):
     r.put(61, 100.2)
     r.put(62, 100.0)
     assert r.step() == []
-    assert r.state()['status'] == 'cancelled'
+    assert r.state()['status'] == 'expired'
 
 
 def test_first_minute_can_emit_on_next_session_after_previous_signal(make_rig):
@@ -500,9 +505,139 @@ def test_first_minute_can_emit_on_next_session_after_previous_signal(make_rig):
     assert r.conn.execute('SELECT COUNT(*) FROM telegram_alerts').fetchone()[0] == 2
 
 
-def test_final_minute_gets_normal_delivery_window_after_close(make_rig):
+def test_session_final_minute_is_outside_opening_window(make_rig):
     r = make_rig()
     r.open = 100.1
     for offset in range(300):
         r.put(offset, r.open + .1 if offset < 299 else r.open - .1)
-    assert len(r.step(now=r.end + pd.Timedelta(seconds=3))) == 1
+    assert r.step(now=r.end + pd.Timedelta(seconds=3)) == []
+
+
+@pytest.mark.parametrize('direction', [-1, 1])
+@pytest.mark.parametrize('start', ['2026-11-18 08:45', '2026-11-18 15:00'])
+@pytest.mark.parametrize('window,cooldown', [(30, 5), (10, 3), (7, 2)])
+def test_sustained_breakout_uses_configured_window_and_spacing(make_rig, direction, start, window, cooldown):
+    r = make_rig(direction=direction, start=start, monitor_minutes=window, cooldown_minutes=cooldown)
+    notifications = []
+    for offset in range(window + 2):
+        r.put(offset, r.open + direction)
+        jobs = r.step()
+        if jobs:
+            notifications.append(offset)
+    assert notifications == list(range(0, window, cooldown))
+    assert r.state()['status'] == 'expired'
+    assert r.conn.execute('SELECT COUNT(*) FROM telegram_alerts').fetchone()[0] == len(notifications)
+
+
+@pytest.mark.parametrize('window', [10, 30])
+def test_last_configured_candle_allowed_but_next_is_not(make_rig, window):
+    r = make_rig(monitor_minutes=window)
+    for offset in range(window - 1):
+        r.put(offset, r.open + 1)
+        assert r.step() == []
+    r.put(window - 1, r.open - 1)
+    assert len(r.step(now=r.start + window * oa.MINUTE + pd.Timedelta(seconds=59))) == 1
+    r.put(window, r.open - 1)
+    assert r.step() == []
+    assert r.state()['reason'] == 'monitoring_window_ended'
+
+
+def test_notification_spacing_uses_elapsed_time_not_only_candle_labels(make_rig):
+    r = make_rig(cooldown_minutes=3)
+    r.put(0, r.open - 1)
+    assert len(r.step(now=r.start + oa.MINUTE + pd.Timedelta(seconds=50))) == 1
+    for offset in range(1, 4):
+        r.put(offset, r.open - 1)
+        assert r.step() == []  # 08:49:03 is less than 3m after 08:46:50
+    r.put(4, r.open - 1)
+    assert len(r.step()) == 1
+
+
+def test_restart_preserves_cooldown_and_continues_monitoring(make_rig):
+    r = make_rig(cooldown_minutes=3)
+    r.put(0, r.open - 1)
+    assert len(r.step()) == 1
+    r.engine = oa.SessionOpenAlerts(r.code, r.config.mode,
+        started_at=r.start + oa.MINUTE + pd.Timedelta(seconds=10))
+    for offset in (1, 2):
+        r.put(offset, r.open - 1)
+        assert r.step() == []
+    r.put(3, r.open - 1)
+    assert len(r.step()) == 1
+    assert r.conn.execute('SELECT COUNT(*) FROM telegram_alerts').fetchone()[0] == 2
+
+
+def test_recross_inside_cooldown_does_not_bypass_throttle(make_rig):
+    r = make_rig(cooldown_minutes=3)
+    for offset, difference in enumerate([-1, 1, -1, 1, -1]):
+        r.put(offset, r.open + difference)
+        assert len(r.step()) == (1 if offset in (0, 4) else 0)
+
+
+def test_replay_and_recovery_allow_only_future_closes(make_rig):
+    r = make_rig()
+    r.put(0, r.open - 1)
+    assert r.step(enabled=False) == []
+    r.put(1, r.open - 1)
+    assert r.step() == []  # recovery must not replay this close
+    r.put(2, r.open - 1)
+    assert len(r.step()) == 1
+
+
+def test_forming_first_minute_cannot_notify(make_rig):
+    r = make_rig()
+    r.put(0, r.open - 1)
+    assert r.step(now=r.start + pd.Timedelta(seconds=59)) == []
+    assert len(r.step()) == 1
+
+
+def test_upgrade_keeps_cooldown_from_version_one_claim(make_rig):
+    r = make_rig(cooldown_minutes=3)
+    alert_id = db.record_alert(r.conn, r.code, hour_start=r.start,
+        box_type=f'open:v1:{r.config.mode}:{r.start.isoformat()}', box_id=None, visit_id=None,
+        kind=oa.RULE, message='legacy opening alert')
+    r.conn.execute('UPDATE telegram_alerts SET sent_at=? WHERE id=?',
+        (str(r.start + oa.MINUTE + pd.Timedelta(seconds=3)), alert_id))
+    r.conn.commit()
+    r.put(0, r.open - 1)
+    r.engine = oa.SessionOpenAlerts(r.code, r.config.mode,
+        started_at=r.start + oa.MINUTE + pd.Timedelta(seconds=10))
+    for offset in (1, 2):
+        r.put(offset, r.open - 1)
+        assert r.step() == []
+    r.put(3, r.open - 1)
+    assert len(r.step()) == 1
+    assert r.conn.execute('SELECT COUNT(*) FROM telegram_alerts').fetchone()[0] == 2
+
+
+def test_window_reload_can_shorten_then_extend_without_historical_replay(make_rig):
+    r = make_rig()
+    for offset in range(11):
+        r.put(offset, r.open + 1)
+    assert r.step() == []
+    assert r.state()['status'] == 'armed'
+    r.alerts.path.write_text(json.dumps({oa.RULE: dict(monitor_minutes=10)}), encoding='utf-8')
+    assert r.step() == []  # config change applies even in the same clock minute
+    assert r.state()['status'] == 'expired'
+    r.put(11, r.open - 1)
+    r.alerts.path.write_text(json.dumps({oa.RULE: dict(monitor_minutes=20)}), encoding='utf-8')
+    assert r.step() == []  # extending the window reconstructs silently
+    r.put(12, r.open - 1)
+    assert len(r.step()) == 1
+
+
+def test_cooldown_reload_preserves_last_notification_time(make_rig):
+    r = make_rig()
+    r.put(0, r.open - 1)
+    assert len(r.step()) == 1
+    r.alerts.path.write_text(json.dumps({oa.RULE: dict(cooldown_minutes=7)}), encoding='utf-8')
+    for offset in range(1, 6):
+        r.put(offset, r.open - 1)
+        assert r.step() == []  # longer than the original 5-minute spacing
+    r.alerts.path.write_text(json.dumps({oa.RULE: dict(cooldown_minutes=2)}), encoding='utf-8')
+    r.put(6, r.open - 1)
+    assert len(r.step()) == 1
+    r.put(7, r.open - 1)
+    assert r.step() == []
+    r.put(8, r.open - 1)
+    assert len(r.step()) == 1

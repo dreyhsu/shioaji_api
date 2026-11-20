@@ -41,7 +41,7 @@ simulation、confirmed。`OrderContext` 提供已解析合約識別碼、tick �
 - 新測試可明確加上標記；既有 Dashboard、監控、交易與 MockRuntime 測試自動歸為 integration，其他預設 unit。
 - 根目錄 conftest 在測試收集前阻擋網路、Shioaji 初始化與 dotenv 載入，移除繼承的敏感憑證；各案例的 DB 僅可放在系統暫存目錄。
 - 時間與價格應固定；透過注入時鐘與單次監控重現行為，不以 sleep 等待成交。背景執行緒只在專門驗證生命週期時啟用並於結束清理。
-- MockRuntime 測試涵蓋手動委託的 ±2 ATR、手動畫曲線切換停利及出場、突破曲線買入一次、錯誤不重送、取消／刪除曲線與重設。
+- MockRuntime 測試涵蓋手動委託的 0.5 ATR 停損／2 ATR 停利、手動畫曲線切換停利及出場、突破曲線買入一次、錯誤不重送、取消／刪除曲線與重設。
 
 ## 新增功能的步驟
 

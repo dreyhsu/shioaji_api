@@ -119,6 +119,9 @@ def test_position_query_failure_cannot_be_cleared_by_order_sync(rig):
         r.runtime.step()
         assert not r.service._broker_ready
         assert r.service._reconcile_error == '券商部位核對失敗：TimeoutError'
+        diagnostic = r.service._reconcile_diagnostic
+        assert diagnostic['stage'] == 'positions' and diagnostic['error_type'] == 'TimeoutError'
+        assert 'private exception content' not in json.dumps(diagnostic)
 
 
 def test_partial_cover_is_not_guessed_or_retried(rig):

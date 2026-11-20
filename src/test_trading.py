@@ -10,14 +10,15 @@ import db
 import trading
 
 
-def test_two_atr_levels_follow_long_and_short_direction():
-    assert trading.stop_target_prices("Buy", 20000, 100) == (19800, 20200)
-    assert trading.stop_target_prices("Sell", 20000, 100) == (20200, 19800)
-    assert trading.crossed_exit("Buy", 19799, 19800, 20200) == "stop"
-    assert trading.crossed_exit("Buy", 20201, 19800, 20200) == "target"
-    assert trading.crossed_exit("Sell", 20201, 20200, 19800) == "stop"
-    assert trading.crossed_exit("Sell", 19799, 20200, 19800) == "target"
-    assert trading.crossed_exit("Buy", 20000, 19800, 20200) is None
+def test_half_atr_stop_and_two_atr_target_follow_long_and_short_direction():
+    assert trading.stop_target_prices("Buy", 20000, 100) == (19950, 20200)
+    assert trading.stop_target_prices("Sell", 20000, 100) == (20050, 19800)
+    assert trading.crossed_exit("Buy", 19950, 19950, 20200) == "stop"
+    assert trading.crossed_exit("Buy", 20200, 19950, 20200) == "target"
+    assert trading.crossed_exit("Sell", 20050, 20050, 19800) == "stop"
+    assert trading.crossed_exit("Sell", 19800, 20050, 19800) == "target"
+    assert trading.crossed_exit("Buy", 19951, 19950, 20200) is None
+    assert trading.crossed_exit("Sell", 20049, 20050, 19800) is None
 
 
 def test_curve_take_profit_requires_one_minute_close_to_cross_hourly_curve():
@@ -108,6 +109,7 @@ def fake_service(tmp_path, monkeypatch):
         api_factory=factory, start_worker=False,
         alerts_path=tmp_path / "alerts.json",
     )
+    monkeypatch.setattr(trading.market_clock, "now", lambda: pd.Timestamp("2026-10-05 11:00:00"))
     service._risk_context = lambda code: (120.0, pd.DataFrame())
     service.entry_notifier.dispatch = lambda task: task()
     yield service, api, factory_modes
@@ -230,7 +232,7 @@ def test_simulation_order_and_margin_are_exposed(fake_service):
         "curve_id": None,
     })
     assert result["entry_trade_id"] == "paper-1"
-    assert result["stop_price"] == 46030
+    assert result["stop_price"] == 46210
     assert result["target_price"] == 46510
     sent = api.sent_orders[-1][1]
     assert sent.price == 46270
@@ -245,7 +247,7 @@ def test_simulation_order_and_margin_are_exposed(fake_service):
     service._persist_trade_state(result["id"], entry=filled)
     updated = service._active_order(result["id"])
     assert updated["avg_fill_price"] == 46280
-    assert updated["stop_price"] == 46040
+    assert updated["stop_price"] == 46220
     assert updated["target_price"] == 46520
 
     margin = service.margin()
@@ -337,13 +339,13 @@ def test_filled_position_can_switch_between_fixed_and_curve_take_profit(fake_ser
         curve_id = db.insert_trendline(conn, "TMFR1", anchors, kind="curve")
     changed = service.set_order_curve(result["id"], curve_id)
     assert changed["curve_id"] == curve_id
-    assert changed["stop_price"] == 46030  # original -2 ATR protection stays in place
+    assert changed["stop_price"] == 46210  # original -0.5 ATR protection stays in place
     assert changed["target_price"] is None  # curve replaces the fixed +2 ATR target
     assert changed["curve_check_from"]
 
     restored = service.set_order_curve(result["id"], None)
     assert restored["curve_id"] is None
-    assert restored["stop_price"] == 46030
+    assert restored["stop_price"] == 46210
     assert restored["target_price"] == 46510
 
 

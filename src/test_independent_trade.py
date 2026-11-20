@@ -104,6 +104,45 @@ def request(r, identity='order-1', **changes):
     return r.client.post('/api/commands', json=body)
 
 
+@pytest.mark.parametrize('stamp,expected', [
+    ('2026-11-18 13:29:59', ['TMFK6', 'TMFL6']),
+    ('2026-11-18 13:30:00', ['TMFL6']),
+    ('2026-11-18 17:00:00', ['TMFL6']),
+    ('2026-11-19 09:00:00', ['TMFL6']),
+    ('2026-11-18 05:30:00+00:00', ['TMFL6']),
+])
+def test_entry_catalog_expires_intraday_without_broker_io(stamp, expected):
+    service = object.__new__(IndependentTradingService)
+    service.code = 'TMFR1'
+    service._now = lambda: pd.Timestamp(stamp)
+    service.position_sync_codes = {'TMFR1', 'TMF202611', 'TMFL6'}
+    service._quote_aliases = {'TMF202611': 'TMFK6'}
+    service.contract_cache = [
+        dict(code='TMFK6', delivery_date='2026-11-18'),
+        dict(code='TMFL6', delivery_date='2026-12-16'),
+        dict(code='TMFA7', delivery_date='2027-01-20'),
+    ]
+    assert [item['code'] for item in service.entry_contracts()] == expected
+    # Removing an entry choice never removes the catalog used for positions.
+    assert len(service.contracts()) == 3
+    service.position_sync_codes = {'TMFR1'}
+    assert service.entry_contracts() == []
+
+
+def test_snapshot_offers_configured_contract_without_watching_catalog_front(rig):
+    r = rig
+    r.broker.Contracts.Futures.TMF.insert(0, NS(code='TMF_OLD', symbol='TMF209811',
+        delivery_month='209811', delivery_date='2098-11-19', name='unconfigured', tick=1))
+    r.service.position_sync_codes = {'TMFR1', 'TMF209912'}
+    r.runtime.step()
+    snapshot = r.client.get('/api/snapshot').json()
+    assert [item['code'] for item in snapshot['contracts']] == ['TMF209912']
+    assert snapshot['contracts'] == snapshot['status']['entry_contracts']
+    assert r.service._wanted == {'TMF_MOCK'}
+    assert len(r.service.contracts()) == 2
+    assert not r.broker.trades
+
+
 def test_reads_enqueue_and_duplicate_ids_do_not_login_or_submit(rig):
     r = rig
     assert r.client.get('/api/snapshot').status_code == 200 and not r.apis
@@ -208,15 +247,12 @@ def test_per_order_breakeven_points_pass_through_durable_trade_command(rig):
     assert repeated['result']['risk_revision'] == command['result']['risk_revision']
 
 
-def test_tick_crossing_does_not_exit_until_verified_minute_closes(rig):
+def test_tick_crossing_exits_without_waiting_for_minute_close(rig):
     r = rig
     request(r)
     r.runtime.step()
     r.runtime.step()  # persist the entry fill
     r.update(tick=21000)
-    r.runtime.step()
-    assert len(r.broker.trades) == 1
-    r.update('2026-10-30 09:03:03', close=21000)
     r.runtime.step()
     r.runtime.step()
     assert len(r.broker.trades) == 2
@@ -265,9 +301,6 @@ def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, ac
     assert len(r.broker.trades) == 1
     r.update('2026-10-30 10:48:03', signal_close=20000 + direction, tick=20000 - direction)
     r.runtime.step()
-    assert len(r.broker.trades) == 1  # tick alone cannot trigger curve profit taking
-    r.update('2026-10-30 10:49:03', signal_close=20000 - direction)
-    r.runtime.step()
     r.runtime.step()
     closed = r.service.orders()[0]
     assert len(r.broker.trades) == 2
@@ -288,7 +321,7 @@ def test_multiframe_curve_profit_exit_through_durable_command(rig, timeframe, ac
     ('2026-10-31 04:59', '2026-11-02 08:45'),
     ('2026-11-03 04:59', '2026-11-03 08:45'),
 ])
-def test_curve_exit_bridges_session_break_after_first_minute_closes(rig, timeframe, action, direction,
+def test_curve_exit_uses_opening_tick_across_session_break(rig, timeframe, action, direction,
                                                                   last_minute, opening):
     import trendline as tl
     r = rig
@@ -339,9 +372,6 @@ def test_curve_exit_bridges_session_break_after_first_minute_closes(rig, timefra
                                        close=price, volume=1, amount=price)])
             db.upsert_minute_bars(conn, code, sb.add_sessions(frame))
     r.runtime.step()
-    assert len(r.broker.trades) == 1
-    r.update(opening + pd.Timedelta(minutes=1, seconds=3), signal_close=20000 - direction)
-    r.runtime.step()
     r.runtime.step()
     closed = r.service.orders()[0]
     assert len(r.broker.trades) == 2
@@ -361,7 +391,7 @@ def test_curve_exit_bridges_session_break_after_first_minute_closes(rig, timefra
     ('2026-10-30 13:44', '2026-10-30 15:01'),
     ('2026-10-30 13:44', '2026-11-02 08:45'),
 ])
-def test_curve_exit_still_rejects_missing_trading_minutes(rig, previous, current):
+def test_curve_exit_uses_live_tick_despite_missing_trading_minutes(rig, previous, current):
     r = rig
     r.update(pd.Timestamp(current) + pd.Timedelta(minutes=1, seconds=3), signal_close=19999)
     with db.session(r.path) as conn:
@@ -371,9 +401,10 @@ def test_curve_exit_still_rejects_missing_trading_minutes(rig, previous, current
         anchors = [{'time': int(pd.Timestamp(stamp).value // 10**9), 'price': 20000}
                    for stamp in pd.date_range('2026-10-30 08:55', periods=3, freq='min')]
         curve_id = db.insert_trendline(conn, 'TMFR1', anchors, kind='curve', timeframe='1m')
-    row = dict(contract_code='TMF209912', action='Buy', stop_price=19000, target_price=None,
+    r.service.load_quotes()
+    row = dict(id='curve-gap-position', contract_code='TMF209912', action='Buy', stop_price=19000, target_price=None,
                curve_id=curve_id, curve_check_from='2026-10-30 09:02')
-    assert r.service._exit_signal(row, 20000) == 'curve_unavailable'
+    assert r.service._exit_signal(row, 20000) == 'curve'
 
 
 @pytest.mark.parametrize('timeframe', ['1m', '5m', '15m', '1h'])
@@ -928,7 +959,7 @@ def test_actual_broker_call_rechecks_cutoff_after_validation(rig):
     assert not r.broker.trades
 
 
-def test_snapshot_prices_remain_live_while_risk_checks_use_closed_candles(rig):
+def test_snapshot_and_protective_prices_use_ticks_with_closed_price_available_separately(rig):
     r = rig
     request(r)
     r.runtime.step()

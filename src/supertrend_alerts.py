@@ -1,4 +1,4 @@
-"""Confirmed 1h / 15m Supertrend disagreement alerts; no network or broker I/O."""
+"""Confirmed 1h standard / 15m LuxAlgo AI alerts; no network or broker I/O."""
 from __future__ import annotations
 
 import pandas as pd
@@ -6,6 +6,7 @@ import pandas as pd
 from alert_rules import Candidate
 import session_bars as sb
 from supertrend import confirmed_supertrend
+from supertrend_ai import confirmed_supertrend_ai
 
 RULE = 'supertrend_opposite'
 
@@ -28,7 +29,10 @@ def alert_candidates(minute_bars, hourly, code, minute_start, now, config):
     # a backlog. Normal synchronization may arrive during the following minute.
     if not end <= pd.Timestamp(now) < end + pd.Timedelta(minutes=1):
         return []
-    quarters = confirmed_supertrend(sb.minute_bars_to_interval(minute_bars, 15), end, 15)
+    # Use the same LuxAlgo calculation as the Dashboard's 15m overlay. The
+    # standard ATR-10 / factor-3 indicator remains exclusive to the 1h side.
+    quarters = confirmed_supertrend_ai(sb.minute_bars_to_interval(minute_bars, 15), end)
+    quarters['available_at'] = quarters['timestamp'] + pd.Timedelta(minutes=15)
     hours = confirmed_supertrend(hourly, end)
     if len(quarters) < 2 or hours.empty or quarters.iloc[-1]['available_at'] != end:
         return []
@@ -51,12 +55,14 @@ def alert_candidates(minute_bars, hourly, code, minute_start, now, config):
     current = pairs.iloc[-1]
     labels = {1: '多頭 ↑', -1: '空頭 ↓'}
     return [Candidate(
-        rule=RULE, key=f'supertrend:1h:15m:{end.isoformat()}:{after[0]}:{after[1]}',
+        rule=RULE, key=f'supertrend:1h:15m-ai:{end.isoformat()}:{after[0]}:{after[1]}',
         once=True,
         message=(f'{code}｜Supertrend 週期方向相反\n'
-                 f'1h：{labels[after[0]]}｜ST {current.supertrend_1h:,.2f}\n'
-                 f'15m：{labels[after[1]]}｜ST {current.supertrend_15m:,.2f}\n'
+                 f'1h 標準 Supertrend：{labels[after[0]]}｜ST {current.supertrend_1h:,.2f}\n'
+                 f'15m LuxAlgo SuperTrend AI：{labels[after[1]]}｜ST {current.supertrend_15m:,.2f}\n'
+                 f'15m K 棒 {end - pd.Timedelta(minutes=15):%Y-%m-%d %H:%M}～{end:%H:%M}\n'
                  f'15m 收盤價 {current.close:,.2f}\n'
-                 f'參數 ATR 10 / 倍數 3（兩週期皆已收定）\n'
+                 f'1h：ATR 10 / 倍數 3；15m AI：ATR 10 / 倍數 1–5 / 間隔 0.5 / Best\n'
+                 f'兩週期皆使用已收定資料\n'
                  f'確認時間 {end:%Y-%m-%d %H:%M} (Asia/Taipei)'),
     )]

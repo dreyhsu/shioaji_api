@@ -13,6 +13,41 @@ from test_market_fetchers import rig
 pytestmark = pytest.mark.integration
 
 
+def test_windows_stop_record_replace_retries_a_brief_reader_conflict(tmp_path, monkeypatch):
+    import service_control as control
+    target = tmp_path / 'dashboard.owner.stop.json'
+    control.atomic_json(target, dict(instance='old', action='stop'))
+    replace = control.os.replace
+    attempts = []
+    def briefly_busy(source, destination):
+        attempts.append(destination)
+        if len(attempts) < 3:
+            raise PermissionError('reader still holds the record')
+        replace(source, destination)
+    monkeypatch.setattr(control, 'IS_WINDOWS', True)
+    monkeypatch.setattr(control.os, 'replace', briefly_busy)
+    monkeypatch.setattr(control.time, 'sleep', lambda _: None)
+    control.atomic_json(target, dict(instance='new', action='stop'))
+    assert len(attempts) == 3 and json.loads(target.read_text())['instance'] == 'new'
+
+
+def test_windows_stop_record_permanent_denial_keeps_original(tmp_path, monkeypatch):
+    import service_control as control
+    target = tmp_path / 'dashboard.owner.stop.json'
+    control.atomic_json(target, dict(instance='old', action='stop'))
+    attempts = []
+    def denied(source, destination):
+        attempts.append(destination)
+        raise PermissionError('persistent denial')
+    monkeypatch.setattr(control, 'IS_WINDOWS', True)
+    monkeypatch.setattr(control.os, 'replace', denied)
+    monkeypatch.setattr(control.time, 'sleep', lambda _: None)
+    with pytest.raises(PermissionError):
+        control.atomic_json(target, dict(instance='new', action='stop'))
+    assert len(attempts) == 4 and json.loads(target.read_text())['instance'] == 'old'
+    assert list(tmp_path.iterdir()) == [target]
+
+
 @pytest.fixture
 def controls(tmp_path):
     config = NS(acquisition_db=tmp_path / 'fetch.db', unified_db=tmp_path / 'unified.db')

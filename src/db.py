@@ -220,6 +220,12 @@ CREATE TABLE IF NOT EXISTS external_position_adoptions (
   adopted_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS broker_external_orders (
+  identity_key TEXT PRIMARY KEY, code TEXT NOT NULL, simulation INTEGER NOT NULL,
+  broker_trade_id TEXT NOT NULL UNIQUE, order_id TEXT, document TEXT NOT NULL,
+  adopted_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS order_reconciliations (
   source_order_id TEXT PRIMARY KEY,
   target_order_id TEXT NOT NULL,
@@ -249,6 +255,7 @@ CREATE TABLE IF NOT EXISTS position_sync_events (
   document TEXT NOT NULL,
   reconciled_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_position_sync_order ON position_sync_events(order_id);
 CREATE TABLE IF NOT EXISTS external_exit_costs (
   order_id TEXT NOT NULL,
   fill_key TEXT NOT NULL,

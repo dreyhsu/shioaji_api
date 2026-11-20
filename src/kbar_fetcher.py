@@ -81,6 +81,7 @@ class KbarFetcher(FetcherRuntime):
                 setattr(self, name, value)
 
     def _work_contract(self, now, calendar):
+        calendar = calendar.for_code(self.code)
         mature_now = now - pd.Timedelta(seconds=self.settings.bar_close_delay_seconds + 180)
         expected = calendar.expected_minutes(self.since, mature_now)
         missing = self.store.missing(self.code, self.mode, expected, source='broker')

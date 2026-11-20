@@ -267,12 +267,13 @@ def test_fixed_breakeven_and_profit_lock_use_the_stronger_protection(fake_servic
     assert row['stop_price'] == 46270 + direction * 800
 
 
-def test_disabled_default_and_legacy_updates_preserve_individual_choice(fake_service):
+def test_enabled_default_and_legacy_updates_preserve_individual_choice(fake_service):
     service, api, _ = fake_service
     first = filled(service, api)
     second = filled(service, api)
-    assert not first['profit_lock_enabled'] and not second['profit_lock_enabled']
-    enabled = save(service, first, profit_lock_enabled=True, target_price=49000)
+    assert first['profit_lock_enabled'] and second['profit_lock_enabled']
+    second = save(service, second, profit_lock_enabled=False)
+    enabled = save(service, first, target_price=49000)
     # Old callers omit the new field: an unrelated save must retain the choice.
     assert save(service, enabled)['profit_lock_enabled'] == 1
     assert not service._active_order(second['id'])['profit_lock_enabled']
@@ -286,7 +287,7 @@ def test_disabled_default_and_legacy_updates_preserve_individual_choice(fake_ser
 def test_enabling_on_a_fresh_profitable_price_immediately_installs_protection(fake_service):
     service, api, _ = fake_service
     order = filled(service, api)
-    order = save(service, order, breakeven_enabled=False, target_price=49000)
+    order = save(service, order, breakeven_enabled=False, profit_lock_enabled=False, target_price=49000)
     tick(service, 47070)
     assert service._active_order(order['id'])['profit_lock_peak_points'] == 0
     enabled = save(service, order, profit_lock_enabled=True)
@@ -369,7 +370,7 @@ def test_dashboard_rejects_non_boolean_profit_lock(fake_service, monkeypatch, va
             curve_id=None, stop_price=order['stop_price'], target_price=order['target_price'],
             risk_revision=order['risk_revision'], breakeven_enabled=False, profit_lock_enabled=value))
     assert response.status_code == 422
-    assert not service._active_order(order['id'])['profit_lock_enabled']
+    assert service._active_order(order['id'])['profit_lock_enabled'] == 1
 
 
 @pytest.mark.integration
@@ -403,10 +404,7 @@ def test_trade_locks_tick_extreme_and_exits_before_minute_closes(rig, action, di
     r.store.quotes([dict(code='TMF209912',mode='simulation',price=20000+direction*300,volume=1,
         quote_at=str(r.now[0]),received_at=str(r.now[0]),instance='offline-monitor',generation=1)])
     r.runtime.step()
-    assert not r.service.orders()[0]['protection']['profit_lock']
-    assert len(r.broker.trades) == 1
-    r.update(tick=20000 + direction * 600)
-    r.runtime.step()
+    assert len(r.broker.trades) == 2  # historical readiness no longer blocks the tick exit
     r.runtime.step()
     closed = r.service.orders()[0]
     assert len(r.broker.trades) == 2 and r.broker.position == 0

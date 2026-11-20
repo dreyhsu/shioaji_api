@@ -50,7 +50,9 @@ def test_curve_geometry_reuses_full_history_and_reloads_corrections(rig, monkeyp
                    for index,stamp in enumerate(stamps.iloc[:3])]
         first = db.insert_trendline(conn,'TMFR1',anchors,kind='curve',timeframe=timeframe)
         second = db.insert_trendline(conn,'TMFR1',anchors,kind='curve',timeframe=timeframe)
-    expected = tl.values_at_times(source, anchors, [frame.iloc[-1]['minute_start']], timeframe=timeframe).iloc[0]
+    r.now[0] = frame.iloc[-1]['minute_start'] + pd.Timedelta(seconds=20)
+    r.service._quotes['TMFR1']['at'] = r.now[0]
+    expected = tl.values_at_times(source, anchors, [r.now[0]], timeframe=timeframe).iloc[0]
     original_load, original_source = db.load_minute_bars, tl.source_bars
     loads, builds = [], []
     def load(*args, **kwargs):

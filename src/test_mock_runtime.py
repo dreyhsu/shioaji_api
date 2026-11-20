@@ -136,12 +136,12 @@ def test_mock_ignores_production_mode_and_does_not_expose_future_bars(replay, mo
 
 
 @pytest.mark.parametrize("action,direction", [("Buy", 1), ("Sell", -1)])
-def test_1_manual_fill_shows_two_atr_stop_and_target(replay, action, direction):
+def test_1_manual_fill_shows_half_atr_stop_and_two_atr_target(replay, action, direction):
     runtime, client = replay
     order = manual_order(client, action)
     assert order["entry_status"] == "Filled" and order["filled_quantity"] == 1
     assert order["avg_fill_price"] == runtime.broker.price
-    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 2 * order["atr"]))
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 0.5 * order["atr"]))
     assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + direction * 2 * order["atr"]))
     assert len(runtime.broker.trades) == 1
 
@@ -153,7 +153,7 @@ def test_fixed_exits_fill_and_flatten_position(replay, action, reason, record_pr
     order = manual_order(client, action)
     direction = 1 if action == "Buy" else -1
     assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + direction * 2 * order["atr"]))
-    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 2 * order["atr"]))
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - direction * 0.5 * order["atr"]))
     runtime.advance(1)
     assert runtime.service._active_order(order["id"])["trigger_reason"] is None
     runtime.advance(89)
@@ -192,7 +192,7 @@ def test_2_manually_saved_curve_replaces_target_and_triggers_trailing_exit(repla
     assert runtime.broker.position == 0
 
 
-def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_property):
+def test_3_curve_breakout_buys_once_and_creates_default_atr_levels(replay, record_property):
     runtime, client = replay
     curve_price = runtime.broker.price - 20
     curve_id = save_curve(runtime, client, curve_price)
@@ -209,7 +209,7 @@ def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_pr
     assert row["action"] == "Buy" and row["filled_quantity"] == 1
     assert row["entry_status"] == "Filled" and row["avg_fill_price"] > curve_price
     assert row["curve_id"] is None  # Entry curve does not implicitly become an exit curve.
-    assert row["stop_price"] == pytest.approx(round(row["avg_fill_price"] - 2 * row["atr"]))
+    assert row["stop_price"] == pytest.approx(round(row["avg_fill_price"] - 0.5 * row["atr"]))
     assert row["target_price"] == pytest.approx(round(row["avg_fill_price"] + 2 * row["atr"]))
     runtime.advance(5)
     assert len(runtime.broker.trades) == 1
@@ -223,7 +223,7 @@ def test_3_curve_breakout_buys_once_and_creates_two_atr_levels(replay, record_pr
     }))
 
 
-def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, record_property):
+def test_curve_breakout_entry_then_fixed_half_atr_stop(tmp_path, monkeypatch, record_property):
     # A short rebound reverses before +2 ATR, then falls through the fixed stop.
     # Prices still come from the scenario generator and use normal Mock API routes.
     config = MockConfig.model_validate({"market": {"rebound_minutes": 30}})
@@ -259,7 +259,7 @@ def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, rec
             assert order["curve_id"] is None
             entry_price, atr = order["avg_fill_price"], order["atr"]
             stop, target = order["stop_price"], order["target_price"]
-            assert stop == pytest.approx(round(entry_price - 2 * atr))
+            assert stop == pytest.approx(round(entry_price - 0.5 * atr))
             assert target == pytest.approx(round(entry_price + 2 * atr))
 
             for _ in range(len(runtime.bars) - runtime.cursor):
@@ -285,7 +285,7 @@ def test_curve_breakout_entry_then_fixed_two_atr_stop(tmp_path, monkeypatch, rec
             assert exit_trade.order.action == "Sell" and exit_trade.order.octype == "Cover"
             exit_price = exit_trade.status.average_price
             assert exit_price == runtime.broker.price and exit_price <= stop
-            assert exit_price - entry_price <= -2 * atr
+            assert exit_price - entry_price <= -0.5 * atr
             runtime.advance(5)
             assert len(runtime.broker.trades) == 2 and runtime.broker.position == 0
             assert len(client.get("/api/trading/orders").json()) == 1

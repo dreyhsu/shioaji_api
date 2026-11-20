@@ -8,12 +8,14 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import uuid
 
 from file_lease import FileLease, LeaseUnavailable
 
 ROOT = Path(__file__).resolve().parents[1]
 CLEAN_SESSION_STATES = {'none', 'logged_out'}
+IS_WINDOWS = os.name == 'nt'
 
 
 def now():
@@ -30,7 +32,16 @@ def atomic_json(path, document):
             json.dump(document, output, ensure_ascii=False, indent=2)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(name, path)
+        # Windows readers can briefly hold a stop/owner record open. Preserve
+        # the old document and retry the atomic swap without deleting it.
+        for attempt in range(4):
+            try:
+                os.replace(name, path)
+                break
+            except PermissionError:
+                if not IS_WINDOWS or attempt == 3:
+                    raise
+                time.sleep(0.01 * 2 ** attempt)
     finally:
         if name and os.path.exists(name):
             os.unlink(name)

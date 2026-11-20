@@ -1,5 +1,9 @@
 # 設定檔與一鍵啟動
 
+## 2026-11-18 出場保護使用有效 tick
+
+固定停損停利、固定保本、獲利回撤保本，以及畫線停利皆使用有效 tick，不等待 K 收盤，歷史缺棒不再停用這些出場保護。固定價格與保本使用月份合約 tick；畫線停利使用 TMFR1 tick 與原線條來源週期幾何。保留即時來源健康、模式／世代、券商部位核對與送單去重；曲線突破進場仍等待相鄰完整收定 1 分 K。Dashboard 依 `exit_signal_mode=tick` 顯示保護，歷史未就緒時只提示曲線自動進場等待，不宣稱 tick 出場受歷史阻擋。設定不能解析的曲線僅暫停該曲線停利；月份合約固定停損仍監控。
+
 ## 一小時 Supertrend
 
 1m／5m／15m／1h 主圖皆疊加同一套一小時 Supertrend，固定 ATR 10、倍數 3；採用 Wilder RMA（前 10 根真實波幅的 SMA 初始化）、HL2 上下軌延續與收盤嚴格突破翻轉。多頭綠線、空頭紅線，翻轉處斷線，線與目前圖表 K 棒實體中點間淡色填色；圖例、價格軸與十字游標顯示方向及數值。
@@ -14,9 +18,11 @@
 
 15m 指標只使用完整已收定 K，盤中缺棒後重新暖機，正常休市延續歷史；先暖機再裁切顯示範圍。形成中的 K 不預先引用收盤結果。計算快取以已收定來源內容為準，修正舊資料會失效；1h 快速路徑不因此載入分鐘資料。更新後重啟 Dashboard 並重新整理頁面。演算法改寫自 © LuxAlgo，沿用 CC BY-NC-SA 4.0；原始提供版本保存在 `doc/indicators/luxalgo_supertrend_ai.pine`。
 
-## Supertrend 雙週期 Telegram 提醒（開發中）
+## Supertrend 雙週期 Telegram 提醒
 
-預定規則為：每根 15m K 收定後，比較原版 1h Supertrend 與 LuxAlgo AI 15m；當兩週期開始方向相反時通知一次，同一分歧持續期間不重複通知。「從高低點計數 15 根」已取消。此提醒整合與驗收尚未完成，目前已驗證範圍為圖表顯示，不能視為已提供 AI 雙週期 Telegram 通知。
+每根 15m K 收定後，monitor 比較原版 1h Supertrend（ATR 10、倍數 3）與 LuxAlgo SuperTrend AI 15m（與 Dashboard 共用計算與預設參數）；當兩週期開始方向相反時通知一次，同一分歧持續期間不重複通知。「從高低點計數 15 根」已取消。訊息標示兩套指標、15m K 棒起訖與確認時間；例如圖上 11:45 的 K 棒在 12:00 收定，最早於 12:00 同步完成後通知。由 `config/alerts.json` 的 `telegram_enabled`、`supertrend_opposite.enabled` 及程序 `--no-telegram` 控制，沿用持久化 claim 去重與背景通知佇列。兩週期必須有有效前值；缺棒暖機、未收定、同方向及逾期資料不發送，啟動或回補不補送歷史。更新程式後需重啟 monitor 才載入新通知規則。
+
+2026-11-19 Windows `tss` 驗證：相關回歸 291 項通過。以 unified DB 的 63,191 根歷史分鐘 K 回放當天 11:45–12:00：1h 空頭（40,638.79）、15m AI 由空翻多（38,416.01）、收盤價 39,301，經 monitor claim／背景佇列產生一筆通知，重跑不重複。13:46:49 另以 Telegram 實際補送一則明確標示「歷史回放驗證」的訊息並獲接受；原本 12:00 沒有發送，不改寫正式通知歷史，驗證補送也不代表原服務已載入新程式。
 
 ## macOS
 
@@ -58,6 +64,8 @@ JSON 不支援一般註解；`mode_comment` 為純說明欄位，不影響模式
 `simulation` 仍會登入券商。切離 Mock 前，`contracts` 必須同時包含 `signal_code` 與實際月份合約，不能以連續合約取代月份價格。兩個 fetcher 各共用一個 session、多個 monitor 不登入，trade 另用一個 session；這是配置，不是實際用量查詢。
 
 runtime 設定包含商品、acquisition／unified DB、trade 位址，以及行情、健康、交易、Dashboard、Mock 設定檔路徑。相對路徑一律以 runtime JSON 所在目錄解析，不受執行目錄影響。舊的非模式診斷參數仍可單獨使用；一般使用啟動器即可。可用 `--runtime-config /absolute/path/runtime.json` 選擇另一份設定。
+
+獨立 trade 提供的下單合約選單只列出本次 runtime `contracts` 已配置的月份合約，依券商 `delivery_date` 排除已到期商品；TMF 到期當日台北時間 13:30 起移除（[期交所契約規格](https://www.taifex.com.tw/cht/2/tMF)）。Dashboard 每次狀態刷新同步選單；原選擇消失時選取剩餘第一個合約並清除舊合約價格，不自動送單。沒有可選月份時停用下單。此篩選不刪除歷史行情、委託、部位或核對證據，也不自動修改 fetcher／monitor 的換月設定。更新程式後需重新啟動 trade，並重新整理 Dashboard 頁面。
 
 啟動器會保存本次模式／路徑與 Dashboard 設定的快照，所有子程序讀同一份快照。執行中修改原 JSON 不會讓不同程序混用模式。直接啟動 fetcher／monitor／trade／watchdog 時若模式為 Mock，會提示使用整體啟動器後結束。
 

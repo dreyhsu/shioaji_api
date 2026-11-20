@@ -110,16 +110,18 @@ def test_every_tick_latches_breakeven_before_monitor_and_survives_restart(fake_s
     service, api, _ = fake_service
     order = filled(service, api, action, quantity=3)
     tick(service, 46270 + direction * 100)
-    assert service._active_order(order["id"])["breakeven_triggered_at"] is None
+    tracked = service._active_order(order["id"])
+    assert tracked["breakeven_triggered_at"] is None
+    assert tracked['profit_lock_peak_points'] == 100
     tick(service, 46270 + direction * 101)
     protected = service._active_order(order["id"])
     assert protected["stop_price"] == protected["breakeven_price"] == 46270 + direction * 5
-    assert protected["risk_revision"] == order["risk_revision"] + 1
+    assert protected["risk_revision"] == tracked["risk_revision"] + 1
     tick(service, 46270 + direction * 200)
     tick(service, 46270 + direction * 4)
     row = service._active_order(order["id"])
     assert row["stop_price"] == protected["stop_price"]
-    assert row["risk_revision"] == protected["risk_revision"]
+    assert row["risk_revision"] == protected["risk_revision"]  # peak-only tracking does not invalidate the risk editor
     assert service._exit_signal(row, 46270 + direction * 4) == "stop"
     restarted = trading.TradingService(service.db_path, service.code, simulation=True, start_worker=False)
     assert restarted.orders()[0]["breakeven_triggered_at"] == protected["breakeven_triggered_at"]
@@ -173,6 +175,7 @@ def test_partial_fill_average_and_sync_preserve_protection_and_custom_levels(fak
     entry.status.deals = [SimpleNamespace(quantity=3, price=46260)]
     service._persist_trade_state(order["id"], entry=entry)
     assert service._active_order(order["id"])["stop_price"] == 46285
+    tick(service, 46371)  # publish the profit peak relative to the corrected fill
     row = service._public_order(service._active_order(order["id"]))
     row = save(service, row, stop_price=46300, target_price=47000)
     service._persist_trade_state(order["id"], entry=entry)
@@ -240,6 +243,7 @@ def test_http_confirmation_conflict_and_latest_saved_exit(fake_service, monkeypa
     monkeypatch.setitem(dashboard.CONFIG, 'db_path', service.db_path)
     monkeypatch.setitem(dashboard.CONFIG, 'code', service.code)
     tick(service, 46280)
+    order = service._public_order(service._active_order(order['id']))
     client = TestClient(dashboard.app)
     payload = {key: order[key] for key in ('curve_id', 'target_price', 'risk_revision')}
     payload.update(stop_price=46290, breakeven_enabled=True)
@@ -311,6 +315,7 @@ def test_configured_breakeven_points_reload_and_cover_tick_reenable_and_fill_syn
     tick(service, 46270 + direction * 41)
     if reenable:
         assert not service._active_order(order['id'])['breakeven_triggered_at']
+        order = service._public_order(service._active_order(order['id']))
         save(service, order, breakeven_enabled=True)
     protected = service._active_order(order['id'])
     assert protected['stop_price'] == 46270 + direction * 3  # protection rounds toward the favorable tick
@@ -391,6 +396,7 @@ def test_lowering_order_trigger_applies_on_save_without_changing_defaults(fake_s
     service, api, _ = fake_service
     order = filled(service, api)
     tick(service, 46290)
+    order = service._public_order(service._active_order(order['id']))
     updated = save(service, order, breakeven_trigger_points=10, breakeven_offset_points=0)
     assert updated['breakeven_triggered_at'] and updated['stop_price'] == 46270
     assert service.breakeven_settings()['breakeven_trigger_points'] == 100

@@ -112,7 +112,7 @@ def arm(driver, curve, action=None, quantity=1):
 @pytest.mark.parametrize("action", ["Buy", "Sell"])
 @pytest.mark.parametrize("exit_reason", ["stop", "target"])
 @pytest.mark.parametrize("timeframe", ["1m", "5m", "1h"])
-def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason, monkeypatch, timeframe):
+def test_directional_entry_quantity_and_default_atr_exit(market, action, exit_reason, monkeypatch, timeframe):
     driver = market()
     messages = []
     import telegram_notify as tg
@@ -145,7 +145,7 @@ def test_directional_entry_quantity_and_two_atr_exit(market, action, exit_reason
     assert order["curve_id"] is None
     expected_hourly_atr, _ = driver.service._risk_context(driver.code)
     assert order["atr"] == pytest.approx(expected_hourly_atr)
-    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - sign * 2 * order["atr"]))
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - sign * 0.5 * order["atr"]))
     assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + sign * 2 * order["atr"]))
     for _ in range(3):
         driver.service.process_market_update()
@@ -183,7 +183,7 @@ def buy(driver):
 def test_shared_fixed_atr_target(market):
     driver = market(start=3600)
     order = buy(driver)
-    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - 2 * order["atr"]))
+    assert order["stop_price"] == pytest.approx(round(order["avg_fill_price"] - 0.5 * order["atr"]))
     assert order["target_price"] == pytest.approx(round(order["avg_fill_price"] + 2 * order["atr"]))
     driver.step(90)
     closed = driver.client.get("/api/trading/orders").json()[0]
@@ -221,7 +221,7 @@ def test_shared_breakout_and_fixed_stop(market):
     assert entry["state"] == "triggered" and entry["simulation"] == driver.simulation
     order = driver.client.get("/api/trading/orders").json()[0]
     stop = order["stop_price"]
-    assert stop == pytest.approx(round(order["avg_fill_price"] - 2 * order["atr"]))
+    assert stop == pytest.approx(round(order["avg_fill_price"] - 0.5 * order["atr"]))
     driver.step(90)
     closed = driver.client.get("/api/trading/orders").json()[0]
     assert closed["trigger_reason"] == "stop" and closed["exit_status"] == "Filled"

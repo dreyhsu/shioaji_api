@@ -300,3 +300,24 @@ def test_shipped_config_parses():
     assert config.telegram_enabled
     assert all(config.enabled(name) for name in ar.RULES)
     assert config.cooldown_minutes("support_bottom_third") == 10
+    assert config.rule("session_open_supertrend")["monitor_minutes"] == 30
+    assert config.cooldown_minutes("session_open_supertrend") == 5
+
+
+@pytest.mark.parametrize('field,value', [
+    ('monitor_minutes', 0), ('monitor_minutes', -1), ('monitor_minutes', 1.5),
+    ('monitor_minutes', True), ('monitor_minutes', '30'), ('monitor_minutes', None),
+    ('cooldown_minutes', -1), ('cooldown_minutes', float('nan')),
+    ('cooldown_minutes', float('inf')), ('cooldown_minutes', True),
+    ('cooldown_minutes', '5'), ('cooldown_minutes', None)])
+def test_invalid_opening_timing_keeps_last_good_config(tmp_path, field, value):
+    path = tmp_path / 'alerts.json'
+    path.write_text(json.dumps({'session_open_supertrend': {'monitor_minutes': 20,
+                                                           'cooldown_minutes': 2}}))
+    config = ar.AlertConfig(path)
+    path.write_text(json.dumps({'session_open_supertrend': {field: value}}))
+    os.utime(path, (1, 1))
+    assert not config.reload()
+    assert f'session_open_supertrend.{field}' in config.last_error
+    assert config.rule('session_open_supertrend')['monitor_minutes'] == 20
+    assert config.cooldown_minutes('session_open_supertrend') == 2

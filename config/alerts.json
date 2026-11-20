@@ -7,12 +7,20 @@
   "gap_entered": {"enabled": true},
   "gap_filled": {"enabled": true},
   "supertrend_opposite": {
-    "_comment": "At each completed 15m close, notify once when confirmed 1h and 15m Supertrends enter opposite directions (both ATR 10 / multiplier 3). No repeating or historical replay.",
+    "_comment": "At each completed 15m close, notify once when confirmed standard 1h Supertrend (ATR 10 / multiplier 3) and LuxAlgo SuperTrend AI 15m (same defaults as Dashboard: ATR 10, factors 1-5 step 0.5, memory 10, Best cluster) enter opposite directions. No repeating or historical replay. Code changes require monitor restart.",
     "enabled": true
   },
+  "supertrend_near": {
+    "_comment": "Signal-code monitor only: complete 1m close within distance_percent of confirmed standard 1h Supertrend (ATR 10 / multiplier 3). Percent = abs(close - ST) / ST * 100; 0.5 means 0.5%. Bearish: close <= ST; bullish: close >= ST; touches included, closes through the line excluded. No candle-to-candle direction requirement. Each direction has its own cooldown_minutes; no stale replay. Settings reload on the next cycle; new code requires monitor restart.",
+    "enabled": true,
+    "distance_percent": 2.0,
+    "cooldown_minutes": 10
+  },
   "session_open_supertrend": {
-    "_comment": "Signal-code monitor only: confirmed 1h ST (ATR 10 / multiplier 3), opening gap versus the previous session's final complete 1m close, then a 1m close crossing the open in the ST direction. Once per session; cancel on ST flip; no historical replay. Requires monitor restart after first installation.",
-    "enabled": true
+    "_comment": "Signal-code monitor only: confirmed 1h ST (ATR 10 / multiplier 3), opening gap versus the previous session's final complete 1m close. monitor_minutes controls the window from the open (positive integer, default 30); cooldown_minutes controls minimum notification spacing (finite nonnegative minutes, default 5). Both reload on the next cycle. Use complete 1m closes beyond the open in the ST direction. Cancel on ST flip; no historical replay. Code changes require monitor restart.",
+    "enabled": true,
+    "monitor_minutes": 30,
+    "cooldown_minutes": 5
   },
 
   "_utc_offset_comment": "the market clock (TAIFEX = Taiwan, UTC+8). Every 'now' in the monitor and dashboard is UTC + this, whatever the computer's own timezone, so travelling (e.g. Japan, UTC+9) needs no change. Read at startup: restart monitor.py and dashboard.py after changing it.",

@@ -988,7 +988,7 @@ function setTradeOrder(order) {
   if (Number(tradeOrder.filled_quantity) === 0 && tradeOrder.price_type !== 'LMT') return;
   if (stop === null && entry && Number(tradeOrder.atr) > 0) {
     const direction = tradeOrder.action === 'Buy' ? 1 : -1;
-    stop = entry - direction * 2 * Number(tradeOrder.atr);
+    stop = entry - direction * 0.5 * Number(tradeOrder.atr);
     target = entry + direction * 2 * Number(tradeOrder.atr);
   }
   const specs = {

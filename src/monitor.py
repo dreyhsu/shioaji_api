@@ -27,6 +27,7 @@ import snr_core as snr
 import gap_zones
 import supertrend_alerts
 from session_open_alerts import SessionOpenAlerts
+from supertrend_near_alerts import SupertrendNearAlerts
 from monitor_notify import MonitorNotifier
 from latency_trace import LatencyRecorder
 import market_health as mh
@@ -206,6 +207,8 @@ def claim_rule(conn, config, alerts, candidate, minute_start, *, commit=True):
     if last is not None:
         if candidate.once:
             return None
+        if pd.Timestamp(minute_start) <= last:
+            return None
         cooldown = pd.Timedelta(minutes=alerts.cooldown_minutes(candidate.rule))
         if pd.Timestamp(minute_start) - last < cooldown:
             return None
@@ -237,7 +240,8 @@ def enqueue_claimed_rule(conn, config, candidate, alert_id, *, notifier=None):
     return False
 
 
-def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "MarketState", *, notifier=None) -> int:
+def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "MarketState", *, notifier=None,
+                 near_alerts=None) -> int:
     """Evaluate the newest minute; delivery never runs on this thread."""
     if alerts.reload():
         log(f"  alert config loaded from {alerts.path}")
@@ -267,6 +271,10 @@ def check_alerts(conn, config: MonitorConfig, alerts: ar.AlertConfig, state: "Ma
         minute['minute_start'], alerts))
     candidates.extend(supertrend_alerts.alert_candidates(
         bars, state.hourly, config.code, minute['minute_start'], market_clock.now(), alerts))
+    if config.code == config.signal_code and config.mode != 'mock':
+        near_alerts = near_alerts if near_alerts is not None else SupertrendNearAlerts()
+        candidates.extend(near_alerts.candidates(
+            state.hourly, config.code, minute, market_clock.now(), alerts, mode=config.mode))
     return sum(
         send_rule(conn, config, alerts, candidate, minute["minute_start"], notifier=notifier)
         for candidate in candidates
@@ -434,7 +442,7 @@ def detect_reversals(
 
 def run_cycle(
     api, contract, conn, config: MonitorConfig, watchers: dict, recorder: BookRecorder,
-    alerts: ar.AlertConfig, *, fresh=None, allow_signals=True, notifier=None,
+    alerts: ar.AlertConfig, *, fresh=None, allow_signals=True, notifier=None, near_alerts=None,
 ) -> MarketState:
     now = market_clock.now()
 
@@ -467,7 +475,7 @@ def run_cycle(
         for box_type in SIDES:
             handle_side(conn, config, state, watchers[box_type], recorder)
         detect_reversals(conn, config, state, watchers, recorder)
-        check_alerts(conn, config, alerts, state, notifier=notifier)
+        check_alerts(conn, config, alerts, state, notifier=notifier, near_alerts=near_alerts)
     return state
 
 
@@ -535,6 +543,7 @@ class MonitorRuntime:
         self.signals_ready = False
         self.ready_since = None
         self.open_alerts = SessionOpenAlerts(config.code, config.mode, started_at=clock())
+        self.near_alerts = SupertrendNearAlerts()
         self.audit_path = Path(config.db_path).resolve().parent / 'logs' / 'monitor.log'
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS monitor_fetch_events (
@@ -630,7 +639,7 @@ class MonitorRuntime:
         except OSError:
             token = None
         if token is None or token != self._calendar_token or self._cached_calendar is None:
-            self._cached_calendar = mh.SessionCalendar.load(path)
+            self._cached_calendar = mh.SessionCalendar.load(path).for_code(self.config.code)
             self._calendar_token = token
         return self._cached_calendar
 
@@ -831,7 +840,8 @@ class MonitorRuntime:
             ready = validation['ready'] and stream_ready
             if self.last_frame is None or (fresh is not self.last_frame and not fresh.equals(self.last_frame)) or (ready and not self.signals_ready):
                 self.last_state = run_cycle(None, None, self.conn, self.config, self.watchers, self.recorder,
-                                           self.alerts, fresh=pd.DataFrame(), allow_signals=ready, notifier=self.notifier)
+                                           self.alerts, fresh=pd.DataFrame(), allow_signals=ready, notifier=self.notifier,
+                                           near_alerts=self.near_alerts)
             self.last_frame = fresh
             if self.config.code == self.config.signal_code and self.config.mode != 'mock':
                 jobs = self.open_alerts.step(
@@ -840,6 +850,7 @@ class MonitorRuntime:
                     opening_grace=validation['opening_grace'] and stream_ready,
                     enabled=(self.config.enable_telegram and self.alerts.telegram_enabled
                              and self.alerts.enabled('session_open_supertrend')),
+                    rule_config=self.alerts.rule('session_open_supertrend'),
                     claim=lambda candidate, minute: claim_rule(
                         self.conn, self.config, self.alerts, candidate, minute, commit=False))
                 for alert_id, candidate in jobs:
